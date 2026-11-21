@@ -50,6 +50,7 @@ import dataclasses
 import difflib
 import json
 import os
+import queue
 import shutil
 import subprocess
 import threading
@@ -65,11 +66,21 @@ MANAGER_BACKEND_IDS: tuple[str, ...] = ("claude_cli", "codex_cli", "opencode_cli
 # The manager turn default silence window: a turn is cut off only when no stdout
 # line arrives for this long; a turn that keeps streaming is never cut off.
 DEFAULT_TURN_TIMEOUT_SECONDS = 3600.0
+# After the provider's terminal event (its result / turn.completed / error) the
+# CLI gets this long to exit; one still running then has its process tree ended
+# and the turn's held terminal event is emitted (a non-zero exit inside it still
+# replaces a clean end, NF-2026-01232). The silence window stops applying there.
+TERMINAL_EXIT_GRACE_SECONDS = 5.0
 MAX_ERROR_DETAIL_CHARS = 500
 MAX_STDERR_CHARS = 2000
 REAP_TIMEOUT_SECONDS = 5.0
 # The owner is waiting on Stop, so close() gets a short graceful window.
 CLOSE_GRACE_SECONDS = 1.0
+# The stdout lines read ahead of the turn; a full queue back-pressures the reader.
+MAX_PENDING_LINES = 1024
+_PUMP_FULL_RECHECK_SECONDS = 0.1
+# The ``error`` detail of a turn ended by close() (the loop records it as turn_stopped).
+TURN_STOPPED_DETAIL = "manager_turn_stopped"
 
 # The conversation id spellings the three CLIs report; the first non-empty one
 # seen in a turn is what the next turn resumes.
@@ -588,9 +599,19 @@ def flush(backend_id: str, context: TurnContext) -> list[dict[str, Any]]:
     return [_turn_end(usage, context)]
 
 
+def _failed_result_subtype(event: Mapping[str, Any]) -> bool:
+    """A Claude ``result`` whose subtype is not ``success`` (``error_during_execution``,
+    ``error_max_turns``, ...) is a failure even when it carries ``is_error: false``."""
+    if str(event.get("type") or "") != "result":
+        return False
+    subtype = event.get("subtype")
+    return isinstance(subtype, str) and subtype.strip().lower() not in ("", "success")
+
+
 def _provider_error(event: Mapping[str, Any]) -> dict[str, Any] | None:
     """The provider's own failure report, or ``None`` when the event is not one."""
-    if str(event.get("type") or "") != "error" and not event.get("is_error"):
+    failed = str(event.get("type") or "") == "error" or event.get("is_error")
+    if not failed and not _failed_result_subtype(event):
         return None
     reported = event.get("error")
     if isinstance(reported, Mapping):
@@ -747,24 +768,40 @@ def _decode(raw: str) -> Mapping[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _reap(process: Any) -> int:
-    """Wait briefly for an exit code; an unreapable child reports -1, never hangs."""
+def _reap(process: Any, *, timeout: float = REAP_TIMEOUT_SECONDS) -> int:
+    """Wait at most ``timeout`` for an exit code; an unreapable child reports -1, never hangs."""
     try:
-        return int(process.wait(timeout=REAP_TIMEOUT_SECONDS))
+        return int(process.wait(timeout=timeout))
     except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
         return -1
 
 
-def _end_process(process: Any, *, grace_seconds: float | None = None) -> None:
-    """Stop one CLI process tree through the platform facade; never raises.
+def _native_tree_kill_only(*_args: Any, **_kwargs: Any) -> Any:
+    """``terminate_process_tree``'s ``run`` seam once the root already exited.
 
-    ``grace_seconds`` bounds the facade's graceful window; ``None`` keeps its default.
+    ``taskkill /T`` reports an exited root as gone and leaves its descendants
+    running, so refusing to run it sends the facade straight to its native
+    snapshot kill of every descendant (Windows only; POSIX signals the group).
     """
-    if process is None or process.poll() is not None:
+    raise OSError("manager_cli_root_exited")
+
+
+def _end_process(process: Any, *, grace_seconds: float | None = None) -> None:
+    """The one teardown every turn ending uses: end one CLI process tree, then reap.
+
+    The tree is ended whether or not the direct child is still alive: a CLI
+    that exited can leave grandchildren holding its stdout open. Every turn
+    teardown -- silence window, exit grace, ``close()``, a consumer that
+    stopped iterating -- goes through here. ``grace_seconds`` bounds the
+    facade's graceful window; ``None`` keeps its default.
+    """
+    if process is None:
         return
     pid = getattr(process, "pid", None)
     if isinstance(pid, int) and pid > 0:
-        options = {} if grace_seconds is None else {"timeout": grace_seconds}
+        options: dict[str, Any] = {} if grace_seconds is None else {"timeout": grace_seconds}
+        if process.poll() is not None and platform_io.is_windows():
+            options["run"] = _native_tree_kill_only
         platform_io.terminate_process_tree(pid, **options)
     if process.poll() is None:
         try:
@@ -772,6 +809,53 @@ def _end_process(process: Any, *, grace_seconds: float | None = None) -> None:
         except OSError:
             return
     _reap(process)
+
+
+_LINES_END = object()  # the reader thread's end-of-stdout marker
+_TURN_WAKE = object()  # close() wakes a turn waiting on its line queue
+
+
+def _pump_lines(stream: Any, sink: queue.Queue[Any], stop: threading.Event) -> None:
+    """Move the child's stdout lines into the turn's bounded queue, then mark the end.
+
+    The turn reads the queue, never the pipe, so it can end at its silence or
+    exit-grace deadline even while a lingering CLI holds stdout open. A full
+    queue applies back pressure until the turn stops reading (``stop``).
+    """
+
+    def put(item: Any) -> bool:
+        while not stop.is_set():
+            try:
+                sink.put(item, timeout=_PUMP_FULL_RECHECK_SECONDS)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    try:
+        for raw in stream or ():
+            if not put(raw):
+                return
+    except (OSError, ValueError):
+        pass
+    put(_LINES_END)
+
+
+class _TurnControl:
+    """One turn's cancel flag and the line queue ``close()`` wakes."""
+
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self.lines: queue.Queue[Any] | None = None
+
+    def cancel(self) -> None:
+        """Called under the backend's ``_slot``; never blocks."""
+        self.cancelled.set()
+        if self.lines is not None:
+            try:
+                self.lines.put_nowait(_TURN_WAKE)
+            except queue.Full:
+                pass  # the turn checks ``cancelled`` before every line it takes
 
 
 class _StderrTail:
@@ -815,7 +899,12 @@ class CliManagerBackend:
     from the stream. ``timeout_seconds`` is a silence window: a turn that
     prints no stdout line for that long has its process
     killed and reports exactly one ``error`` event, as does a non-zero exit, and
-    the backend stays closeable either way.
+    the backend stays closeable either way. After the provider's terminal event
+    the silence window no longer applies: the CLI gets
+    ``TERMINAL_EXIT_GRACE_SECONDS`` to exit, then its process tree is ended and
+    the turn's own terminal event stands. Every teardown -- silence, exit grace,
+    ``close()``, a consumer that stops iterating -- ends the whole process tree
+    through :func:`_end_process`.
     """
 
     def __init__(
@@ -854,6 +943,8 @@ class CliManagerBackend:
         self.images: tuple[str, ...] = ()
         self._process: Any = None
         self._slot = threading.Lock()
+        # The running turn's cancel control, set and cleared under ``_slot``.
+        self._turn_control: _TurnControl | None = None
         # The last claude turn's ``--thinking-display`` state (thinking_display_state),
         # ``None`` for the other CLIs or before any claude turn ran.
         self.thinking_display: dict[str, Any] | None = None
@@ -873,13 +964,27 @@ class CliManagerBackend:
         return f"cli:{self.backend_id}:{self.model}"
 
     def send(self, message: str) -> Iterator[dict[str, Any]]:
-        """Run one CLI turn for ``message`` and yield its events while it runs."""
-        return self._turn(str(message))
+        """Run one CLI turn for ``message`` and yield its events while it runs.
+
+        The turn's cancel control is registered here, before the first ``next()``,
+        so a ``close()`` between ``send`` and the first iteration still stops it.
+        """
+        control = _TurnControl()
+        with self._slot:
+            self._turn_control = control
+        return self._turn(str(message), control)
 
     def close(self) -> None:
-        """End the turn's process if one is alive; safe to call any number of times."""
+        """End the running turn and its process tree; safe to call any number of times.
+
+        The running turn's cancel flag is set under ``_slot``, so a close that lands
+        before the process is assigned (the spawn window) or before the first event
+        still ends that turn the moment its process exists, never at the silence window.
+        """
         with self._slot:
             process, self._process = self._process, None
+            if self._turn_control is not None:
+                self._turn_control.cancel()
         _end_process(process, grace_seconds=CLOSE_GRACE_SECONDS)
 
     def argv_for(self, plan: Any) -> list[str]:
@@ -901,7 +1006,18 @@ class CliManagerBackend:
             argv.extend((flag, str(self.mcp_config_path)))
         return resume_argv(self.backend_id, argv, self._conversation_id)
 
-    def _turn(self, message: str, *, retried: bool = False) -> Iterator[dict[str, Any]]:
+    def _turn(self, message: str, control: _TurnControl) -> Iterator[dict[str, Any]]:
+        """One turn under the cancel control ``send`` registered for ``close()``."""
+        try:
+            yield from self._run_turn(message, control)
+        finally:
+            with self._slot:
+                if self._turn_control is control:
+                    self._turn_control = None
+
+    def _run_turn(
+        self, message: str, control: _TurnControl, *, retried: bool = False
+    ) -> Iterator[dict[str, Any]]:
         images, self.images = tuple(self.images), ()
         if images and self.backend_id == "opencode_cli":
             yield _turn_error("images", f"manager_images_unsupported:{self.backend_id}")
@@ -918,6 +1034,9 @@ class CliManagerBackend:
         plan = self._plan_builder(self.backend_id, prompt, self.repo, model=self.model)
         if not getattr(plan, "launchable", False) or not plan.argv:
             yield _turn_error("launch_plan", plan.validation_reason or "plan_not_launchable")
+            return
+        if control.cancelled.is_set():
+            yield _turn_error("stopped", TURN_STOPPED_DETAIL)
             return
         try:
             argv = self.argv_for(plan)
@@ -937,30 +1056,48 @@ class CliManagerBackend:
         except OSError as exc:
             yield _turn_error("spawn", f"{type(exc).__name__}: {exc}")
             return
+        lines: queue.Queue[Any] = queue.Queue(maxsize=MAX_PENDING_LINES)
         with self._slot:
-            self._process = process
-        expired = threading.Event()
+            # A close() in the spawn window found no process; its flag is honored here.
+            cancelled_at_spawn = control.cancelled.is_set()
+            if not cancelled_at_spawn:
+                self._process = process
+                control.lines = lines
+        if cancelled_at_spawn:
+            _end_process(process, grace_seconds=CLOSE_GRACE_SECONDS)
+            yield _turn_error("stopped", TURN_STOPPED_DETAIL)
+            return
         tail = _StderrTail(getattr(process, "stderr", None))
-
-        deadline = [time.monotonic() + self.timeout_seconds]
-        done = threading.Event()
-
-        def watch() -> None:
-            while not done.wait(max(0.0, deadline[0] - time.monotonic())):
-                if time.monotonic() >= deadline[0]:
-                    expired.set()
-                    _end_process(process)
-                    return
-
-        watchdog = threading.Thread(target=watch, daemon=True)
-        watchdog.start()
+        stop_pump = threading.Event()
+        threading.Thread(
+            target=_pump_lines, args=(getattr(process, "stdout", None), lines, stop_pump), daemon=True
+        ).start()
         context = TurnContext()
         ended = False
         held: dict[str, Any] | None = None
         streamed = False
+        # Why reading stopped: eof, expired (silence), lingered (past the exit grace
+        # after the terminal event), cancelled (close()), or dropped (the consumer left).
+        ending = "dropped"
+        deadline = time.monotonic() + self.timeout_seconds
         try:
-            for raw in process.stdout or ():
-                deadline[0] = time.monotonic() + self.timeout_seconds
+            while True:
+                if control.cancelled.is_set():
+                    ending = "cancelled"
+                    break
+                try:
+                    raw = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+                except queue.Empty:
+                    ending = "lingered" if ended else "expired"
+                    break
+                if raw is _LINES_END:
+                    ending = "cancelled" if control.cancelled.is_set() else "eof"
+                    break
+                if raw is _TURN_WAKE:
+                    continue
+                if not ended:
+                    # A silence window until the terminal event; after it only the exit grace.
+                    deadline = time.monotonic() + self.timeout_seconds
                 event = _decode(raw)
                 if event is None:
                     continue
@@ -974,34 +1111,56 @@ class CliManagerBackend:
                             continue
                         ended = True
                         streamed = True
+                        deadline = time.monotonic() + TERMINAL_EXIT_GRACE_SECONDS
                         if translated["type"] == "turn_end":
-                            # A clean end is only final once the process exits clean: a
-                            # non-zero exit or a timeout after it replaces it, never follows it.
+                            # A non-zero exit inside the exit grace replaces a clean end,
+                            # never follows it; a CLI lingering past the grace does not.
                             held = translated
                             continue
                     streamed = True
                     yield translated
         finally:
-            done.set()
-            code = _reap(process)
-            stderr = tail.text()
+            stop_pump.set()
             with self._slot:
                 if self._process is process:
                     self._process = None
+                if control.lines is lines:
+                    control.lines = None
+            code = -1
+            if ending == "eof":
+                wait = REAP_TIMEOUT_SECONDS
+                if ended:
+                    # A late EOF still gets a floor: an exit just after it is not lingering.
+                    wait = max(CLOSE_GRACE_SECONDS, deadline - time.monotonic())
+                code = _reap(process, timeout=wait)
+                if code == -1 and ended:
+                    ending = "lingered"
+            if ending == "cancelled":
+                code = _reap(process)  # close() already ended this same tree; never twice
+            elif ending != "eof" or code == -1:
+                grace = None if ending == "expired" else CLOSE_GRACE_SECONDS
+                _end_process(process, grace_seconds=grace)
+                code = _reap(process)
+            stderr = tail.text()
         if ended and held is None:
             return
+        if ending == "cancelled" and held is None:
+            yield _turn_error("stopped", TURN_STOPPED_DETAIL)
+            return
         if (
-            code != 0 and not streamed and not expired.is_set() and not retried
+            code != 0 and not streamed and ending == "eof" and not retried
             and identity is not None and "--thinking-display" in argv
             and "unknown option" in stderr.lower() and "--thinking-display" in stderr
         ):
             # NF-2026-01353 / NF-2026-01977: retry once without the flag; the rejection
             # is remembered for this one binary only (images are already in message).
             record_thinking_display_rejection(identity)
-            yield from self._turn(message, retried=True)
+            yield from self._run_turn(message, control, retried=True)
             return
-        if expired.is_set():
+        if ending == "expired":
             yield _turn_error("timeout", f"manager_turn_timeout_seconds={self.timeout_seconds:g}")
+        elif held is not None and ending in ("lingered", "cancelled"):
+            yield self._closing(held)
         elif code != 0:
             outcome = runtime_adapters.classify_provider_outcome(exit_code=code, stderr=stderr)
             reason = str(outcome.get("reason") or f"exit_code={code}")

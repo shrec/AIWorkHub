@@ -14,6 +14,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -605,7 +606,12 @@ def test_a_result_followed_by_a_non_zero_exit_is_one_terminal_error_not_two(tmp_
     cli.close()
 
 
-def test_a_result_followed_by_a_stall_is_one_terminal_timeout_error(tmp_path: Path):
+def test_a_result_followed_by_a_stall_ends_the_turn_at_the_exit_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The provider finished; a CLI that then stalls no longer holds the turn until
+    # the silence window, so the clean end stands and the child is ended for real.
+    monkeypatch.setattr(mlb, "TERMINAL_EXIT_GRACE_SECONDS", 0.3)
     fake = FakeCli(
         tmp_path,
         [[
@@ -614,14 +620,17 @@ def test_a_result_followed_by_a_stall_is_one_terminal_timeout_error(tmp_path: Pa
             "@hang",
         ]],
     )
-    cli = backend(fake, timeout_seconds=0.5)
+    cli = backend(fake, timeout_seconds=60.0)
     cli.start("brief")
 
+    began = time.monotonic()
     events = drain(cli.send("go"))
 
-    assert _terminals(events) == ["error"]
-    assert events[-1]["payload"]["source"] == "timeout"
+    assert time.monotonic() - began < 20.0
+    assert _terminals(events) == ["turn_end"]
+    assert kinds(events) == ["assistant_text", "turn_end"]
     assert not cli.is_running()
+    assert fake.children[-1].poll() is not None, "the stalled child is ended, not leaked"
     cli.close()
 
 
@@ -672,6 +681,221 @@ def test_close_kills_a_live_process_and_is_idempotent(tmp_path: Path):
     while child.poll() is None and time.monotonic() < deadline:
         time.sleep(0.01)
     assert child.poll() is not None, "close must end the child, not leak it"
+
+
+class _LingeringTree:
+    """A fake CLI ``Popen``: replays its lines, then holds stdout open until its tree is ended.
+
+    Nothing is launched; the patched platform facade (``tree_kills``) is the only
+    thing that ends it, so each test proves the process TREE was ended.
+    """
+
+    _next_pid = 70000
+
+    def __init__(self, lines: list[Any]) -> None:
+        _LingeringTree._next_pid += 1
+        self.pid = _LingeringTree._next_pid
+        self.stderr = None
+        self.returncode: int | None = None
+        self.ended = threading.Event()
+        self._lines = [line if isinstance(line, str) else json.dumps(line) for line in lines]
+        self.stdout = self._stream()
+
+    def _stream(self) -> Iterator[str]:
+        for line in self._lines:
+            yield line + "\n"
+        self.ended.wait(30)
+
+    def end(self, code: int) -> None:
+        if self.returncode is None:
+            self.returncode = code
+        self.ended.set()
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self.ended.wait(timeout):
+            raise subprocess.TimeoutExpired("fake-cli", timeout or 0)
+        return int(self.returncode or 0)
+
+    def kill(self) -> None:
+        self.end(-9)
+
+
+@pytest.fixture
+def tree_kills(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Record every platform tree kill and end the matching fake tree."""
+    trees: dict[int, _LingeringTree] = {}
+    killed: list[int] = []
+
+    def terminate(pid: int, **_options: Any) -> bool:
+        killed.append(pid)
+        if pid in trees:
+            trees[pid].end(-15)
+        return True
+
+    def add(tree: _LingeringTree) -> _LingeringTree:
+        trees[tree.pid] = tree
+        return tree
+
+    monkeypatch.setattr(mlb.platform_io, "terminate_process_tree", terminate)
+    return SimpleNamespace(killed=killed, add=add)
+
+
+def _fake_tree_backend(
+    tmp_path: Path, tree: _LingeringTree, *, on_spawn: Callable[[], None] | None = None, **options: Any
+) -> Any:
+    def plan_builder(backend_id: str, prompt: str, repo: Any, *, model: str = "") -> Any:
+        return SimplePlan(_ADAPTER_SHAPES[backend_id](prompt, model), str(repo))
+
+    def spawn(argv: Any, cwd: str | None, stdin_text: str | None = None, env: Any = None) -> Any:
+        if on_spawn is not None:
+            on_spawn()
+        return tree
+
+    return mlb.CliManagerBackend(
+        "claude_cli", "fixture-model", tmp_path, plan_builder=plan_builder, spawn=spawn, **options
+    )
+
+
+def _said(text: str) -> dict[str, Any]:
+    return {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+
+
+def test_a_result_followed_by_a_lingering_exit_is_one_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tree_kills: SimpleNamespace
+):
+    monkeypatch.setattr(mlb, "TERMINAL_EXIT_GRACE_SECONDS", 0.2)
+    usage = {"input_tokens": 3, "output_tokens": 2}
+    tree = tree_kills.add(_LingeringTree([_said("done"), {"type": "result", "usage": usage}]))
+    cli = _fake_tree_backend(tmp_path, tree, timeout_seconds=5.0)
+    cli.start("brief")
+
+    began = time.monotonic()
+    events = drain(cli.send("go"))
+
+    assert time.monotonic() - began < 3.0, "the turn ends at the exit grace, not the silence window"
+    assert kinds(events) == ["assistant_text", "turn_end"]
+    assert events[-1]["payload"]["usage"]["input"] == 3
+    assert tree_kills.killed == [tree.pid], "the lingering CLI's process tree is ended once"
+    assert tree.poll() is not None
+    assert not cli.is_running()
+
+
+def test_close_before_the_first_event_ends_the_turn(tmp_path: Path, tree_kills: SimpleNamespace):
+    # A stop in the spawn window: close() runs before the process is assigned.
+    early = tree_kills.add(_LingeringTree([]))
+    holder: dict[str, Any] = {}
+    cli = _fake_tree_backend(tmp_path, early, on_spawn=lambda: holder["cli"].close(), timeout_seconds=5.0)
+    holder["cli"] = cli
+    cli.start("brief")
+
+    began = time.monotonic()
+    events = drain(cli.send("go"))
+
+    assert time.monotonic() - began < 3.0
+    assert events == [{"type": "error", "payload": {"source": "stopped", "error": mlb.TURN_STOPPED_DETAIL}}]
+    assert tree_kills.killed == [early.pid]
+    assert early.poll() is not None and not cli.is_running()
+
+    # A stop after the process exists but before its first event (Claude's
+    # system/init translates to nothing, so the loop never re-closes).
+    quiet = tree_kills.add(_LingeringTree([{"type": "system", "subtype": "init", "session_id": "conv-q"}]))
+    later = _fake_tree_backend(tmp_path, quiet, timeout_seconds=5.0)
+    later.start("brief")
+    stopper = threading.Timer(0.3, later.close)
+    stopper.start()
+
+    began = time.monotonic()
+    try:
+        events = drain(later.send("go"))
+    finally:
+        stopper.join()
+
+    assert time.monotonic() - began < 3.0
+    assert events == [{"type": "error", "payload": {"source": "stopped", "error": mlb.TURN_STOPPED_DETAIL}}]
+    assert quiet.pid in tree_kills.killed
+    assert quiet.poll() is not None and not later.is_running()
+
+
+def test_a_dropped_stream_ends_the_process_tree(tmp_path: Path, tree_kills: SimpleNamespace):
+    tree = tree_kills.add(_LingeringTree([_said("partial")]))
+    cli = _fake_tree_backend(tmp_path, tree)
+    cli.start("brief")
+    stream = cli.send("go")
+    assert next(stream)["type"] == "assistant_text"
+
+    stream.close()  # the consumer stops iterating: the event cap, or a raise upstream
+
+    assert tree_kills.killed == [tree.pid], "no CLI process survives a dropped stream"
+    assert tree.poll() is not None
+    assert not cli.is_running()
+
+
+def test_end_process_ends_the_tree_even_after_the_direct_child_exited(tree_kills: SimpleNamespace):
+    tree = tree_kills.add(_LingeringTree([]))
+    tree.returncode = 0  # the direct child is gone; a grandchild may still hold its stdout
+
+    mlb._end_process(tree)
+
+    assert tree_kills.killed == [tree.pid]
+
+
+def test_a_non_success_result_subtype_is_an_error():
+    zero = {"input_tokens": 0, "output_tokens": 0}
+    for subtype in ("error_during_execution", "error_max_turns"):
+        failed = {"type": "result", "is_error": False, "subtype": subtype, "usage": zero}
+        assert mlb.translate("claude_cli", failed) == [
+            {"type": "error", "payload": {"source": "provider", "error": subtype}}
+        ]
+    succeeded = {"type": "result", "is_error": False, "subtype": "success", "usage": zero}
+    assert "error" not in kinds(mlb.translate("claude_cli", succeeded))
+
+
+class _LateExit(_LingeringTree):
+    """Closes stdout late, then exits non-zero shortly after: an exit, not a linger."""
+
+    def _stream(self) -> Iterator[str]:
+        for line in self._lines:
+            yield line + "\n"
+        time.sleep(0.6)
+        threading.Timer(0.6, self.end, args=(1,)).start()
+
+
+def test_a_non_zero_exit_just_after_a_late_eof_still_replaces_the_clean_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tree_kills: SimpleNamespace
+):
+    monkeypatch.setattr(mlb, "TERMINAL_EXIT_GRACE_SECONDS", 1.0)
+    usage = {"input_tokens": 1, "output_tokens": 1}
+    tree = tree_kills.add(_LateExit([_said("done"), {"type": "result", "usage": usage}]))
+    cli = _fake_tree_backend(tmp_path, tree, timeout_seconds=5.0)
+    cli.start("brief")
+
+    events = drain(cli.send("go"))
+
+    assert _terminals(events) == ["error"]
+    assert tree_kills.killed == [], "an exit just after a late EOF is not a lingering CLI"
+    assert not cli.is_running()
+
+
+def test_close_between_send_and_the_first_iteration_stops_the_turn(
+    tmp_path: Path, tree_kills: SimpleNamespace
+):
+    tree = tree_kills.add(_LingeringTree([]))
+    spawns: list[int] = []
+    cli = _fake_tree_backend(tmp_path, tree, on_spawn=lambda: spawns.append(1), timeout_seconds=5.0)
+    cli.start("brief")
+    stream = cli.send("go")
+
+    cli.close()
+    began = time.monotonic()
+    events = drain(stream)
+
+    assert time.monotonic() - began < 3.0
+    assert events == [{"type": "error", "payload": {"source": "stopped", "error": mlb.TURN_STOPPED_DETAIL}}]
+    assert spawns == [], "a turn stopped before its first iteration never spawns"
+    assert not cli.is_running()
 
 
 def test_an_unlaunchable_plan_is_one_error_event_rather_than_a_launch(tmp_path: Path):
