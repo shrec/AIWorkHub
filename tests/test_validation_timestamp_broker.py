@@ -345,6 +345,8 @@ def test_real_node_and_python_operations_through_validation_broker(
     worktree = tmp_path / "worktree"
     home = tmp_path / "home"
     worktree.mkdir()
+    # sandbox_argv always protects the worktree's Git authority with a dedicated read-only bind, so a synthetic worktree must carry the marker.
+    (worktree / ".git").write_text("gitdir: /nonexistent/aiworkhub-timestamp-broker\n", encoding="utf-8")
     home.mkdir(mode=0o700)
     (home / "tmp").mkdir(mode=0o700)
     python_script = worktree / "timestamp_python.py"
