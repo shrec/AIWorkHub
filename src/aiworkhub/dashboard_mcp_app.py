@@ -4471,7 +4471,8 @@ def _needfix_transition_one(
                     # gate refusal (readiness, evidence, commit) keeps what was written.
                     current = core.needfix_show(candidate)
                     if str(current.get("status") or "") in needfix_store.RESOLVE_VERIFIED_FROM_STATUSES:
-                        core.needfix_update(
+                        needfix_store.update_needfix(
+                            core.repo_root(),
                             candidate,
                             readiness_score=readiness_score,
                             evidence_patch=evidence,

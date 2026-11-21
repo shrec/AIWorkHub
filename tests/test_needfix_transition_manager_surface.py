@@ -246,3 +246,20 @@ def test_conversion_refusal_and_next_action_name_the_manager_tool(repo: Path, st
     assert f"call {_MANAGER_TOOL} action={action}" in reason
     assert _PREFIX not in reason and _PREFIX not in preview["refusal_reason"]
     assert server.mcp_tool_listed(preview["next_action"]["tool"], "manager") is True
+
+
+def test_resolve_verified_writes_readiness_and_evidence_then_resolves(repo: Path) -> None:
+    rec = needfix_store.add_needfix(repo, title="verified fix", description="verified body", status="accepted")
+    result = server.needfix_transition(
+        needfix_id=rec["id"],
+        action="resolve_verified",
+        reason="verified",
+        readiness_score=100,
+        evidence={"k": 1},
+        evidence_refs=["test:ref"],
+        confirm=True,
+    )
+    assert result["ok"] is True, result
+    assert result["status_after"] == "resolved"
+    row = needfix_store.get_needfix(repo, rec["id"])
+    assert row["evidence"]["k"] == 1 and "test:ref" in row["evidence_refs"]
