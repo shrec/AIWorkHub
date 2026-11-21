@@ -2238,11 +2238,9 @@ class TestManagerVerifiedResolution:
         monkeypatch.setattr(
             core, "needfix_show", lambda nf: needfix_store.get_needfix(init_store, nf)
         )
-        monkeypatch.setattr(
-            core,
-            "needfix_update",
-            lambda nf, **kw: needfix_store.update_needfix(init_store, nf, **kw),
-        )
+        # resolve_verified writes evidence through needfix_store.update_needfix(core.repo_root(), ...)
+        # (NF-2026-02322), so bind the repository rather than faking the legacy core forwarder.
+        monkeypatch.setattr(core, "repo_root", lambda *args, **kwargs: init_store)
         monkeypatch.setattr(
             core,
             "needfix_resolve_verified",
