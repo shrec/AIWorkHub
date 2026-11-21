@@ -177,9 +177,11 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.5
+## What's new in 0.13.6
 
-- Hub mail discovery keeps resending its probe until the deadline, so one lost UDP datagram on a busy machine no longer reports zero hubs.
+- Manager Chat: an empty turn is an error, not a silent success, so a wake is never acknowledged for a callback the model never saw.
+- Manager Chat: every finished card the chat launched reaches that chat, with no duplicate copies and no lost wakes after a rework or rotate.
+- Manager Chat: busy/idle state, reply binding and the settling of typed messages stay correct across replays, session switches and stops; closing the panel no longer kills the running turn.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

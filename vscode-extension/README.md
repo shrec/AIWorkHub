@@ -94,9 +94,9 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.5
+## What's new in 0.13.6
 
-- Hub mail discovery keeps resending its probe until the deadline, so one lost UDP datagram on a busy machine no longer reports zero hubs.
+- Manager Chat: an empty turn is an error, every finished card the chat launched reaches that chat, busy/idle state and message echoes stay correct, and closing the panel no longer kills the running turn.
 
 ## Get started
 

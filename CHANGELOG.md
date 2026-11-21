@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-11-21
+
+### Fixed
+
+- Manager Chat loop: a turn that ends with no reply, no tool event and no usage is an error, not a success, so a wake is never acknowledged for a callback the model never saw; a turn capped by the event limit closes its backend and leaves no orphaned turn; a Context Graph write that resolves another repository is skipped instead of failing the turn (NF-2026-02318).
+- Manager Chat wakes: every finished card a chat launched reaches the session that launched it, even after a rework another session launched; a lane card no chat launched gets no duplicate chat copy; a wake queued behind a rotate records its own outcome.
+- Manager Chat webview: busy/idle state, reply binding and the settling of typed messages stay correct across history replays, session switches and stops; a replayed drop never settles a message typed after it.
+- Manager Chat send: the panel's per-send id travels through the host, the MCP tool and the service to the turn's `user_message` and to a stop's `queue_dropped` event, so two identical messages settle exactly and a stop marks exactly the sends it dropped.
+- Manager Chat host: closing the panel or the editor tab no longer kills the turn that is running.
+- Accept neighbour lane: an environment-skipped green neighbour row is evidence, not a failure (NF-2026-02319).
+- Release cut: the WSL test tree is extracted on WSL-native ext4 (/tmp) (NF-2026-02315), and the full-suite host run records the test-impact map the next cut narrows with (NF-2026-02314).
+- Dashboard: the snapshot reads storage readiness without the per-process PRAGMA (NF-2026-02317), and the first reader call after a (re)spawn gets a cold-start budget.
+
 ## [0.13.5] - 2026-11-17
 
 ### Fixed

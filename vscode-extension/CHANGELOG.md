@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.6 — 2026-11-21
+
+### Fixed
+
+- Bundles runtime 0.13.6: Manager Chat reports an empty turn as an error, delivers every finished card to the chat that launched it, keeps busy/idle state and message echoes correct, and keeps the running turn alive when the panel or editor tab closes.
+
 ## 0.13.5 — 2026-11-17
 
 ### Fixed
