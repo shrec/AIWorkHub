@@ -711,6 +711,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace_native_seed.py",
         # ...and its validation stall watchdog (NF-2026-02269).
         "validation_stall.py",
+        # ...and its bubblewrap interpreter identity binds (NF-2026-02327).
+        "validation_interpreter_binds.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte

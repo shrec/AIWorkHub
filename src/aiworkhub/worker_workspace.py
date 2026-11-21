@@ -9105,22 +9105,10 @@ def sandbox_argv(
             for value in rewritten
             for value_path in (Path(value).resolve(strict=False),)
         ]
-    if validation_python_runtime_identity_root is not None:
-        resolved_root = validation_python_runtime_identity_root.resolve(strict=True)
-        trusted_base_prefix = Path(sys.base_prefix).resolve(strict=True)
-        executable_path = Path(adapter_argv[0]).resolve(strict=False)
-        if resolved_root == Path("/") or resolved_root != trusted_base_prefix:
-            raise WorkspaceError("validation_python_runtime_identity_root_untrusted")
-        if not _path_is_relative_to(executable_path, resolved_root):
-            raise WorkspaceError("validation_python_runtime_executable_outside_root")
-        identity_parent_dirs: set[str] = set()
-        for parent in reversed(resolved_root.parents):
-            parent_text = str(parent)
-            if parent_text == "/" or parent_text in identity_parent_dirs:
-                continue
-            validation_binds.extend(("--dir", parent_text))
-            identity_parent_dirs.add(parent_text)
-        validation_binds.extend(("--ro-bind", str(resolved_root), str(resolved_root)))
+    from .validation_interpreter_binds import identity_runtime_binds as _identity_binds
+    validation_binds.extend(
+        _identity_binds(adapter_id, adapter_argv[0], validation_python_runtime_identity_root)
+    )
     if validation_readonly_dirs:
         validation_binds.extend(("--dir", "/validation-pythonpath"))
         for index, path in enumerate(validation_readonly_dirs):
