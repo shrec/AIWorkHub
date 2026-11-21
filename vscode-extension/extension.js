@@ -742,6 +742,11 @@ const DASHBOARD_PROCESS_RESPAWN_BACKOFF_MS = Object.freeze([0, 1000, 2000, 5000,
 const DASHBOARD_PROCESS_MAX_PENDING_REQUESTS = 64;
 // NF-2026-02317: a cold reader's first call takes ~55 s (one-time imports + DB warm-up) vs 20 s MCP default.
 const DASHBOARD_PROCESS_COLD_START_TIMEOUT_MS = 90000;
+// NF-2026-02323: past its soft budget a dashboard request stays pending so its
+// late reply is still delivered (a loaded machine measured a 146 s full
+// snapshot against a 120 s budget). A request unanswered this long marks the
+// reader hung: it is stopped and the next call respawns it.
+const DASHBOARD_LATE_REPLY_CAP_MS = 10 * 60 * 1000;
 // Process-control variables only the MCP server/dispatcher reads; the
 // dashboard child never receives them.
 const DASHBOARD_PROCESS_STRIPPED_ENV = Object.freeze([
@@ -2311,6 +2316,11 @@ class DashboardProcessClient {
     this.consecutiveFailures = 0;
     this.lastFailure = "";
     this.retryNotBefore = 0;
+    // Per-child facts an explicit Retry consults (NF-2026-02323): whether the
+    // current child has answered, and a process-level failure it recorded
+    // without exiting (a stdin write failure). Reset on every spawn.
+    this.childAnswered = false;
+    this.childFailure = "";
     // The child runs this extension's own bundled runtime, so it always
     // speaks the snapshot delta protocol (see clientSpeaksSnapshotDelta).
     this.runtimePreflight = Object.freeze({ matches: true });
@@ -2385,6 +2395,7 @@ class DashboardProcessClient {
     this.buffer = "";
     // A fresh child gets the cold-start budget until it answers once.
     this.childAnswered = false;
+    this.childFailure = "";
     this.stdoutDecoder = new StringDecoder("utf8");
     registerOwnedDashboardChild(child);
     trackStableRuntimeChild(child, runtimeDir);
@@ -2423,9 +2434,10 @@ class DashboardProcessClient {
       const record = message && this.pending.get(message.id);
       if (!record) continue;
       // The child has answered once: later calls keep the caller's own timeout.
+      // A reply past the soft budget settles that request's err.lateReply.
       this.childAnswered = true;
       this.pending.delete(message.id);
-      clearTimeout(record.timer);
+      this._clearRecordTimers(record);
       if (message.error) {
         const code = String((message.error && message.error.code) || "unknown").slice(0, 80);
         record.reject(new Error(`dashboard_${code}`));
@@ -2451,7 +2463,7 @@ class DashboardProcessClient {
     const records = Array.from(this.pending.values());
     this.pending.clear();
     for (const record of records) {
-      clearTimeout(record.timer);
+      this._clearRecordTimers(record);
       record.reject(err);
     }
   }
@@ -2475,6 +2487,12 @@ class DashboardProcessClient {
     treeKillMcpChild(child);
   }
 
+  // NF-2026-02323: the soft budget only answers the caller. When it fires the
+  // caller gets DASHBOARD_REQUEST_TIMEOUT_REASON, but the request stays pending
+  // so the reader's late reply is still delivered through err.lateReply. A
+  // request still unanswered at DASHBOARD_LATE_REPLY_CAP_MS marks the reader
+  // hung: it is stopped and the next call respawns it. A live, merely slow
+  // reader is never killed by the soft budget.
   async callTool(name, args = {}, timeoutMs = MCP_REQUEST_TIMEOUT_MS) {
     if (!DASHBOARD_PROCESS_TOOLS.has(name)) {
       throw new Error("dashboard_tool_not_allowed");
@@ -2490,22 +2508,51 @@ class DashboardProcessClient {
     const id = this.nextId++;
     const frame = `${JSON.stringify({ id, tool: name, arguments: args || {} })}\n`;
     return new Promise((resolve, reject) => {
-      const record = { resolve, reject, timer: null };
+      const coldBudgetMs = this.childAnswered ? timeoutMs : Math.max(timeoutMs, DASHBOARD_PROCESS_COLD_START_TIMEOUT_MS);
+      const capMs = Math.max(coldBudgetMs, DASHBOARD_LATE_REPLY_CAP_MS);
+      const record = { resolve, reject, timer: null, capTimer: null, deadline: Date.now() + capMs };
       const fail = (err) => {
         if (this.pending.get(id) !== record) return;
         this.pending.delete(id);
-        clearTimeout(record.timer);
-        reject(err);
+        this._clearRecordTimers(record);
+        record.reject(err);
       };
-      const coldBudgetMs = this.childAnswered ? timeoutMs : Math.max(timeoutMs, DASHBOARD_PROCESS_COLD_START_TIMEOUT_MS);
-      record.timer = setTimeout(() => fail(new Error(DASHBOARD_REQUEST_TIMEOUT_REASON)), coldBudgetMs);
+      record.timer = setTimeout(() => {
+        record.timer = null;
+        if (this.pending.get(id) !== record) return;
+        const err = new Error(DASHBOARD_REQUEST_TIMEOUT_REASON);
+        // From here on the reply (or its abandonment) settles err.lateReply.
+        err.lateReply = new Promise((lateResolve, lateReject) => {
+          record.resolve = lateResolve;
+          record.reject = lateReject;
+        });
+        err.lateReply.catch(() => {});
+        reject(err);
+      }, coldBudgetMs);
+      record.capTimer = setTimeout(() => {
+        record.capTimer = null;
+        if (this.pending.get(id) !== record || this.child !== child) return;
+        this._log(`[dashboard] request ${id} unanswered after ${capMs} ms; reader hung`);
+        this.stop("dashboard_process_hung");
+      }, capMs);
       this.pending.set(id, record);
-      try {
-        child.stdin.write(frame, (err) => { if (err) fail(new Error("dashboard_process_write_failed")); });
-      } catch (_err) {
+      const writeFailed = () => {
+        if (this.child === child) this.childFailure = "dashboard_process_write_failed";
         fail(new Error("dashboard_process_write_failed"));
+      };
+      try {
+        child.stdin.write(frame, (err) => { if (err) writeFailed(); });
+      } catch (_err) {
+        writeFailed();
       }
     });
+  }
+
+  _clearRecordTimers(record) {
+    clearTimeout(record.timer);
+    clearTimeout(record.capTimer);
+    record.timer = null;
+    record.capTimer = null;
   }
 
   // Once the dashboard has painted, routing services may converge on the
@@ -2514,12 +2561,30 @@ class DashboardProcessClient {
     convergeRoutingServicesInBackground();
   }
 
-  // An explicit Retry clears the respawn backoff and replaces the child.
+  // A live child that has answered before, recorded no process-level failure
+  // and holds no request past the hard cap is serving: keep it.
+  _childServing() {
+    if (!this.running || !this.childAnswered || this.childFailure) return false;
+    const now = Date.now();
+    for (const record of this.pending.values()) {
+      if (now >= record.deadline) return false;
+    }
+    return true;
+  }
+
+  // An explicit Retry clears the respawn backoff. It keeps a serving child and
+  // its pending requests (the caller then joins or re-sends the snapshot);
+  // only a missing, failed or hung child is stopped so the next call respawns.
+  // Returns true when the child was replaced.
   resetForExplicitRetry() {
+    const keep = this._childServing();
     this.consecutiveFailures = 0;
     this.lastFailure = "";
     this.retryNotBefore = 0;
+    debugTrace("dashboard_process.retry", { keep_child: keep, pending: this.pending.size });
+    if (keep) return false;
     this.stop("dashboard_process_retry");
+    return true;
   }
 
   stop(reason = "dashboard_process_stopped") {
@@ -11214,6 +11279,9 @@ class ViewState {
     // Last full payload plus its per-section digests, bound to one client: the
     // base a delta refresh merges into (NF-2026-01731). One entry per view.
     this.snapshotDeltaCache = null;
+    // The one full snapshot request of this view still in the reader (on
+    // time or awaiting its late reply); refreshes join it (NF-2026-02323).
+    this.fullSnapshotFlight = null;
   }
 
   bindClient(client) {
@@ -11381,36 +11449,106 @@ function mergeSnapshotDelta(cache, delta) {
   return { payload, digests };
 }
 
+// NF-2026-02323: a dashboard request that missed its soft budget stays pending
+// in the reader; its timeout error carries err.lateReply, which settles with
+// the reply or with the reason the request was abandoned (hard cap, stop).
+function lateSnapshotReply(err) {
+  return err && err.lateReply && typeof err.lateReply.then === "function"
+    && isSnapshotTimeoutReason(sanitizeErrorMessage(err))
+    ? err.lateReply
+    : null;
+}
+
+// Finish one snapshot reply with `finish`, on time or late: a timed-out
+// request's late reply goes through the same continuation (delta merge,
+// rememberFullSnapshot) before anyone paints it.
+function finishFullSnapshotReply(request, finish) {
+  return request.then(finish, (err) => {
+    const lateReply = lateSnapshotReply(err);
+    if (lateReply) {
+      const finished = lateReply.then(finish)
+        .catch((lateErr) => lateSnapshotReply(lateErr) || Promise.reject(lateErr));
+      finished.catch(() => {});
+      err.lateReply = finished;
+    }
+    throw err;
+  });
+}
+
 // One full-shape snapshot read: a delta against this view's last full payload
 // when the runtime speaks it, else -- and after any delta miss -- a plain full call.
-async function callFullSnapshot(view, client, timeoutMs) {
+async function requestFullSnapshot(view, client, timeoutMs) {
+  const plainFull = async () => finishFullSnapshotReply(
+    client.callTool(DASHBOARD_TOOLS.snapshot, { full: true }, timeoutMs),
+    (payload) => {
+      rememberFullSnapshot(view, client, payload);
+      return payload;
+    },
+  );
   const cache = view.snapshotDeltaCache;
   if (
-    cache && cache.client === client && cache.claimEpisode === client.claimEpisode
-    && clientSpeaksSnapshotDelta(client)
+    !cache || cache.client !== client || cache.claimEpisode !== client.claimEpisode
+    || !clientSpeaksSnapshotDelta(client)
   ) {
-    const reply = await client.callTool(
+    return plainFull();
+  }
+  return finishFullSnapshotReply(
+    client.callTool(
       DASHBOARD_TOOLS.snapshot,
       { full: true, previous: { [SNAPSHOT_SECTION_DIGESTS_FIELD]: cache.digests } },
       timeoutMs,
-    );
-    if (!isPlainSnapshotObject(reply) || reply.snapshot_mode !== SNAPSHOT_DELTA_MODE) {
-      rememberFullSnapshot(view, client, reply);
-      return reply;
-    }
-    try {
-      const merged = mergeSnapshotDelta(cache, reply);
-      rememberFullSnapshot(view, client, merged.payload, merged.digests);
-      debugTrace("snapshot.delta.merged", { changed_sections: Object.keys(reply.changed_sections).length });
-      return merged.payload;
-    } catch (err) {
-      view.snapshotDeltaCache = null;
-      debugTrace("snapshot.delta.fallback", { reason: sanitizeErrorMessage(err) });
-    }
+    ),
+    (reply) => {
+      if (!isPlainSnapshotObject(reply) || reply.snapshot_mode !== SNAPSHOT_DELTA_MODE) {
+        rememberFullSnapshot(view, client, reply);
+        return reply;
+      }
+      try {
+        const merged = mergeSnapshotDelta(cache, reply);
+        rememberFullSnapshot(view, client, merged.payload, merged.digests);
+        debugTrace("snapshot.delta.merged", { changed_sections: Object.keys(reply.changed_sections).length });
+        return merged.payload;
+      } catch (err) {
+        view.snapshotDeltaCache = null;
+        debugTrace("snapshot.delta.fallback", { reason: sanitizeErrorMessage(err) });
+        return plainFull();
+      }
+    },
+  );
+}
+
+// NF-2026-02323: at most one full snapshot request per view and client is in
+// the reader at a time. While one is in flight -- on time, or past its budget
+// and awaiting its late reply -- a further refresh/poll joins it instead of
+// writing another frame, so a slow reader never accumulates stacked requests.
+async function callFullSnapshot(view, client, timeoutMs) {
+  const flight = view.fullSnapshotFlight;
+  if (flight && flight.client === client) {
+    debugTrace("snapshot.full.joined", { late: flight.late });
+    return flight.request;
   }
-  const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, { full: true }, timeoutMs);
-  rememberFullSnapshot(view, client, payload);
-  return payload;
+  const entry = { client, late: false, request: null };
+  const release = () => {
+    if (view.fullSnapshotFlight === entry) view.fullSnapshotFlight = null;
+  };
+  entry.request = requestFullSnapshot(view, client, timeoutMs).then(
+    (payload) => {
+      release();
+      return payload;
+    },
+    (err) => {
+      const lateReply = lateSnapshotReply(err);
+      if (lateReply) {
+        entry.late = true;
+        lateReply.then(release, release);
+      } else {
+        release();
+      }
+      throw err;
+    },
+  );
+  view.fullSnapshotFlight = entry;
+  return entry.request;
 }
 
 async function pushSnapshotOnce(view) {
@@ -11436,7 +11574,10 @@ async function pushSnapshotOnce(view) {
   // summary is normally available in about two seconds. After the first full
   // paint the Webview already shows every card, so a refresh asks only for the
   // full snapshot instead of building both on each poll (NF-2026-00633).
-  if (!view.fullSnapshotPainted) {
+  // A summary queued behind an in-flight full snapshot on the single-threaded
+  // reader would only answer after it, so that refresh joins the full one.
+  const fullSnapshotInFlight = Boolean(view.fullSnapshotFlight && view.fullSnapshotFlight.client === client);
+  if (!view.fullSnapshotPainted && !fullSnapshotInFlight) {
     try {
       const summaryPayload = await client.callTool(
         DASHBOARD_TOOLS.snapshot,
@@ -11463,7 +11604,10 @@ async function pushSnapshotOnce(view) {
       });
     }
   }
-  for (let attempt = 0; attempt < MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
+  let payload = null;
+  let received = false;
+  let attempt = 0;
+  for (; attempt < MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
     if (attempt > 0) {
       if (client.recovery.open) break;
       await new Promise((resolve) => setTimeout(resolve, MCP_RECOVERY_BACKOFF_MS[attempt - 1]));
@@ -11471,30 +11615,9 @@ async function pushSnapshotOnce(view) {
     try {
       debugTrace("snapshot.attempt.begin", { request_seq: requestSeq, attempt: attempt + 1 });
       refreshCoordinatorRouteBeforeSnapshot();
-      const payload = await callFullSnapshot(view, client, MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS);
-      debugTrace("snapshot.payload.received", {
-        request_seq: requestSeq,
-        attempt: attempt + 1,
-        payload_present: Boolean(payload),
-      });
-      if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
-        view.postMessage({
-          type: OUTBOUND_TYPES.snapshot,
-          payload: sanitizeWebviewPayload({
-            ...payload,
-            system_logs: systemLogSnapshot(),
-            ...runtimeRetentionSnapshotFields(),
-          }),
-        });
-        view.fullSnapshotPainted = true;
-        // The storage state is now visible. Only now may slower background
-        // services use this serialized MCP transport.
-        client._convergeBackgroundServices();
-        debugTrace("snapshot.posted", { request_seq: requestSeq, attempt: attempt + 1 });
-      } else if (!payload && requestSeq === view.snapshotRequestSeq) {
-        view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
-      }
-      return;
+      payload = await callFullSnapshot(view, client, MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS);
+      received = true;
+      break;
     } catch (err) {
       debugTrace("snapshot.attempt.error", {
         request_seq: requestSeq,
@@ -11515,18 +11638,55 @@ async function pushSnapshotOnce(view) {
       if (isSnapshotTimeoutReason(snapshotRecovery.reason)) break;
     }
   }
-  if (requestSeq === view.snapshotRequestSeq) {
-    const delayed = isSnapshotTimeoutReason(snapshotRecovery.reason);
-    view.postMessage({
-      type: delayed ? OUTBOUND_TYPES.snapshotDelayed : OUTBOUND_TYPES.offline,
-      reason: sanitizeErrorMessage(lastError),
-      recovery: snapshotRecovery,
-    });
+  if (!received) {
+    if (requestSeq === view.snapshotRequestSeq) {
+      const delayed = isSnapshotTimeoutReason(snapshotRecovery.reason);
+      view.postMessage({
+        type: delayed ? OUTBOUND_TYPES.snapshotDelayed : OUTBOUND_TYPES.offline,
+        reason: sanitizeErrorMessage(lastError),
+        recovery: snapshotRecovery,
+      });
+    }
+    debugTrace(
+      isSnapshotTimeoutReason(snapshotRecovery.reason) ? "snapshot.delayed" : "snapshot.offline",
+      { request_seq: requestSeq, ...debugErrorFields(lastError) },
+    );
+    // NF-2026-02323: the timed-out request is still pending in the reader. Its
+    // late reply is painted below exactly like an on-time one, which replaces
+    // the banner; a request abandoned at the hard cap or by a stop leaves the
+    // banner for the next refresh/Retry.
+    const lateReply = lateSnapshotReply(lastError);
+    if (!lateReply) return;
+    try {
+      payload = await lateReply;
+    } catch (err) {
+      debugTrace("snapshot.late.error", { request_seq: requestSeq, ...debugErrorFields(err) });
+      return;
+    }
+    debugTrace("snapshot.late.received", { request_seq: requestSeq });
   }
-  debugTrace(
-    isSnapshotTimeoutReason(snapshotRecovery.reason) ? "snapshot.delayed" : "snapshot.offline",
-    { request_seq: requestSeq, ...debugErrorFields(lastError) },
-  );
+  debugTrace("snapshot.payload.received", {
+    request_seq: requestSeq,
+    attempt: attempt + 1,
+    payload_present: Boolean(payload),
+  });
+  if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.snapshot,
+      payload: sanitizeWebviewPayload({
+        ...payload,
+        system_logs: systemLogSnapshot(),
+        ...runtimeRetentionSnapshotFields(),
+      }),
+    });
+    view.fullSnapshotPainted = true;
+    // The storage state is now visible. Only now may slower background
+    // services use this serialized MCP transport.
+    client._convergeBackgroundServices();
+    debugTrace("snapshot.posted", { request_seq: requestSeq, attempt: attempt + 1 });
+  } else if (!payload && requestSeq === view.snapshotRequestSeq) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
+  }
 }
 
 async function pushSnapshotNoRetry(view, options = {}) {
@@ -12758,9 +12918,14 @@ function handleInboundMessage(view, message) {
     case "retry": {
       const client = getDashboardClient();
       runBackgroundTask("dashboard retry", async () => {
-        // Explicit Retry replaces this window's dashboard process and clears
-        // its respawn backoff, even when the old process still looks alive.
-        // The routing child's runtime health/repair stays with pushRuntimeInfo.
+        // Explicit Retry clears the respawn backoff. A live dashboard process
+        // that has answered before and recorded no failure is kept with its
+        // pending requests (NF-2026-02323): pushSnapshot joins the in-flight
+        // full snapshot or re-sends one. Only with no live child, a recorded
+        // process-level failure (exit, write failure, protocol error) or a hung
+        // reader (a request past DASHBOARD_LATE_REPLY_CAP_MS) is it stopped and
+        // respawned. The routing child's runtime health/repair stays with
+        // pushRuntimeInfo.
         client.resetForExplicitRetry();
         await pushRuntimeInfo(view);
         await pushSnapshot(view);
@@ -16293,6 +16458,9 @@ module.exports = {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_INITIALIZE_TIMEOUT_MS,
       MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
+      DASHBOARD_REQUEST_TIMEOUT_REASON,
+      DASHBOARD_PROCESS_COLD_START_TIMEOUT_MS,
+      DASHBOARD_LATE_REPLY_CAP_MS,
       MCP_TIMER_LAG_TOLERANCE_MS,
       MCP_TIMER_LAG_GRACE_MS,
       HOST_STALL_PROBE_INTERVAL_MS,

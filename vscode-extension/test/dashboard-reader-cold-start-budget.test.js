@@ -66,8 +66,11 @@ assert.ok(
   ),
   "callTool must select the cold budget until the child has answered",
 );
+// NF-2026-02323: the soft timer no longer fails the request; it rejects the caller with
+// DASHBOARD_REQUEST_TIMEOUT_REASON and keeps the record pending for the late reply.
 assert.ok(
-  callTool.includes("fail(new Error(DASHBOARD_REQUEST_TIMEOUT_REASON)), coldBudgetMs);"),
+  callTool.includes("const err = new Error(DASHBOARD_REQUEST_TIMEOUT_REASON);")
+    && callTool.includes("}, coldBudgetMs);"),
   "callTool's request timer must use the selected budget",
 );
 assert.ok(
