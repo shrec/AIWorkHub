@@ -36,9 +36,10 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 SCHEMA_ID = "aiworkhub.dashboard_reader.v1"
 
@@ -89,6 +90,9 @@ MAX_ERROR_DETAIL_CHARS = 240
 # next drain, so one request can never pin the loop indefinitely.
 MAX_DEFERRED_JOBS_PER_DRAIN = 64
 MAX_DEFERRED_QUEUE = 256
+# Only an explicit ``join`` of a polled child-process job re-polls; serve()
+# never sleeps on one.
+JOIN_POLL_INTERVAL_SECONDS = 0.05
 
 
 class DashboardReaderError(Exception):
@@ -104,6 +108,19 @@ class DashboardReaderError(Exception):
 
 
 _DEFERRED: collections.deque[_DeferredThread] = collections.deque()
+
+
+@runtime_checkable
+class _PolledJob(Protocol):
+    """A started child-process job a deferred target returned (NF-2026-02324).
+
+    ``poll`` checks the child without waiting and returns True once its result
+    is published; ``cancel`` kills a still-running child and removes its files.
+    """
+
+    def poll(self) -> bool: ...
+
+    def cancel(self) -> None: ...
 
 
 class _DeferredThread:
@@ -131,6 +148,7 @@ class _DeferredThread:
         self._args = tuple(args)
         self._kwargs = dict(kwargs or {})
         self._state = "new"
+        self._pending: _PolledJob | None = None
 
     def start(self) -> None:
         if self._state != "new":
@@ -143,30 +161,66 @@ class _DeferredThread:
         _DEFERRED.append(self)
 
     def run(self) -> None:
+        self._call_target()
+
+    def _call_target(self) -> Any:
         if self._target is not None:
-            self._target(*self._args, **self._kwargs)
+            return self._target(*self._args, **self._kwargs)
+        return None
 
     def _run_now(self) -> None:
-        if self._state != "queued":
+        """Run the job, or poll its running child once; never waits on a child.
+
+        A target that returns a :class:`_PolledJob` (repo_policy's polled
+        ``opencode models`` refresh, NF-2026-02324) has started a child
+        process; the job then stays ``polling`` until ``poll()`` reports it
+        finished and published.
+        """
+        if self._state not in ("queued", "polling"):
             return
+        pending = self._pending
         self._state = "running"
         try:
-            self.run()
+            if pending is None:
+                outcome = self._call_target()
+                if isinstance(outcome, _PolledJob):
+                    pending = outcome
+            if pending is not None and pending.poll():
+                pending = None
         except Exception as exc:  # noqa: BLE001 -- a background refresh never ends the process
+            pending = None
             sys.stderr.write(
                 f"dashboard_reader_deferred_failed:{self.name}:{type(exc).__name__}:"
                 f"{str(exc)[:MAX_ERROR_DETAIL_CHARS]}\n"
             )
         finally:
-            self._state = "done"
+            self._pending = pending
+            self._state = "polling" if pending is not None else "done"
+
+    def _cancel(self) -> None:
+        pending, self._pending = self._pending, None
+        self._state = "done"
+        if pending is not None:
+            pending.cancel()
 
     def join(self, timeout: float | None = None) -> None:
         if self._state == "new":
             raise RuntimeError("cannot join thread before it is started")
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         self._run_now()
+        # A caller that waits for its own refresh still observes the result;
+        # only an explicit join ever waits on a polled child.
+        while self._state == "polling":
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            time.sleep(JOIN_POLL_INTERVAL_SECONDS)
+            self._run_now()
 
     def is_alive(self) -> bool:
-        return self._state in ("queued", "running")
+        return self._state in ("queued", "running", "polling")
+
+    def is_polling(self) -> bool:
+        return self._state == "polling"
 
 
 class _ThreadingFence(types.ModuleType):
@@ -189,20 +243,48 @@ def install_single_thread_fence() -> None:
         if getattr(module, "threading", None) is not threading:
             raise RuntimeError(f"dashboard_reader_fence_unrecognized:{module_name}")
         setattr(module, "threading", fence)
-    from aiworkhub import dashboard
+    from aiworkhub import dashboard, repo_policy
 
     # build_snapshot's own sequential path (the one-core branch): reads run
     # inline on this thread and the shared read pool is never created.
     setattr(dashboard, "_snapshot_read_worker_limit", lambda: 1)
+    # NF-2026-02324: the ``opencode models`` refresh runs here as a polled
+    # child process, so a drain never waits on it (it is a child process and
+    # not a thread because this process stays single-threaded).
+    repo_policy.enable_polled_opencode_probe(_DeferredThread)
 
 
 def drain_deferred_work(limit: int = MAX_DEFERRED_JOBS_PER_DRAIN) -> int:
-    """Run up to ``limit`` queued background jobs on this thread; return the count."""
+    """Run up to ``limit`` queued background jobs on this thread; return the count.
+
+    A job whose child process is still running (the polled ``opencode models``
+    refresh, NF-2026-02324) is polled once without waiting and, unfinished,
+    queued again for the next drain.
+    """
     ran = 0
+    unfinished: list[_DeferredThread] = []
     while _DEFERRED and ran < limit:
-        _DEFERRED.popleft()._run_now()
+        job = _DEFERRED.popleft()
+        job._run_now()
         ran += 1
+        if job.is_polling():
+            unfinished.append(job)
+    _DEFERRED.extend(unfinished)
     return ran
+
+
+def stop_polled_work() -> int:
+    """Kill every still-running polled child and drop its job; return the count.
+
+    Called when ``serve`` ends: a probe child never outlives the reader and its
+    output files are removed. Queued jobs that never started stay queued.
+    """
+    stopped = 0
+    for job in [job for job in _DEFERRED if job.is_polling()]:
+        _DEFERRED.remove(job)
+        job._cancel()
+        stopped += 1
+    return stopped
 
 
 def dashboard_tools() -> dict[str, Callable[..., Any]]:
@@ -301,6 +383,14 @@ def _read_request_line(stdin: BinaryIO) -> tuple[bytes, bool] | None:
 
 def serve(stdin: BinaryIO, stdout: BinaryIO, tools: Mapping[str, Callable[..., Any]]) -> int:
     """Serve requests until stdin closes; one reply line per request line."""
+    try:
+        return _serve_loop(stdin, stdout, tools)
+    finally:
+        # Never leave a polled probe child (NF-2026-02324) behind.
+        stop_polled_work()
+
+
+def _serve_loop(stdin: BinaryIO, stdout: BinaryIO, tools: Mapping[str, Callable[..., Any]]) -> int:
     while True:
         read = _read_request_line(stdin)
         if read is None:

@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -844,7 +845,14 @@ class _TtlSingleFlightCache:
         compute: Any,
         cacheable: Any,
         generation: int,
-    ) -> None:
+    ) -> _PolledRefresh | None:
+        start_polled = getattr(compute, "start_polled", None)
+        if callable(start_polled):
+            # NF-2026-02324 (dashboard reader only): the compute is a child
+            # process.  Return while it runs; the reader's fenced thread
+            # stand-in polls the returned refresh on its later drains.
+            refresh = _PolledRefresh(self, key, start_polled, cacheable, generation)
+            return None if refresh.poll() else refresh
         ok = False
         value: Any = None
         error: BaseException | None = None
@@ -855,14 +863,33 @@ class _TtlSingleFlightCache:
             ok = False
             error = exc
         finally:
-            # Publish before clearing the flag, so a get() in between never sees
-            # the stale entry with no refresh in flight and starts a second one.
+            self._finish_refresh(key, ok, value, error, generation)
+        return None
+
+    def _finish_refresh(
+        self,
+        key: Any,
+        ok: bool,
+        value: Any,
+        error: BaseException | None,
+        generation: int,
+    ) -> None:
+        # Publish before clearing the flag, so a get() in between never sees
+        # the stale entry with no refresh in flight and starts a second one.
+        try:
             if ok:
                 self._store(key, value, generation)
             else:
                 self._store_rejected(key, value, error, generation)
+        finally:
             with self._lock:
                 self._refreshing.discard(key)
+
+    def _abandon_refresh(self, key: Any) -> None:
+        """Clear the in-flight flag of a refresh stopped without a result."""
+
+        with self._lock:
+            self._refreshing.discard(key)
 
     def get(
         self,
@@ -939,6 +966,67 @@ class _TtlSingleFlightCache:
         if accept(value):
             self._store(key, value, generation)
         return deepcopy(value)
+
+
+class _PolledRefresh:
+    """A cache refresh whose compute is a running child process (NF-2026-02324).
+
+    Only the dashboard reader produces one: its fenced thread stand-in keeps
+    the job queued and calls :meth:`poll` once per drain -- never waiting --
+    until the result is published to the cache like a threaded refresh's.
+    """
+
+    def __init__(
+        self,
+        cache: _TtlSingleFlightCache,
+        key: Any,
+        start: Any,
+        cacheable: Any,
+        generation: int,
+    ) -> None:
+        self._cache = cache
+        self._key = key
+        self._start = start
+        self._cacheable = cacheable
+        self._generation = generation
+        self._job: Any = None
+        self._done = False
+
+    def poll(self) -> bool:
+        """Advance without waiting; True once the refresh is published."""
+
+        if self._done:
+            return True
+        ok = False
+        value: Any = None
+        error: BaseException | None = None
+        try:
+            if self._job is None:
+                self._job = self._start()
+            if not self._job.poll():
+                return False
+            value = self._job.result()
+            ok = bool(self._cacheable(value))
+        except Exception as exc:  # noqa: BLE001 - keep serving the last good value
+            ok = False
+            error = exc
+            if self._job is not None:
+                self._job.cancel()
+        self._done = True
+        self._cache._finish_refresh(self._key, ok, value, error, self._generation)
+        return True
+
+    def cancel(self) -> None:
+        """Stop an unfinished refresh (reader exit): kill the child, publish nothing."""
+
+        if self._done:
+            return
+        self._done = True
+        try:
+            if self._job is not None:
+                self._job.cancel()
+        finally:
+            self._cache._abandon_refresh(self._key)
 
 
 def _sanitized_probe_exception(error: BaseException) -> BaseException:
@@ -1096,9 +1184,17 @@ def _cached_opencode_models(
             "failed",
         )
 
+    # In the dashboard reader the background refresh is a polled child
+    # process (NF-2026-02324); everywhere else the compute is unchanged.
+    runtime_dir = _polled_probe_runtime_dir()
+    compute: Any = (
+        _PolledOpencodeModels(executable, runtime_dir)
+        if runtime_dir is not None
+        else (lambda: _opencode_models_with_record(executable))
+    )
     value = _OPENCODE_MODELS_CACHE.get(
         key,
-        lambda: _opencode_models_with_record(executable),
+        compute,
         cacheable,
         blocking=not _probes_nonblocking(),
     )
@@ -1153,8 +1249,6 @@ def _opencode_models_probe_once(
 ) -> tuple[list[str], str | None]:
     """Run ``opencode models`` once; return (rows, failure_reason)."""
 
-    from . import workforce_catalog
-
     try:
         completed = subprocess.run(
             [executable, "models"],
@@ -1168,18 +1262,41 @@ def _opencode_models_probe_once(
         return [], "oserror"
     except ValueError:
         return [], "invalid"
-    payload = completed.stdout or b""
+    return _opencode_models_from_output(
+        completed.stdout or b"",
+        completed.stderr or b"",
+        getattr(completed, "returncode", 0),
+    )
+
+
+def _opencode_models_from_output(
+    stdout: bytes, stderr: bytes, returncode: Any
+) -> tuple[list[str], str | None]:
+    """Parse one finished ``opencode models`` run; return (rows, failure_reason).
+
+    Shared by the blocking probe and the reader's polled child (NF-2026-02324),
+    so both yield the same rows and the same oversized/exit_N/empty reasons.
+    """
+
+    from . import workforce_catalog
+
+    payload = stdout or b""
     if not payload:
-        payload = completed.stderr or b""
+        payload = stderr or b""
     if len(payload) > _OPENCODE_PROBE_MAX_PAYLOAD_BYTES:
         return [], "oversized"
     rows = workforce_catalog.parse_opencode_models_output(payload)
     if not rows:
-        returncode = getattr(completed, "returncode", 0)
         if returncode:
             return [], f"exit_{returncode}"
         return [], "empty"
     return rows, None
+
+
+def _opencode_probe_retryable(reason: str | None) -> bool:
+    """A timed-out or empty first probe is retried once with the longer timeout."""
+
+    return reason in ("timeout", "empty")
 
 
 def _list_opencode_models(executable: str | None) -> list[str]:
@@ -1197,10 +1314,22 @@ def _list_opencode_models(executable: str | None) -> list[str]:
     rows, reason = _opencode_models_probe_once(
         executable, _OPENCODE_PROBE_TIMEOUT_SECONDS
     )
-    if reason in ("timeout", "empty"):
+    if _opencode_probe_retryable(reason):
         rows, reason = _opencode_models_probe_once(
             executable, _OPENCODE_PROBE_RETRY_TIMEOUT_SECONDS
         )
+    return _publish_opencode_probe(executable, rows, reason)[0]
+
+
+def _publish_opencode_probe(
+    executable: str, rows: list[str], reason: str | None
+) -> tuple[list[str], dict[str, Any]]:
+    """Record one finished probe; return (served listing, probe record).
+
+    The one owner of the last-known-good list, the probe record and the owner
+    custom-provider append, for both the blocking and the polled probe.
+    """
+
     with _OPENCODE_PROBE_LOCK:
         if reason is None:
             _OPENCODE_LAST_GOOD_MODELS[executable] = list(rows)
@@ -1220,7 +1349,233 @@ def _list_opencode_models(executable: str | None) -> list[str]:
         if model not in existing:
             served.append(model)
             existing.add(model)
-    return served
+    return served, dict(record)
+
+
+# The uncached probe callables as defined here; a test that replaces any of
+# them keeps the blocking path, so its stub is called exactly as before.
+_BLOCKING_OPENCODE_PROBE: tuple[Any, ...] = (
+    _list_opencode_models,
+    _opencode_models_probe_once,
+    subprocess.run,
+)
+
+# NF-2026-02324: the dashboard reader is single-threaded by owner requirement
+# (NF-2026-02287); its fence runs this module's refresh "thread" inline after
+# each reply, so a blocking ``subprocess.run`` probe there stalled every
+# request for the whole probe (measured 20.79 s).  In the reader the refresh
+# is a polled CHILD PROCESS instead -- not a thread, which the fence exists to
+# forbid: it starts ``[executable, "models"]`` with Popen (output to files
+# under the repository runtime directory) and later drains collect it with
+# poll().  Enabled only by ``dashboard_reader.install_single_thread_fence``.
+_POLLED_PROBE_THREAD_CLASS: Any = None
+_OPENCODE_PROBE_RUNTIME_PARTS: tuple[str, ...] = ("opencode_models_probe",)
+_OPENCODE_PROBE_KILL_TIMEOUT_SECONDS = 0.5
+
+
+def enable_polled_opencode_probe(thread_class: Any) -> None:
+    """Poll the probe as a child process while ``threading.Thread`` is ``thread_class``.
+
+    ``thread_class`` is the reader fence's queued thread stand-in; once this
+    module's ``threading`` is no longer that fence the blocking path returns.
+    ``None`` disables the polled path.  The threaded MCP server never calls it.
+    """
+
+    global _POLLED_PROBE_THREAD_CLASS
+    _POLLED_PROBE_THREAD_CLASS = thread_class
+
+
+def _polled_probe_runtime_dir() -> Path | None:
+    """The runtime directory of a polled probe, or None for the blocking path."""
+
+    thread_class = _POLLED_PROBE_THREAD_CLASS
+    if thread_class is None or getattr(threading, "Thread", None) is not thread_class:
+        return None
+    if (
+        _list_opencode_models is not _BLOCKING_OPENCODE_PROBE[0]
+        or _opencode_models_probe_once is not _BLOCKING_OPENCODE_PROBE[1]
+        or subprocess.run is not _BLOCKING_OPENCODE_PROBE[2]
+    ):
+        return None
+    from . import runtime_temp
+
+    root = runtime_temp.known_repository()
+    if root is None:
+        # Never write probe output outside a known repository.
+        return None
+    try:
+        return runtime_temp.repo_runtime_dir(root, *_OPENCODE_PROBE_RUNTIME_PARTS)
+    except runtime_temp.RuntimeTempError:
+        return None
+
+
+def _probe_child_session_kwargs() -> dict[str, Any]:
+    """POSIX: own process group, so a timeout kill reaches the whole tree."""
+
+    return {} if _is_windows_host() else {"start_new_session": True}
+
+
+def _read_probe_output(path: Path) -> bytes:
+    # One byte past the limit is enough to name the probe ``oversized``.
+    with path.open("rb") as handle:
+        return handle.read(_OPENCODE_PROBE_MAX_PAYLOAD_BYTES + 1)
+
+
+def _remove_probe_outputs(paths: Any) -> None:
+    for path in paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+class _PolledOpencodeModelsProbe:
+    """One ``opencode models`` listing as a polled child process (NF-2026-02324).
+
+    :meth:`poll` never waits on the child: it starts it, or checks it with
+    ``Popen.poll``, and returns True once the result is published exactly as
+    :func:`_list_opencode_models` publishes it -- same rows and failure
+    reasons, one retry on timeout/empty, the same last-known-good and record.
+    A child still running at its deadline is killed with its process tree and
+    reported as ``timeout``.  Output files are removed once collected.
+    """
+
+    def __init__(self, executable: str, runtime_dir: Path) -> None:
+        self._executable = executable
+        self._runtime_dir = runtime_dir
+        self._attempts = 0
+        self._process: subprocess.Popen[bytes] | None = None
+        self._outputs: tuple[Path, Path] | None = None
+        self._deadline = 0.0
+        self._result: tuple[list[str], dict[str, Any]] | None = None
+
+    def result(self) -> tuple[list[str], dict[str, Any]]:
+        if self._result is None:
+            raise RuntimeError("opencode_models_probe_not_finished")
+        served, record = self._result
+        return list(served), dict(record)
+
+    def poll(self) -> bool:
+        if self._result is not None:
+            return True
+        rows: list[str] = []
+        if self._process is None:
+            reason = self._start(_OPENCODE_PROBE_TIMEOUT_SECONDS)
+            if reason is None:
+                return False
+        else:
+            returncode = self._process.poll()
+            if returncode is None and time.monotonic() < self._deadline:
+                return False
+            if returncode is None:
+                self._stop_child()
+                reason = "timeout"
+            else:
+                rows, reason = self._collect(returncode)
+        if self._attempts == 1 and _opencode_probe_retryable(reason):
+            reason = self._start(_OPENCODE_PROBE_RETRY_TIMEOUT_SECONDS)
+            if reason is None:
+                return False
+            rows = []
+        self._result = _publish_opencode_probe(self._executable, rows, reason)
+        return True
+
+    def cancel(self) -> None:
+        """Kill a still-running child and remove its files; publishes nothing."""
+
+        self._stop_child()
+
+    def _start(self, timeout: int) -> str | None:
+        """Start one attempt; None while it runs, else its failure reason."""
+
+        self._attempts += 1
+        descriptors: list[int] = []
+        paths: list[Path] = []
+        reason: str | None = None
+        try:
+            self._runtime_dir.mkdir(parents=True, exist_ok=True)
+            for suffix in (".out", ".err"):
+                descriptor, name = tempfile.mkstemp(
+                    prefix="opencode-models-", suffix=suffix, dir=self._runtime_dir
+                )
+                descriptors.append(descriptor)
+                paths.append(Path(name))
+            process = subprocess.Popen(
+                [self._executable, "models"],
+                stdin=subprocess.DEVNULL,
+                stdout=descriptors[0],
+                stderr=descriptors[1],
+                **_probe_child_session_kwargs(),
+            )
+        except OSError:
+            reason = "oserror"
+        except ValueError:
+            reason = "invalid"
+        else:
+            self._process = process
+            self._outputs = (paths[0], paths[1])
+            self._deadline = time.monotonic() + timeout
+        finally:
+            for descriptor in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if reason is not None:
+            _remove_probe_outputs(paths)
+        return reason
+
+    def _collect(self, returncode: int) -> tuple[list[str], str | None]:
+        outputs = self._outputs or ()
+        self._process = None
+        self._outputs = None
+        try:
+            stdout = _read_probe_output(outputs[0])
+            stderr = _read_probe_output(outputs[1])
+        except (OSError, IndexError):
+            return [], "oserror"
+        finally:
+            _remove_probe_outputs(outputs)
+        return _opencode_models_from_output(stdout, stderr, returncode)
+
+    def _stop_child(self) -> None:
+        process = self._process
+        outputs = self._outputs or ()
+        self._process = None
+        self._outputs = None
+        if process is not None:
+            if process.poll() is None:
+                from . import platform_io
+
+                platform_io.terminate_process_tree(
+                    process.pid,
+                    timeout=_OPENCODE_PROBE_KILL_TIMEOUT_SECONDS,
+                    probe=lambda _identity: process.poll() is None,
+                )
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=_OPENCODE_PROBE_KILL_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        _remove_probe_outputs(outputs)
+
+
+class _PolledOpencodeModels:
+    """The reader's cache compute: blocking when called, polled when started."""
+
+    def __init__(self, executable: str, runtime_dir: Path) -> None:
+        self._executable = executable
+        self._runtime_dir = runtime_dir
+
+    def __call__(self) -> tuple[list[str], dict[str, Any] | None]:
+        return _opencode_models_with_record(self._executable)
+
+    def start_polled(self) -> _PolledOpencodeModelsProbe:
+        return _PolledOpencodeModelsProbe(self._executable, self._runtime_dir)
 
 
 def _provider_status(
