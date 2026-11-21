@@ -21,7 +21,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from .platform_io import atomic_replace, chmod_fd, lock_fd, unlock_fd
 
@@ -1377,6 +1377,7 @@ def latest_events(
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
     drop_fields: tuple[str, ...] = (),
+    keep_fields: Sequence[str] = (),
 ) -> dict[str, dict[str, Any]]:
     """Return the latest merged row per key using an append-aware projection.
 
@@ -1394,16 +1395,28 @@ def latest_events(
     from the dict handed back to the caller. Omitting it preserves the exact
     default projection byte-for-byte.
 
+    ``keep_fields`` is the inverse (NF-2026-02014): only those keys are folded
+    and retained, so a caller that reads a handful of fields avoids
+    materialising every full row. Each kept field ends with the value the
+    unfiltered fold would hold; keys that never carried a kept field are
+    absent. It combines with every other option exactly as ``_latest_view``
+    folds them (the keep filter runs first, then ``drop_fields``). A bare
+    string is refused rather than split into characters. An empty value keeps
+    the default projection byte-for-byte.
+
     This returns a copy of the WHOLE projection; a caller that needs one key
     or a filtered subset should use ``latest_event`` / ``latest_events_where``.
     """
 
+    if isinstance(keep_fields, (str, bytes)):
+        raise ValueError("keep_fields must be a sequence of field names, not a string")
     view = _latest_view(
         path,
         key_field=key_field,
         skip_event_kinds=skip_event_kinds,
         replace=replace,
         drop_fields=drop_fields,
+        keep_fields=tuple(keep_fields),
     )
     return copy_projection(view)
 

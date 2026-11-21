@@ -81,6 +81,20 @@ _TAIL_CAP_NOTICE = (
 _BOUNDABLE_LOG_SUFFIXES = (".stdout.log", ".stderr.log")
 
 _REQUEST_RE = re.compile(r"^[a-f0-9]{32}$")
+# Every ledger-row field the retention callers read (usage capture,
+# storage measurement, _terminal_request_ids and _attempt_recorded_at). The
+# fold keeps only these so a cold projection never materialises whole rows
+# (NF-2026-02014); add a field here before reading a new one from a row.
+_RETENTION_ROW_FIELDS: tuple[str, ...] = (
+    "request_id",
+    "task_id",
+    "runner",
+    "state",
+    "adapter_id",
+    "topic",
+    "model",
+    "finished_at",
+)
 _BATCH_RE = re.compile(r"^l[0-9]{8}T[0-9]{6}-[a-f0-9]{12}$")
 _OWNED_SUFFIXES = (".request.json", ".stderr.log", ".stdout.log", ".supervisor.json")
 # NF-2026-01360: the Claude auth relaunch keeps the replayed prompt and spec as
@@ -273,7 +287,7 @@ def _latest_rows(root: Path) -> dict[str, dict[str, Any]]:
         raise TerminalLogRetentionError("terminal_log_ledger_invalid")
     latest: dict[str, dict[str, Any]] = {}
     for request_id, row in process_event_ledger.latest_events(
-        ledger, drop_fields=("packet",)
+        ledger, keep_fields=_RETENTION_ROW_FIELDS
     ).items():
         if not _REQUEST_RE.fullmatch(request_id):
             continue

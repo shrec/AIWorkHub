@@ -166,8 +166,12 @@ def test_latest_rows_uses_incremental_ledger_projection(
         request_id: {"request_id": request_id, "state": "exited"},
         "not-a-request": {"request_id": "not-a-request", "state": "exited"},
     }
-    def _fake_latest_events(_path, *, drop_fields=()):
-        assert drop_fields == ("packet",), "packet must be dropped before retention"
+    def _fake_latest_events(_path, *, drop_fields=(), keep_fields=()):
+        assert drop_fields == (), "retention folds a keep_fields projection"
+        assert set(keep_fields) >= {
+            "request_id", "task_id", "runner", "state",
+            "adapter_id", "topic", "model", "finished_at",
+        }, "every field the retention callers read must be kept"
         return projected
 
     monkeypatch.setattr(
