@@ -33,6 +33,8 @@ HEAP_CENSUS_LARGEST_OBJECTS = 10
 HEAP_CENSUS_MAX_REFERRERS = 256
 HEAP_CENSUS_NAME_CHARS = 120
 HEAP_CENSUS_CONTAINER_TYPES = (dict, list, str, bytes, bytearray)
+# Untracked payload totals (NF-2026-02331): gc never tracks these; counted via referents.
+HEAP_CENSUS_PAYLOAD_TYPES = (str, bytes, bytearray)
 NESTED_PROBE_KEYS = ("reconciler", "learning_coverage")
 DETAIL_KEYS = ("error", "last_error", "reason")
 # Task DB holder scan (NF-2026-00274): every bound is a constant, never a per-call knob.
@@ -191,7 +193,18 @@ def diagnose(
     if heap_census:
         reply["server_process"] = server_process(heap_census=True)
         census = reply["server_process"]["heap_census"]
-        # The census gives way first: the largest-objects list, then the type table.
+        native = reply["server_process"]["native_memory"]
+        # Optional sections give way first: the payload holders, then mallinfo2.
+        payload = census.get("untracked_payload")
+        if isinstance(payload, dict) and payload.get("top_holders"):
+            if _encoded_size(reply) > REPLY_MAX_BYTES:
+                payload["top_holders"] = []
+                payload["top_holders_dropped"] = True
+        if isinstance(native, dict) and isinstance(native.get("mallinfo2"), dict):
+            if _encoded_size(reply) > REPLY_MAX_BYTES:
+                native["mallinfo2"] = None
+                native["reasons"]["mallinfo2"] = "dropped_to_fit_reply"
+        # Then the census core: the largest-objects list, then the type table.
         for key in ("largest_objects", "top_types"):
             if key in census and _encoded_size(reply) > REPLY_MAX_BYTES:
                 census[key] = []
@@ -246,7 +259,7 @@ def _register_owner(obj: Any, owners: dict[int, tuple[str, str]]) -> None:
     """Remember the namespace dict of a module, class or function by id."""
     kind = type(obj)
     if issubclass(kind, types.ModuleType):
-        namespace = types.ModuleType.__dict__["__dict__"].__get__(obj)
+        namespace = vars(types.ModuleType)["__dict__"].__get__(obj)
         if type(namespace) is dict:
             name = namespace.get("__name__")
             owners[id(namespace)] = ("module", str(name)[:HEAP_CENSUS_NAME_CHARS])
@@ -272,11 +285,72 @@ def _first_owner(obj: Any, owners: Mapping[int, tuple[str, str]]) -> tuple[str, 
     return None
 
 
+class _TopBySize:
+    """Bounded largest-N with id dedupe; keeps strong refs to at most ``limit`` objects."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._heap: list[tuple[int, int, Any]] = []
+        self._ids: set[int] = set()
+        self._sequence = 0
+
+    def offer(self, candidate: Any, size: int) -> None:
+        if self._limit <= 0 or id(candidate) in self._ids:
+            return
+        self._sequence += 1
+        entry = (size, self._sequence, candidate)
+        if len(self._heap) < self._limit:
+            heapq.heappush(self._heap, entry)
+        elif size > self._heap[0][0]:
+            self._ids.discard(id(heapq.heapreplace(self._heap, entry)[2]))
+        else:
+            return
+        self._ids.add(id(candidate))
+
+    def ranked(self) -> list[tuple[int, Any]]:
+        return [(size, obj) for size, _, obj in sorted(self._heap, key=lambda i: (-i[0], i[1]))]
+
+
+def _owner_or_none(obj: Any, owners: Mapping[int, tuple[str, str]]) -> tuple[str, str] | None:
+    try:
+        return _first_owner(obj, owners)
+    except Exception:
+        return None
+
+
+def _census_entry(
+    obj: Any, size_key: str, size: int, owner: tuple[str, str] | None
+) -> dict[str, Any]:
+    """One bounded census row: type name, length, a size and the owner name, never contents."""
+    try:
+        length = _container_len(obj)
+    except Exception:
+        length = None
+    return {
+        "type": _type_name(type(obj)),
+        "len": length,
+        size_key: size,
+        "referrer": owner[0] if owner else None,
+        "referrer_name": owner[1] if owner else None,
+    }
+
+
+def _payload_base(kind: type) -> type | None:
+    for base in HEAP_CENSUS_PAYLOAD_TYPES:
+        if issubclass(kind, base):
+            return base
+    return None
+
+
 def _heap_census(max_objects: int) -> dict[str, Any]:
     """Bounded stdlib census of the live heap: type names, counts and sizes only.
 
     Type counts cover gc-tracked objects; untracked str/bytes/bytearray/dict
     values are reached through their referring containers for the largest list.
+    ``untracked_payload`` totals those str/bytes/bytearray referents per type
+    (deduped by id, at most ``max_objects`` distinct payloads) in the same walk,
+    one level through untracked dict/tuple referents, and ranks the containers
+    that directly reference the most payload bytes.
     Ceiling: gc.get_objects() materialises one list of every tracked object
     (8 bytes each), and each largest-object referrer lookup walks the heap once.
     """
@@ -288,23 +362,44 @@ def _heap_census(max_objects: int) -> dict[str, Any]:
     truncated = len(objects) > max_objects
     by_type: dict[type, list[int]] = {}
     owners: dict[int, tuple[str, str]] = {}
-    largest: list[tuple[int, int, Any]] = []
-    largest_ids: set[int] = set()
-    sequence = 0
+    largest = _TopBySize(HEAP_CENSUS_LARGEST_OBJECTS)
+    holders = _TopBySize(HEAP_CENSUS_LARGEST_OBJECTS)
+    payload_totals: dict[type, list[int]] = {base: [0, 0] for base in HEAP_CENSUS_PAYLOAD_TYPES}
+    payload_seen: set[int] = set()
+    descended: set[int] = set()
+    payload_capped = False
 
-    def offer(candidate: Any, size: int) -> None:
-        nonlocal sequence
-        if id(candidate) in largest_ids:
+    def count_payload(ref: Any) -> int:
+        """Shallow size of a payload referent (0 otherwise); type totals dedupe by id."""
+        nonlocal payload_capped
+        base = _payload_base(type(ref))
+        if base is None:
+            return 0
+        size = _shallow_size(ref)
+        key = id(ref)
+        if key not in payload_seen:
+            if len(payload_seen) < max_objects:
+                payload_seen.add(key)
+                slot = payload_totals[base]
+                slot[0] += 1
+                slot[1] += size
+            else:
+                payload_capped = True
+        return size
+
+    def descend(ref: Any) -> None:
+        """Untracked dict/tuple values are invisible to gc.get_objects(): scan each once."""
+        nonlocal payload_capped
+        key = id(ref)
+        if key in descended:
             return
-        sequence += 1
-        if len(largest) < HEAP_CENSUS_LARGEST_OBJECTS:
-            heapq.heappush(largest, (size, sequence, candidate))
-        elif size > largest[0][0]:
-            gone = heapq.heapreplace(largest, (size, sequence, candidate))[2]
-            largest_ids.discard(id(gone))
-        else:
+        if len(descended) >= max_objects:
+            payload_capped = True
             return
-        largest_ids.add(id(candidate))
+        descended.add(key)
+        nested = sum(count_payload(inner) for inner in gc.get_referents(ref))
+        if nested:
+            holders.offer(ref, nested)
 
     scanned = 0
     skipped = 0
@@ -322,33 +417,49 @@ def _heap_census(max_objects: int) -> dict[str, Any]:
         try:
             _register_owner(obj, owners)
             if issubclass(kind, HEAP_CENSUS_CONTAINER_TYPES):
-                offer(obj, size)
+                largest.offer(obj, size)
+            held = 0
             for ref in gc.get_referents(obj):
-                if issubclass(type(ref), HEAP_CENSUS_CONTAINER_TYPES) and not gc.is_tracked(ref):
-                    offer(ref, _shallow_size(ref))
+                ref_kind = type(ref)
+                untracked = not gc.is_tracked(ref)
+                if untracked and issubclass(ref_kind, HEAP_CENSUS_CONTAINER_TYPES):
+                    largest.offer(ref, _shallow_size(ref))
+                held += count_payload(ref)
+                if untracked and (ref_kind is dict or ref_kind is tuple):
+                    descend(ref)
+            if held:
+                holders.offer(obj, held)
         except Exception:
             # One exotic object costs its owner/largest entry, never the census.
             skipped += 1
     del objects
     top = heapq.nlargest(HEAP_CENSUS_TOP_TYPES, by_type.items(), key=lambda item: item[1])
-    largest_objects: list[dict[str, Any]] = []
-    for size, _, obj in sorted(largest, key=lambda item: (-item[0], item[1])):
-        owner = _or_none(lambda target=obj: _first_owner(target, owners))
-        largest_objects.append(
-            {
-                "type": _type_name(type(obj)),
-                "len": _or_none(lambda target=obj: _container_len(target)),
-                "shallow_bytes": size,
-                "referrer": owner[0] if owner else None,
-                "referrer_name": owner[1] if owner else None,
-            }
+    largest_objects = [
+        _census_entry(obj, "shallow_bytes", size, _owner_or_none(obj, owners))
+        for size, obj in largest.ranked()
+    ]
+    # A holder that is itself a module/class/function namespace is named directly.
+    top_holders = [
+        _census_entry(
+            obj, "payload_bytes", held, owners.get(id(obj)) or _owner_or_none(obj, owners)
         )
+        for held, obj in holders.ranked()
+    ]
     return {
         "top_types": [
             {"type": _type_name(kind), "count": count, "shallow_bytes": total}
             for kind, (count, total) in top
         ],
         "largest_objects": largest_objects,
+        "untracked_payload": {
+            "types": {
+                _type_name(base): {"count": count, "shallow_bytes": total}
+                for base, (count, total) in payload_totals.items()
+            },
+            "total_bytes": sum(total for _, total in payload_totals.values()),
+            "payloads_truncated": payload_capped,
+            "top_holders": top_holders,
+        },
         "gc_counts": {
             "before_collect": before,
             "collected": collected,
@@ -368,7 +479,28 @@ NATIVE_MEMORY_KEYS = (
     "python_allocated_blocks",
     "private_bytes",
     "peak_working_set_bytes",
+    "vm_rss_bytes",
+    "vm_swap_bytes",
+    "rss_anon_bytes",
+    "mallinfo2",
 )
+# Linux probes (NF-2026-02331): one bounded read of /proc/self/status per field.
+PROC_STATUS_PATH = Path("/proc/self/status")
+PROC_STATUS_MAX_BYTES = 64 * 1024
+# glibc ``struct mallinfo2`` layout (all size_t) and the subset the doctor reports.
+MALLINFO2_STRUCT_FIELDS = (
+    "arena",
+    "ordblks",
+    "smblks",
+    "hblks",
+    "hblkhd",
+    "usmblks",
+    "fsmblks",
+    "uordblks",
+    "fordblks",
+    "keepcost",
+)
+MALLINFO2_FIELDS = ("arena", "hblkhd", "uordblks", "fordblks", "keepcost")
 
 
 class _NativeUnavailable(Exception):
@@ -473,20 +605,106 @@ def _peak_working_set_bytes() -> int:
     return _windows_memory_counters()["peak_working_set_bytes"]
 
 
+def _read_proc_status() -> str:
+    """Bounded read of ``/proc/self/status``; the only filesystem touch of the Linux probes."""
+    with PROC_STATUS_PATH.open("rb") as handle:
+        return handle.read(PROC_STATUS_MAX_BYTES).decode("ascii", "replace")
+
+
+def _proc_status_bytes(field: str) -> int:
+    """One ``<field>: <n> kB`` line of ``/proc/self/status`` in bytes (Linux only)."""
+    if not platform_io.is_linux():
+        raise _NativeUnavailable("linux_only")
+    try:
+        text = _read_proc_status()
+    except OSError as error:
+        raise _NativeUnavailable(f"proc_status_unreadable:{type(error).__name__}") from error
+    prefix = f"{field}:"
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            parts = line[len(prefix) :].split()
+            if len(parts) == 2 and parts[1] == "kB" and parts[0].isdigit():
+                return int(parts[0]) * 1024
+            raise _NativeUnavailable(f"proc_status_unparsed:{field}")
+    raise _NativeUnavailable(f"proc_status_field_missing:{field}")
+
+
+def _vm_rss_bytes() -> int:
+    return _proc_status_bytes("VmRSS")
+
+
+def _vm_swap_bytes() -> int:
+    return _proc_status_bytes("VmSwap")
+
+
+def _rss_anon_bytes() -> int:
+    return _proc_status_bytes("RssAnon")
+
+
+def _glibc_library() -> Any:
+    """ctypes handle on glibc, probed like ``platform_io._glibc_malloc_trim``.
+
+    The glibc version string identifies glibc (musl and every non-Linux host
+    lack it); each miss raises ``_NativeUnavailable`` with a named reason.
+    """
+    if not platform_io.is_linux():
+        raise _NativeUnavailable("linux_only")
+    confstr = getattr(os, "confstr", None)
+    if not callable(confstr):
+        raise _NativeUnavailable("glibc_only")
+    try:
+        version = str(confstr("CS_GNU_LIBC_VERSION"))
+    except (OSError, ValueError) as error:
+        raise _NativeUnavailable("glibc_only") from error
+    if not version.lower().startswith("glibc"):
+        raise _NativeUnavailable("glibc_only")
+    import ctypes
+
+    try:
+        return ctypes.CDLL("libc.so.6")
+    except OSError as error:
+        raise _NativeUnavailable(f"libc_unresolved:{type(error).__name__}") from error
+
+
+def _mallinfo2() -> dict[str, int]:
+    """Read-only glibc ``mallinfo2()``: arena/mmap/in-use/free-retained/trimmable bytes."""
+    import ctypes
+
+    library = _glibc_library()
+    try:
+        function = library.mallinfo2
+    except AttributeError as error:
+        raise _NativeUnavailable("mallinfo2_missing") from error
+
+    class Mallinfo2(ctypes.Structure):
+        _fields_ = tuple((name, ctypes.c_size_t) for name in MALLINFO2_STRUCT_FIELDS)
+
+    function.argtypes = ()
+    function.restype = Mallinfo2
+    info = function()
+    return {name: int(getattr(info, name)) for name in MALLINFO2_FIELDS}
+
+
 def _native_memory() -> dict[str, Any]:
     """Bounded read-only native-memory probes; each value is an int, null or ``{error}``.
 
-    A null value names its cause under ``reasons``; a probe that raises reports
-    ``{"error": <exception type name>}`` and never affects the other probes.
-    Nothing is mutated: sqlite's high-water mark is read with resetFlag=0.
+    ``mallinfo2`` is the one dict-valued probe ({arena, hblkhd, uordblks,
+    fordblks, keepcost}). A null value names its cause under ``reasons``; a
+    probe that raises reports ``{"error": <exception type name>}`` and never
+    affects the other probes. Nothing is mutated: sqlite's high-water mark is
+    read with resetFlag=0.
     """
-    probes: dict[str, Callable[[], int]] = {
+    probes: dict[str, Callable[[], Any]] = {
         "sqlite_memory_used": _sqlite_memory_used,
         "sqlite_memory_highwater": _sqlite_memory_highwater,
         "live_sqlite_connections": _live_sqlite_connections,
         "python_allocated_blocks": sys.getallocatedblocks,
         "private_bytes": _private_bytes,
         "peak_working_set_bytes": _peak_working_set_bytes,
+        "vm_rss_bytes": _vm_rss_bytes,
+        "vm_swap_bytes": _vm_swap_bytes,
+        "rss_anon_bytes": _rss_anon_bytes,
+        "mallinfo2": _mallinfo2,
     }
     section: dict[str, Any] = {}
     reasons: dict[str, str] = {}
@@ -670,7 +888,7 @@ def _scan_task_db_holders(proc_root: str, db_path: Path | None) -> dict[str, Any
             "scanned_pids": 0,
             "truncated": False,
         }
-    own_uid = os.getuid()
+    own_uid = os.getuid()  # type: ignore[attr-defined,unused-ignore]
     deadline = time.monotonic() + TASK_DB_HOLDERS_BUDGET_SECONDS
     entries: list[dict[str, Any]] = []
     scanned = 0
