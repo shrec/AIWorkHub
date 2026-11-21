@@ -50,7 +50,8 @@ _PRE_TABLE_ALL_COUNT = 231
 _PRE_TABLE_ALL_READ_ONLY_COUNT = 227
 # NF-2026-02139: manager 130 -> 115, the 15 rows below moved to manager-callable. Then 118 -> 117:
 # aiworkhub_dashboard_snapshot and aiworkhub_dashboard_needfix_transition left, needfix_transition joined.
-_LISTED_COUNTS = {"manager": 117, "worker": 19, "dashboard": 67}
+# NF-2026-01979: 117 -> 118, aiworkhub_manager_skill_propose is listed (skill_mine tells clients to call it).
+_LISTED_COUNTS = {"manager": mcp_tool_metadata.MANAGER_LISTED_CEILING, "worker": 19, "dashboard": 67}
 # NF-2026-02139: callable by exact name on manager, absent from its tools/list. The extension (dashboard
 # surface) calls the loop/vscode_lm rows; managers finalize with accept_review/reject_review, not mark_*.
 _NF02139_DASHBOARD_LISTED = (
@@ -588,7 +589,9 @@ _ALIAS_DESCRIPTION_PREFIX = "Deprecated alias of {canonical}; call {canonical}. 
 
 
 def test_aliases_are_manager_callable_but_unlisted_and_canonicals_stay_listed(runs: dict) -> None:
-    aliases = mcp_tool_metadata.MCP_TOOL_ALIASES
+    aliases = {
+        alias: mcp_tool_metadata.alias_canonical(alias) for alias in mcp_tool_metadata.MCP_TOOL_ALIASES
+    }
     assert aliases and not set(aliases) & set(aliases.values())
     manager = runs["manager"]
     for alias, canonical in aliases.items():
@@ -605,7 +608,8 @@ def test_aliases_are_manager_callable_but_unlisted_and_canonicals_stay_listed(ru
 
 
 def test_alias_description_carries_the_deprecation_prefix() -> None:
-    for alias, canonical in mcp_tool_metadata.MCP_TOOL_ALIASES.items():
+    for alias in mcp_tool_metadata.MCP_TOOL_ALIASES:
+        canonical = mcp_tool_metadata.alias_canonical(alias)
         function = getattr(server, alias)
         cleaned, _ = mcp_tool_metadata.split_docstring(function.__doc__)
         _args, kwargs, _signature = mcp_tool_metadata.prepare_registration(function, (alias,), {})

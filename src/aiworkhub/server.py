@@ -399,7 +399,7 @@ except ModuleNotFoundError:
                 "inputSchema": _stdio_cached_schema_for(func),
             }
             annotations = _stdio_tool_metadata.derive_annotations(
-                _stdio_tool_metadata.MCP_TOOL_ALIASES.get(name, name), description
+                _stdio_tool_metadata.canonical_tool_name(name), description
             )
             if annotations is not None:
                 entry["annotations"] = annotations
@@ -1034,6 +1034,57 @@ def _write_gated_tool(*args: Any, **kwargs: Any) -> Any:
         return function
 
     return decorate
+
+
+def deprecated_alias_delegate(
+    alias: str, canonical_function: Any, record: Mapping[str, Any] | None = None
+) -> Any:
+    """Thin delegate that serves deprecated ``alias`` by calling ``canonical_function``.
+
+    ``record`` defaults to ``MCP_TOOL_ALIASES[alias]`` (KeyError for a name the
+    table does not mark, so an unrecorded alias cannot be built). Its
+    ``bound_kwargs`` are merged under the caller's kwargs (the caller wins), and
+    a dict reply gains ``deprecated_alias: {alias, canonical, remove_in}``; any
+    other reply passes through unchanged. The canonical body stays the one
+    implementation: the delegate owns no logic of its own.
+    """
+
+    if record is None:
+        record = _tool_metadata.MCP_TOOL_ALIASES[alias]
+    missing = [key for key in _tool_metadata.MCP_ALIAS_RECORD_KEYS if key not in record]
+    if missing:
+        raise ValueError(f"alias {alias} record is missing {missing}")
+    bound = dict(record["bound_kwargs"] or {})
+    stamp = {"alias": alias, "canonical": str(record["canonical"]), "remove_in": str(record["remove_in"])}
+
+    @wraps(canonical_function)
+    def delegate(*args: Any, **kwargs: Any) -> Any:
+        reply = canonical_function(*args, **{**bound, **kwargs})
+        if isinstance(reply, dict):
+            reply = {**reply, _tool_metadata.MCP_ALIAS_REPLY_KEY: dict(stamp)}
+        return reply
+
+    delegate.__name__ = alias
+    delegate.__qualname__ = alias
+    return delegate
+
+
+def register_deprecated_alias(
+    alias: str,
+    canonical_function: Any,
+    record: Mapping[str, Any] | None = None,
+    *,
+    registrar: Any = None,
+) -> Any:
+    """Register ``alias`` as a deprecated_alias_delegate on ``registrar`` (default ``mcp.tool``).
+
+    The profile table still decides whether the alias is callable or listed on
+    the active surface; the delegate is returned for direct Python callers.
+    """
+
+    delegate = deprecated_alias_delegate(alias, canonical_function, record)
+    (registrar or mcp.tool)(name=alias)(delegate)
+    return delegate
 
 
 # ---------------------------------------------------------------------------

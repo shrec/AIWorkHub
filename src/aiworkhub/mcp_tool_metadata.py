@@ -30,6 +30,11 @@ __all__ = [
     "prepare_registration",
     "MCP_TOOL_PROFILES",
     "MCP_TOOL_ALIASES",
+    "MCP_ALIAS_RECORD_KEYS",
+    "MCP_ALIAS_REPLY_KEY",
+    "MANAGER_LISTED_CEILING",
+    "alias_canonical",
+    "canonical_tool_name",
     "MCP_DEPRECATED_FACET_ALIASES",
     "MCP_FOLD_KEPT_REASONS",
     "DEPRECATED_ALIAS_REPLY_KEY",
@@ -308,7 +313,7 @@ def prepare_registration(
     description = kwargs.get("description", cleaned)
 
     if "annotations" not in kwargs:
-        derived = derive_annotations(MCP_TOOL_ALIASES.get(tool_name, tool_name), description)
+        derived = derive_annotations(canonical_tool_name(tool_name), description)
         if derived is not None:
             try:
                 from mcp.types import ToolAnnotations
@@ -389,7 +394,7 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_manager_context_import": _MANAGER_CALLABLE,
     "aiworkhub_manager_context_write_intents": _MANAGER,
     "aiworkhub_manager_context_write_intent_dispose": _MANAGER,
-    "aiworkhub_manager_skill_propose": _MANAGER_CALLABLE,
+    "aiworkhub_manager_skill_propose": _MANAGER,
     "aiworkhub_manager_skill_add_evidence": _MANAGER,
     "aiworkhub_manager_skill_usage": _MANAGER,
     "aiworkhub_manager_skill_activate": _MANAGER_CALLABLE,
@@ -612,13 +617,59 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_worker_exit_preflight": _WORKER,
 }
 
+# NF-2026-01979: the manager profile's listed count may only fall. Later TDQS
+# cards lower this toward 45; a change that lists one more manager tool must
+# first unlist or fold another. tests/test_mcp_surface_contract_nf01979.py pins
+# listed <= ceiling and ceiling == the measured count.
+MANAGER_LISTED_CEILING = 118
+
 # Duplicate tool names: callable by exact name on the manager profile, absent from its tools/list.
 # Each canonical must be listed on every profile that lists the alias. Verified same delegate and parameters.
-MCP_TOOL_ALIASES: Mapping[str, str] = MappingProxyType({
-    "aiworkhub_router_known_repositories": "aiworkhub_repo_list",
-    "aiworkhub_manager_task_archive": "aiworkhub_task_archive",
-    "aiworkhub_manager_task_supersede": "aiworkhub_task_supersede",
+# NF-2026-01979: each entry is a versioned record. ``canonical`` is the surviving
+# tool; ``bound_kwargs`` are merged under the caller's kwargs by a delegate built
+# with server.register_deprecated_alias; ``since`` is the release that made the
+# name an alias and ``remove_in`` the release that must no longer carry it (a test
+# fails once the package version reaches it). Read the canonical name through
+# canonical_tool_name / alias_canonical, never by indexing a record.
+MCP_ALIAS_RECORD_KEYS = ("canonical", "bound_kwargs", "since", "remove_in")
+MCP_ALIAS_REPLY_KEY = "deprecated_alias"
+
+
+def _alias_record(
+    canonical: str, *, since: str, remove_in: str, bound_kwargs: Mapping[str, Any] | None = None
+) -> Mapping[str, Any]:
+    return MappingProxyType({
+        "canonical": canonical,
+        "bound_kwargs": MappingProxyType(dict(bound_kwargs or {})),
+        "since": since,
+        "remove_in": remove_in,
+    })
+
+
+MCP_TOOL_ALIASES: Mapping[str, Mapping[str, Any]] = MappingProxyType({
+    "aiworkhub_router_known_repositories": _alias_record(
+        "aiworkhub_repo_list", since="0.13.7", remove_in="0.14.0"
+    ),
+    "aiworkhub_manager_task_archive": _alias_record(
+        "aiworkhub_task_archive", since="0.13.7", remove_in="0.14.0"
+    ),
+    "aiworkhub_manager_task_supersede": _alias_record(
+        "aiworkhub_task_supersede", since="0.13.7", remove_in="0.14.0"
+    ),
 })
+
+
+def alias_canonical(tool_name: Any) -> str | None:
+    """Canonical tool name for alias ``tool_name``, or None when it is no alias."""
+    record = MCP_TOOL_ALIASES.get(tool_name) if isinstance(tool_name, str) else None
+    return None if record is None else str(record["canonical"])
+
+
+def canonical_tool_name(tool_name: Any) -> Any:
+    """``tool_name``'s canonical tool name; a non-alias name is returned unchanged."""
+    canonical = alias_canonical(tool_name)
+    return tool_name if canonical is None else canonical
+
 
 # NF-2026-02270: facet tools folded behind a parameter on a surviving tool. Each
 # old name stays registered (same profile entry, same parameters) for one release
@@ -665,7 +716,7 @@ def deprecated_alias_reply(alias: str, reply: Mapping[str, Any]) -> dict[str, An
 
 
 def alias_description(tool_name: str, cleaned: str) -> str:
-    canonical = MCP_TOOL_ALIASES.get(tool_name)
+    canonical = alias_canonical(tool_name)
     if canonical is None:
         return cleaned
     return f"Deprecated alias of {canonical}; call {canonical}. {cleaned}"

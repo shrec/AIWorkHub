@@ -202,7 +202,7 @@ def build_inventory(
         if name in facet_aliases:
             row["deprecated_alias_of"] = facet_aliases[name]["surviving_tool"]
         if name in metadata.MCP_TOOL_ALIASES:
-            row["duplicate_alias_of"] = metadata.MCP_TOOL_ALIASES[name]
+            row["duplicate_alias_of"] = metadata.alias_canonical(name)
         if name in metadata.MCP_FOLD_KEPT_REASONS:
             row["fold_kept_reason"] = metadata.MCP_FOLD_KEPT_REASONS[name]
         tools.append(row)
