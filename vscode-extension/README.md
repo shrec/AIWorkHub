@@ -94,10 +94,11 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.7
+## What's new in 0.13.8
 
-- Manager Chat: a turn ends at the provider's terminal event, a stop kills the whole CLI process tree, an empty turn or a provider error is an error, every finished card the chat launched reaches that chat, busy/idle state and message echoes stay correct, and closing the panel no longer kills the running turn.
-- Dashboard: no more "Dashboard snapshot delayed" loop. A late snapshot is painted instead of dropped, Retry keeps a live reader, the opencode model probe no longer blocks it, and a running Claude Code manager shows as ✓ Route / ✓ Callback.
+- Manager Chat: text the Claude CLI injects (its compaction summary, interrupt notices, hook output) no longer appears as a manager reply; when the CLI compacts its own context the chat shows a marker and rotates into a clean successor session.
+- Manager Chat: a turn ends at the provider's terminal event, a stop kills the whole CLI process tree, an empty turn or a provider error is an error, every finished card the chat launched reaches that chat, and closing the panel no longer kills the running turn.
+- Dashboard: no more "Dashboard snapshot delayed" loop, and a running Claude Code manager shows as ✓ Route / ✓ Callback.
 
 ## Get started
 

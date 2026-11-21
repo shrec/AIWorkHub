@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.13.8 — 2026-11-21
+
+### Fixed
+
+- Bundles runtime 0.13.8: Claude CLI user-role text (compaction summary, interrupt notices, hook output) never renders as a Manager Chat reply, and the CLI's own context compaction rotates the session into a clean successor. Includes all of 0.13.6 and 0.13.7, which were tagged but not published; their Linux CI failure is fixed.
+- Manager Chat: a `provider_compacted` event renders as a "Provider compacted context" marker row.
+
 ## 0.13.7 — 2026-11-21
 
 ### Fixed

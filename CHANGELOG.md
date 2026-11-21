@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.8] - 2026-11-21
+
+0.13.7 was tagged but never published: its Linux CI and Release failed on the bubblewrap validation sandbox (fixed below). 0.13.8 carries all of 0.13.6 and 0.13.7 plus these fixes.
+
+### Fixed
+
+- Manager Chat (claude_cli): user-role lines the Claude CLI injects (its own compaction summary, interrupt notices, hook output) no longer become `assistant_text`, so they never render as a manager reply or join the Context Graph turn text; a user line yields only its tool results (NF-2026-02329).
+- Manager Chat (claude_cli): the CLI's `system`/`compact_boundary` line becomes a `provider_compacted` loop event, shown as a "Provider compacted context" marker; a completed turn that contains it rotates into a successor (reason `provider_compaction`) under the same stopped/empty/failure guards as a full context, instead of continuing on the CLI's lossy summary (NF-2026-02329).
+- Sandbox (Linux): bubblewrap validation binds the coordinator interpreter's venv and base prefix read-only and refuses an interpreter outside them, including a `..` path that climbs out; this was the 0.13.7 Linux CI and Release failure (NF-2026-02327).
+- Accept neighbour lane: the tests of changed non-Python and non-src paths (extension.js, scripts) are selected through the impact map's reads edges (NF-2026-02298).
+- Terminal log retention: the process ledger is folded as a keep_fields projection instead of whole rows (NF-2026-02014).
+- MCP surface contract: `skill_propose` is listed, a registry/profile parity test and a listed-count ratchet guard the surface, and deprecated aliases carry versioned since/remove_in metadata (NF-2026-01979).
+
 ## [0.13.7] - 2026-11-21
 
 0.13.6 was tagged but never published: its Linux CI failed (see the CI entry below). 0.13.7 carries all of 0.13.6 plus these fixes.
