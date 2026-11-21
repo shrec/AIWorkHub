@@ -239,7 +239,7 @@ test("managerLoopStart/Send/Rotate/Status/Events reach one lazily-created client
   assert.equal(harness.managerLoopClientInstances.length, 0);
 
   harness.api.handleInboundMessage(view, { type: "managerLoopStart", backendId: "claude_cli", model: "opus" });
-  harness.api.handleInboundMessage(view, { type: "managerLoopSend", text: "hello manager", backendId: "codex_cli", model: "gpt-x" });
+  harness.api.handleInboundMessage(view, { type: "managerLoopSend", text: "hello manager", backendId: "codex_cli", model: "gpt-x", clientId: "echo-1_A" });
   harness.api.handleInboundMessage(view, { type: "managerLoopRotate", reason: "context threshold" });
   harness.api.handleInboundMessage(view, { type: "managerLoopStatus" });
   harness.api.handleInboundMessage(view, {
@@ -257,7 +257,7 @@ test("managerLoopStart/Send/Rotate/Status/Events reach one lazily-created client
 
   const find = (name) => gatedClient.calls.find((call) => call.name === name);
   assert.deepEqual(plain(find("aiworkhub_manager_loop_start").args), { backend_id: "claude_cli", model: "opus" });
-  assert.deepEqual(plain(find("aiworkhub_manager_loop_send").args), { text: "hello manager", backend_id: "codex_cli", model: "gpt-x", reasoning: "" });
+  assert.deepEqual(plain(find("aiworkhub_manager_loop_send").args), { text: "hello manager", backend_id: "codex_cli", model: "gpt-x", reasoning: "", client_id: "echo-1_A" });
   assert.deepEqual(plain(find("aiworkhub_manager_loop_rotate").args), { reason: "context threshold" });
   assert.deepEqual(plain(find("aiworkhub_manager_loop_events").args), { session_id: "mls-aaaa1111bbbb2222", after_seq: 5 });
   // Status is called both explicitly and as the authoritative refresh after
@@ -266,6 +266,25 @@ test("managerLoopStart/Send/Rotate/Status/Events reach one lazily-created client
 
   // None of the seven tools ever reach the dashboard's own read-only client.
   assert.equal(client.calls.length, 0);
+});
+
+test("managerLoopSend drops an invalid client id and still runs the send", async () => {
+  const harness = loadHostSlice();
+  harness.setClient(makeClient());
+  const view = makeView();
+  const invalid = ["x".repeat(65), "bad id!", "", 42, null, { id: "a" }];
+  for (const clientId of invalid) {
+    harness.api.handleInboundMessage(view, { type: "managerLoopSend", text: "hi", backendId: "codex_cli", model: "gpt-x", clientId });
+  }
+  harness.api.handleInboundMessage(view, { type: "managerLoopSend", text: "hi", backendId: "codex_cli", model: "gpt-x", clientId: "y".repeat(64) });
+  await flush();
+
+  const sends = harness.managerLoopClientInstances[0].calls.filter((call) => call.name === "aiworkhub_manager_loop_send");
+  assert.equal(sends.length, invalid.length + 1, "an invalid id never refuses the send");
+  for (const call of sends.slice(0, invalid.length)) {
+    assert.equal("client_id" in plain(call.args), false);
+  }
+  assert.equal(plain(sends[invalid.length].args).client_id, "y".repeat(64), "a 64-character id is kept");
 });
 
 test("managerLoopSend with an unlisted backend is refused before any MCP call", async () => {
@@ -4055,6 +4074,50 @@ test("a send carries its echo's clientId, and echoes dropped by queue_dropped or
   });
   assert.equal(echo(ids[2]).local, "dropped", "a Stop settles what was queued before it");
   assert.equal(harness.state.managerChatEvents.filter((event) => event.local === "pending").length, 0, "nothing stays sending forever");
+});
+
+test("two pending echoes with the same text settle by client id, not by order", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  submitManagerChat(harness, "same");
+  submitManagerChat(harness, "same");
+  const ids = harness.state.managerChatPendingSends.map((entry) => entry.clientId);
+  assert.equal(new Set(ids).size, 2);
+
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 1,
+    events: [{ seq: 1, turn: 1, type: "user_message", payload: { text: "same", client_id: ids[1] } }],
+  });
+  const echo = (id) => harness.state.managerChatEvents.find((event) => event.local && event.type === "user_message" && event.payload.client_id === id);
+  assert.equal(echo(ids[1]), undefined, "the echo the turn names is settled");
+  assert.equal(echo(ids[0]).local, "pending", "the other identical echo keeps waiting");
+});
+
+test("a queue_dropped with client_ids settles exactly those echoes, whatever the time or count says", () => {
+  const harness = loadWebviewSlice();
+  liveStatus(harness, true);
+  submitManagerChat(harness, "first");
+  submitManagerChat(harness, "second");
+  submitManagerChat(harness, "third");
+  const ids = harness.state.managerChatPendingSends.map((entry) => entry.clientId);
+
+  // The count heuristic alone would settle the oldest echo (ids[0]); the ids name the newest.
+  harness.api.renderManagerChatEventsResponse({
+    ok: true,
+    session_id: LIVE_SESSION,
+    last_seq: 1,
+    events: [{
+      seq: 1, turn: 1, type: "queue_dropped",
+      at: new Date(Date.now() - 3600000).toISOString(),
+      payload: { count: 1, client_ids: [ids[2]] },
+    }],
+  });
+  const echo = (id) => harness.state.managerChatEvents.find((event) => event.local && event.type === "user_message" && event.payload.client_id === id);
+  assert.equal(echo(ids[2]).local, "dropped", "the named send settles as not delivered");
+  assert.equal(echo(ids[0]).local, "pending");
+  assert.equal(echo(ids[1]).local, "pending");
 });
 
 test("a zero-usage turn_end with no output renders as an empty, failed turn", () => {

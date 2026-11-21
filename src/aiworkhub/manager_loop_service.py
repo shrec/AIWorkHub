@@ -37,7 +37,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from .manager_loop import ManagerLoopError, ManagerOrchestrator, ManagerSession
+from .manager_loop import CLIENT_ID_RE, ManagerLoopError, ManagerOrchestrator, ManagerSession
 from .manager_loop_backends import MANAGER_BACKEND_IDS, _opencode_discovered_models, cli_discovers_model, manager_backend_factory
 from . import callback_store, manager_loop_wake, model_settings, platform_io, workforce_catalog
 
@@ -73,6 +73,7 @@ class _QueuedSend:
     level: str
     route: tuple[str, str] | None
     images: tuple[str, ...] = ()
+    client_id: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -392,7 +393,9 @@ def _queued_send_action(
         )
         if refused is not None:
             raise ManagerLoopError(str(refused.get("error") or "manager_send_queue_bind_failed"))
-        return orchestrator.send(queued.text, reasoning=queued.level, images=queued.images)
+        return orchestrator.send(
+            queued.text, reasoning=queued.level, images=queued.images, client_id=queued.client_id
+        )
 
     return action
 
@@ -742,6 +745,8 @@ def send(
     model: str | None = None,
     reasoning: str | None = None,
     images: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    client_id: str | None = None,
 ) -> dict[str, Any]:
     """Run one manager turn on a background thread.
 
@@ -764,6 +769,10 @@ def send(
     session store's ``attachments`` before anything is queued; the turn gets
     their paths and a backend that cannot read images reports it as the turn's
     error. Images need text with them (``manager_image_needs_text``).
+    ``client_id`` is the panel's per-send id: kept only when it matches
+    ``[A-Za-z0-9_-]{1,64}`` (otherwise dropped, the send still runs), it is
+    written on that send's own ``user_message`` and, if a stop drops the send
+    from the queue, on the ``queue_dropped`` event.
     """
 
     route: tuple[str, str] | None = None
@@ -787,13 +796,17 @@ def send(
         paths, err = _store_images(entry.orchestrator.store.root / "attachments", images)
         if err is not None:
             return err
+    # A client id outside the panel's id alphabet is dropped; the send still runs.
+    sent_id = client_id if isinstance(client_id, str) and CLIENT_ID_RE.fullmatch(client_id) else ""
     return _dispatch_turn(
         repo,
-        lambda orchestrator: orchestrator.send(text, reasoning=level, images=paths),
+        lambda orchestrator: orchestrator.send(
+            text, reasoning=level, images=paths, client_id=sent_id
+        ),
         record_last_turn=True,
         pin_passive_route=bool(text.strip()),
         route=route,
-        queued=_QueuedSend(text=text, level=level, route=route, images=paths),
+        queued=_QueuedSend(text=text, level=level, route=route, images=paths, client_id=sent_id),
         clear_suspended=True,
     )
 
@@ -1030,13 +1043,14 @@ def stop(repo: str | Path) -> dict[str, Any]:
         if not entry.turn_running:
             return {"ok": True, "stopped": False, "armed": False, "dropped_queued": 0}
         dropped = len(entry.send_queue)
+        dropped_client_ids = [item.client_id for item in entry.send_queue if item.client_id]
         entry.send_queue.clear()
         entry.orchestrator.arm_stop()
         running = entry.running_turn
     try:
         if running is not None:
             try:
-                entry.orchestrator.record_queue_dropped(running[0], running[1], dropped)
+                entry.orchestrator.record_queue_dropped(running[0], running[1], dropped, dropped_client_ids)
             except Exception:  # noqa: BLE001 - display-only event; its failed write must not fail a completed stop
                 pass
         interrupted = entry.orchestrator.interrupt()

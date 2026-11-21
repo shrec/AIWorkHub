@@ -8375,11 +8375,20 @@ function managerChatMergeEvents(incoming) {
         if (settled !== -1) events.splice(settled, 1);
       }
     } else if (event.type === "queue_dropped") {
-      // Only echoes typed before the drop can be what it dropped: a history replay from cursor 0
+      // client_ids name exactly the dropped sends, regardless of time or count. Without them,
+      // only echoes typed before the drop can be what it dropped: a history replay from cursor 0
       // never settles a send typed after it.
-      const droppedAt = managerChatEventTime(event);
-      const eligible = pending.filter((echo) => !droppedAt || managerChatEventTime(echo) <= droppedAt);
-      const dropped = eligible.slice(0, managerConsoleDroppedCount(payload));
+      const droppedIds = Array.isArray(payload.client_ids)
+        ? payload.client_ids.filter((id) => typeof id === "string" && id)
+        : [];
+      let dropped;
+      if (droppedIds.length) {
+        dropped = pending.filter((echo) => droppedIds.includes(echo.payload.client_id));
+      } else {
+        const droppedAt = managerChatEventTime(event);
+        const eligible = pending.filter((echo) => !droppedAt || managerChatEventTime(echo) <= droppedAt);
+        dropped = eligible.slice(0, managerConsoleDroppedCount(payload));
+      }
       pending = pending.filter((echo) => !dropped.includes(echo));
       kept.push(...dropped.map(managerChatDroppedEcho));
     } else if (event.type === "turn_stopped") {

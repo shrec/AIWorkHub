@@ -517,6 +517,88 @@ def test_stop_with_nothing_queued_records_no_queue_dropped_event(
     assert "queue_dropped" not in [event["type"] for event in events]
 
 
+def test_send_records_its_client_id_on_its_own_user_message(monkeypatch: Any, tmp_path: Path) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    first = manager_loop_service.send(tmp_path, "one", client_id="id-one")
+    assert backend.entered.wait(timeout=5)
+    assert manager_loop_service.send(tmp_path, "two", client_id="id_two")["queued"] is True
+    assert manager_loop_service.send(tmp_path, "three")["queued"] is True
+    backend.gate.set()
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    events = manager_loop_service.events(tmp_path, first["session_id"])["events"]
+    sent = [event for event in events if event["type"] == "user_message"]
+    assert [(event["turn"], event["payload"]) for event in sent] == [
+        (1, {"text": "one", "client_id": "id-one"}),
+        (2, {"text": "two", "client_id": "id_two"}),
+        (3, {"text": "three"}),
+    ]
+
+
+def test_send_drops_an_invalid_client_id_and_still_runs(monkeypatch: Any, tmp_path: Path) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    session_id = ""
+    for index, bad in enumerate(["x" * 65, "has space", "semi;colon", 7, ["a"]]):
+        result = manager_loop_service.send(tmp_path, f"m{index}", client_id=bad)  # type: ignore[arg-type]
+        assert result["ok"] is True
+        session_id = result["session_id"]
+        assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+    kept = manager_loop_service.send(tmp_path, "kept", client_id="y" * 64)
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    events = manager_loop_service.events(tmp_path, session_id)["events"]
+    sent = [event["payload"] for event in events if event["type"] == "user_message"]
+    assert backends[0].messages == ["m0", "m1", "m2", "m3", "m4", "kept"]
+    assert all("client_id" not in payload for payload in sent[:5])
+    assert sent[5] == {"text": "kept", "client_id": "y" * 64}
+    assert kept["ok"] is True
+
+
+def test_stop_records_the_dropped_sends_client_ids_in_queue_order(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    first = manager_loop_service.send(tmp_path, "one", client_id="run-1")
+    assert backend.entered.wait(timeout=5)
+    assert manager_loop_service.send(tmp_path, "two", client_id="q-a")["queued"] is True
+    assert manager_loop_service.send(tmp_path, "three")["queued"] is True
+    assert manager_loop_service.send(tmp_path, "four", client_id="q-c")["queued"] is True
+
+    assert manager_loop_service.stop(tmp_path)["dropped_queued"] == 3
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    events = manager_loop_service.events(tmp_path, first["session_id"])["events"]
+    dropped = [event for event in events if event["type"] == "queue_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["payload"] == {"count": 3, "client_ids": ["q-a", "q-c"]}
+
+
+def test_stop_without_client_ids_records_no_client_ids_key(monkeypatch: Any, tmp_path: Path) -> None:
+    backends = _install_fakes(monkeypatch)
+    manager_loop_service.start(tmp_path, "fake", "model-a")
+    backend = backends[0]
+    backend.gate = threading.Event()
+
+    first = manager_loop_service.send(tmp_path, "one")
+    assert backend.entered.wait(timeout=5)
+    assert manager_loop_service.send(tmp_path, "two")["queued"] is True
+    assert manager_loop_service.stop(tmp_path)["dropped_queued"] == 1
+    assert manager_loop_service.wait_for_idle(tmp_path, timeout=5) is True
+
+    events = manager_loop_service.events(tmp_path, first["session_id"])["events"]
+    (dropped,) = [event for event in events if event["type"] == "queue_dropped"]
+    assert dropped["payload"] == {"count": 1}
+
+
 def test_a_stop_flag_left_by_a_stopped_turn_does_not_stop_the_next_turn(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
@@ -812,13 +894,19 @@ def test_the_send_tool_passes_attached_images_to_the_service(monkeypatch: Any, t
     monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     calls: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(manager_loop_service, "send", lambda *args: calls.append(args) or {"ok": True})
+    kwargs: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        manager_loop_service,
+        "send",
+        lambda *args, **kw: calls.append(args) or kwargs.append(kw) or {"ok": True},
+    )
 
     images = _attached(_PNG)
-    assert server.aiworkhub_manager_loop_send("look", images=images) == {"ok": True}
+    assert server.aiworkhub_manager_loop_send("look", images=images, client_id="echo-1") == {"ok": True}
     assert server.aiworkhub_manager_loop_send("plain") == {"ok": True}
     assert calls[0][1:] == ("look", None, None, None, images)
     assert calls[1][1:] == ("plain", None, None, None)
+    assert kwargs == [{"client_id": "echo-1"}, {"client_id": ""}]
 
 
 def test_events_after_seq_returns_only_newer_events_and_respects_limit(
@@ -948,7 +1036,7 @@ def _verified_manager(monkeypatch: Any, root: Path) -> list[str]:
     calls: list[str] = []
     for name in ("start", "send", "rotate"):
         monkeypatch.setattr(
-            manager_loop_service, name, lambda *_a, _n=name: calls.append(_n) or {"ok": True}
+            manager_loop_service, name, lambda *_a, _n=name, **_k: calls.append(_n) or {"ok": True}
         )
     return calls
 

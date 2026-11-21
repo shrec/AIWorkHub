@@ -388,9 +388,10 @@ def test_manager_loop_send_forwards_the_picker_route_to_the_service(
     )
     captured: dict = {}
 
-    def fake_send(repo, text, backend_id=None, model=None, reasoning=None):
+    def fake_send(repo, text, backend_id=None, model=None, reasoning=None, *, client_id=None):
         captured.update(
-            repo=repo, text=text, backend_id=backend_id, model=model, reasoning=reasoning
+            repo=repo, text=text, backend_id=backend_id, model=model, reasoning=reasoning,
+            client_id=client_id,
         )
         return {"ok": True}
 
@@ -398,14 +399,17 @@ def test_manager_loop_send_forwards_the_picker_route_to_the_service(
     monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
     monkeypatch.setattr(server.core, "writes_allowed", lambda: True)
 
-    assert server.aiworkhub_manager_loop_send("hi", "codex_cli", "gpt-x", "high") == {"ok": True}
+    assert server.aiworkhub_manager_loop_send(
+        "hi", "codex_cli", "gpt-x", "high", client_id="echo-1"
+    ) == {"ok": True}
     assert captured == {
         "repo": tmp_path.resolve(), "text": "hi", "backend_id": "codex_cli", "model": "gpt-x",
-        "reasoning": "high",
+        "reasoning": "high", "client_id": "echo-1",
     }
     assert server.aiworkhub_manager_loop_send("hi") == {"ok": True}
     assert captured["backend_id"] is None and captured["model"] is None
     assert captured["reasoning"] is None
+    assert captured["client_id"] == ""
 
 def test_manager_loop_tools_refuse_a_manager_route_with_no_session_identity(monkeypatch) -> None:
     monkeypatch.setattr(

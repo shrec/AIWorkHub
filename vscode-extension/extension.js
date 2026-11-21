@@ -13227,6 +13227,12 @@ function handleInboundMessage(view, message) {
         return;
       }
       const sendArgs = { text, backend_id: sendBackendId, model: sendModel, reasoning: sendReasoning };
+      // The webview's per-send id lets the polled user_message/queue_dropped
+      // events name the send they answer. An invalid id is dropped, never a
+      // reason to refuse the send.
+      if (typeof message.clientId === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(message.clientId)) {
+        sendArgs.client_id = message.clientId;
+      }
       if (sendImages.length) {
         sendArgs.images = sendImages.map((image) => ({ name: String(image.name || "").slice(0, 200), data: image.data }));
       }

@@ -3467,6 +3467,7 @@ def aiworkhub_manager_loop_send(
     model: str = "",
     reasoning: str = "",
     images: list[dict[str, str]] | None = None,
+    client_id: str = "",
 ) -> dict[str, Any]:
     """MANAGER WRITE: run one manager turn in the background.
 
@@ -3490,6 +3491,7 @@ def aiworkhub_manager_loop_send(
         model: Model id chosen in the panel picker for backend_id; give both or neither.
         reasoning: The owner's reasoning-depth choice for this turn; blank keeps the provider default.
         images: Up to 4 png, jpeg, gif or webp images, each an object with name (file name) and data (base64 content), at most 5 MiB each; only claude_cli and codex_cli read them.
+        client_id: The panel's per-send id (1-64 characters of A-Z, a-z, 0-9, underscore or hyphen); it is echoed on that turn's user_message event and on a queue_dropped event so the panel settles the exact send. An invalid id is dropped and the send still runs; blank means none.
     """
 
     root, refusal = _manager_loop_repo_root(launching=True)
@@ -3497,7 +3499,13 @@ def aiworkhub_manager_loop_send(
         return refusal
     attached = (images,) if images else ()
     return manager_loop_service.send(
-        root, text, backend_id or None, model or None, reasoning or None, *attached
+        root,
+        text,
+        backend_id or None,
+        model or None,
+        reasoning or None,
+        *attached,
+        client_id=client_id,
     )
 
 

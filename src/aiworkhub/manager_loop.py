@@ -78,6 +78,8 @@ KEEP_CLOSED_SESSIONS = 20
 SESSION_TOPIC = "management"
 CONTEXT_QUERY = "manager_loop"
 TURN_EVENT_TYPE = "manager_loop_turn"
+# The panel's per-send id that the user_message and queue_dropped events echo back.
+CLIENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 TURN_TERMINAL_TYPES = frozenset({"turn_end", "error", "turn_stopped"})
 TURN_STOPPED_ERROR = "turn_stopped"
 # NF-2026-02318: a provider turn with no reply, no tool event and no usage is this error.
@@ -958,23 +960,27 @@ class ManagerOrchestrator:
         with self._exclusive():
             return self._open(backend_id, model)
 
-    def send(self, text: str, *, reasoning: str = "", images: tuple[str, ...] = ()) -> dict[str, Any]:
+    def send(
+        self, text: str, *, reasoning: str = "", images: tuple[str, ...] = (), client_id: str = ""
+    ) -> dict[str, Any]:
         """Run one turn; refused while another runs (the service queues owner sends).
 
         ``images`` are stored image file paths the backend hands its CLI; the
         transcript records only how many there were. A restored pinned session
         gets its own persisted route back first, the way a wake rebinds it.
+        ``client_id`` is the panel's per-send id; when non-empty it is written
+        on this turn's ``user_message`` so the panel settles the exact echo.
         """
         if not text.strip():
             raise ValueError("the message is empty")
         with self._exclusive():
-            self._rebind_for_send(text, images=len(images))
+            self._rebind_for_send(text, images=len(images), client_id=client_id)
             if self._backend is not None:
                 self._backend.reasoning_level = str(reasoning or "").strip().lower()
                 self._backend.images = tuple(images)
-            return self._turn(text, "user_message", "", images=len(images))
+            return self._turn(text, "user_message", "", images=len(images), client_id=client_id)
 
-    def _rebind_for_send(self, text: str, *, images: int) -> None:
+    def _rebind_for_send(self, text: str, *, images: int, client_id: str = "") -> None:
         """NF-2026-02318: bind an attached session with no backend before an owner turn.
 
         Restore and continue attach a conversation without a backend. A pinned one is
@@ -992,6 +998,8 @@ class ManagerOrchestrator:
         except Exception as exc:
             turn = session.turn_count + 1
             asked: dict[str, Any] = {"text": text, "images": images} if images else {"text": text}
+            if client_id:
+                asked["client_id"] = client_id
             refused = {"source": "route_bind", "error": str(exc) if isinstance(exc, ManagerLoopError) else _failure(exc)}
             with contextlib.suppress(Exception):  # the refusal below must not be masked
                 self._record(session, turn, "user_message", asked)
@@ -1060,11 +1068,22 @@ class ManagerOrchestrator:
     def disarm_stop(self) -> None:
         self._stop_armed = False
 
-    def record_queue_dropped(self, session_id: str, turn: int, count: int) -> dict[str, Any] | None:
-        """Log that ``count`` queued owner sends were dropped by a stop, on the turn that was running."""
+    def record_queue_dropped(
+        self, session_id: str, turn: int, count: int, client_ids: Iterable[str] = ()
+    ) -> dict[str, Any] | None:
+        """Log that ``count`` queued owner sends were dropped by a stop, on the turn that was running.
+
+        ``client_ids`` (the dropped sends' panel ids, in queue order) are added
+        only when there are any, so the panel settles exactly those echoes.
+        """
         if not session_id or count <= 0:
             return None
-        return self._record_to(session_id, turn, "queue_dropped", {"count": count})
+        payload: dict[str, Any] = {"count": count}
+        # Materialized first: a lazy iterable is truthy even when it yields nothing.
+        ids = list(client_ids)
+        if ids:
+            payload["client_ids"] = ids
+        return self._record_to(session_id, turn, "queue_dropped", payload)
 
     def attach(self, session_id: str, backend_id: str = "", model: str = "") -> ManagerSession:
         """Continue one saved conversation. No provider call and no Start.
@@ -1541,12 +1560,16 @@ class ManagerOrchestrator:
         with contextlib.suppress(Exception):
             self.store.save(consumed)
 
-    def _turn(self, message: str, inbound: str, task_id: str, *, images: int = 0) -> dict[str, Any]:
+    def _turn(
+        self, message: str, inbound: str, task_id: str, *, images: int = 0, client_id: str = ""
+    ) -> dict[str, Any]:
         session, _ = self._active()
         turn = session.turn_count + 1
         asked: dict[str, Any] = {"text": message, "task_id": task_id} if task_id else {"text": message}
         if images:
             asked["images"] = images
+        if client_id:
+            asked["client_id"] = client_id
         try:
             self._record(session, turn, inbound, asked)
             events, grown, reply = self._exchange(session, turn, message)

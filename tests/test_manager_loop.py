@@ -852,6 +852,40 @@ def test_a_send_that_cannot_rebind_still_logs_the_owner_text(make) -> None:
     assert saved.turn_count == 1
 
 
+def test_a_route_refused_send_logs_its_client_id_and_a_plain_send_logs_none(make) -> None:
+    first = make()
+    pinned = first.orch.start("fake", "model-a")
+    first.orch.close()
+    again = make(prefix="b")
+    again.orch.restore_latest()
+
+    def unreachable(backend_id: str, model: str) -> FakeBackend:
+        raise RuntimeError("provider offline")
+
+    again.orch._backend_factory = unreachable
+
+    with pytest.raises(RuntimeError, match="provider offline"):
+        again.orch.send("are you there", client_id="echo-9")
+
+    logged = again.store.events(pinned.session_id)
+    assert logged[-2]["type"] == "user_message"
+    assert logged[-2]["payload"] == {"text": "are you there", "client_id": "echo-9"}
+
+
+def test_record_queue_dropped_adds_client_ids_only_when_given(make) -> None:
+    harness = make()
+    session = harness.orch.start("fake", "model-a")
+
+    harness.orch.record_queue_dropped(session.session_id, 1, 2, ["a-1", "b_2"])
+    harness.orch.record_queue_dropped(session.session_id, 1, 1)
+    harness.orch.record_queue_dropped(session.session_id, 1, 1, iter(()))
+
+    dropped = [event for event in harness.store.events(session.session_id) if event["type"] == "queue_dropped"]
+    assert [event["payload"] for event in dropped] == [
+        {"count": 2, "client_ids": ["a-1", "b_2"]}, {"count": 1}, {"count": 1}
+    ]
+
+
 def test_a_route_switch_restarts_the_byte_estimate_from_the_new_brief(make) -> None:
     # NF-2026-02318: the old route's estimate carried over and rotated the new route early.
     harness = make()
