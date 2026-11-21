@@ -213,8 +213,8 @@ def test_extension_first_snapshot_precedes_background_convergence():
     routing_convergence = _slice(_EXTENSION_JS, "if (this.backgroundConvergencePromise) return", 600)
     # The first snapshot posts a bounded summary before the full payload;
     # retain enough of the function to reach the deliberately later
-    # convergence call.
-    snapshot = _slice(_EXTENSION_JS, "async function pushSnapshotOnce(view)", 5200)
+    # convergence call (NF-2026-02323's late-reply path grew it past 5200).
+    snapshot = _slice(_EXTENSION_JS, "async function pushSnapshotOnce(view)", 8000)
     assert "this._convergeBackgroundServices()" not in handshake
     assert "convergeRoutingServicesInBackground();" in dashboard_convergence
     assert routing_entry.index("client.ensureStarted()") < routing_entry.index(
