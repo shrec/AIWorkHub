@@ -95,11 +95,18 @@ class HostStageError(ValueError):
     """A refused host-stage input or step; ``str(exc)`` is a stable code."""
 
 
+# NF-2026-02371: card key naming, per host command routed from a canonical
+# env-skip, the files that host run must no longer skip.
+HOST_ENV_SKIP_PATHS = "host_env_skip_paths"
+MAX_ENV_SKIP_ROUTES = 64
+
+
 @dataclass(frozen=True)
 class HostStageSpec:
     commands: tuple[tuple[str, ...], ...]
     sweep_tests: tuple[str, ...]
     sweep_processes: int
+    env_skip_paths: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = ()
 
 
 @dataclass
@@ -243,6 +250,27 @@ def _sweep(raw: object) -> tuple[tuple[str, ...], int]:
     return tuple(tests), processes
 
 
+def _env_skip_paths(raw: object) -> tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]:
+    """Validated ``host_env_skip_paths`` routes; refused unless strings throughout."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or len(raw) > MAX_ENV_SKIP_ROUTES:
+        raise HostStageError(f"{HOST_ENV_SKIP_PATHS}_invalid:list_of_routes")
+    routes: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    for index, item in enumerate(raw):
+        argv = item.get("argv") if isinstance(item, Mapping) else None
+        paths = item.get("paths") if isinstance(item, Mapping) else None
+        if (
+            not isinstance(argv, list)
+            or not isinstance(paths, list)
+            or not all(isinstance(token, str) for token in argv)
+            or not all(isinstance(path, str) for path in paths)
+        ):
+            raise HostStageError(f"{HOST_ENV_SKIP_PATHS}_invalid:{index}")
+        routes.append((tuple(argv), tuple(paths)))
+    return tuple(routes)
+
+
 def parse_host_spec(card: object) -> HostStageSpec | None:
     """The card's host-stage spec, ``None`` for a card that declares none."""
     if not card_requests_host_stage(card):
@@ -253,7 +281,12 @@ def parse_host_spec(card: object) -> HostStageSpec | None:
     tests, processes = ((), 0) if raw_sweep is None else _sweep(raw_sweep)
     if not commands and not tests:
         raise HostStageError("host_stage_empty")
-    return HostStageSpec(commands=commands, sweep_tests=tests, sweep_processes=processes)
+    return HostStageSpec(
+        commands=commands,
+        sweep_tests=tests,
+        sweep_processes=processes,
+        env_skip_paths=_env_skip_paths(card.get(HOST_ENV_SKIP_PATHS)),
+    )
 
 
 def card_host_fields(
@@ -274,6 +307,96 @@ def card_host_fields(
     if host_sweep is not None:
         out["host_sweep"] = {"tests": list(spec.sweep_tests), "processes": spec.sweep_processes}
     return out
+
+
+# NF-2026-02371: validation-row keys a worker evidence record may carry.
+_EVIDENCE_VALIDATION_KEYS = ("validation_results", "validations", "validation")
+
+
+def _evidence_validation_rows(evidence: object) -> list[Mapping[str, Any]]:
+    if not isinstance(evidence, Mapping):
+        return []
+    rows: list[Mapping[str, Any]] = []
+    for key in _EVIDENCE_VALIDATION_KEYS:
+        value = evidence.get(key)
+        if isinstance(value, list):
+            rows.extend(row for row in value if isinstance(row, Mapping))
+    return rows
+
+
+def _env_skip_routes(
+    rows: Iterable[object], declared: object
+) -> list[tuple[list[str], list[str]]]:
+    """``(argv, env_skip_canonical paths)`` of every canonical env-skip row, argv deduplicated.
+
+    Fail closed, never dropped: a command that is not exactly one of the card's
+    *declared* validation commands, or whose paths are not a list of strings,
+    becomes argv ``[""]``, and a command the validation parser cannot read is
+    kept as its whitespace split, so ``parse_host_spec`` refuses either.
+    """
+    from . import validation_skip_audit, worker_workspace
+
+    items = declared if isinstance(declared, list) else []
+    allowed = {item for item in items if isinstance(item, str)}
+    routes: list[tuple[list[str], list[str]]] = []
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        skipped = row.get(validation_skip_audit.ENV_SKIP_CANONICAL)
+        if not skipped:
+            continue
+        command = row.get(validation_skip_audit.HOST_STAGE_COMMAND)
+        text = command if isinstance(command, str) else ""
+        paths_ok = isinstance(skipped, list) and all(isinstance(path, str) for path in skipped)
+        if text not in allowed or not paths_ok:
+            argv = [""]
+        else:
+            try:
+                argv = worker_workspace.validation_argv(text)
+            except worker_workspace.WorkspaceError:
+                argv = text.split() or [""]
+        paths = list(skipped) if paths_ok else []
+        for route_argv, route_paths in routes:
+            if route_argv == argv:
+                route_paths.extend(path for path in paths if path not in route_paths)
+                break
+        else:
+            routes.append((argv, paths))
+    return routes
+
+
+def env_skip_host_commands(rows: Iterable[object], declared: object) -> list[list[str]]:
+    """Host argv of every green row whose env-skip came from canonical-unchanged tests.
+
+    *declared* is the card's own ``validation`` list; see :func:`_env_skip_routes`.
+    """
+    return [argv for argv, _paths in _env_skip_routes(rows, declared)]
+
+
+def card_with_env_skip_host_commands(card: Any, rows: Iterable[object]) -> Any:
+    """*card* with canonical env-skip commands joined to ``host_commands``.
+
+    Each routed argv is bound to one of the card's declared ``validation``
+    commands and records its skipped paths under ``host_env_skip_paths`` so the
+    host stage fails when it still skips them.  Returns *card* itself when no
+    row needs the host stage, so a card without such rows behaves exactly as
+    before.
+    """
+    if not isinstance(card, Mapping):
+        return card
+    routes = _env_skip_routes(rows, card.get("validation"))
+    if not routes:
+        return card
+    existing = card.get("host_commands")
+    if existing is not None and not isinstance(existing, list):
+        return card  # malformed: parse_host_spec refuses it unchanged
+    merged = list(existing or [])
+    merged.extend(argv for argv, _paths in routes if argv not in merged)
+    return {
+        **card,
+        "host_commands": merged,
+        HOST_ENV_SKIP_PATHS: [{"argv": argv, "paths": paths} for argv, paths in routes],
+    }
 
 
 def sweep_process_bound(cpu_capacity: int | None = None) -> int:
@@ -461,6 +584,48 @@ def _handle_runner(tree: TreeHandle) -> Runner:
 
 def _row_failed(row: Mapping[str, Any]) -> bool:
     return bool(row.get("timed_out")) or row.get("returncode") != 0
+
+
+def _routed_paths(spec: HostStageSpec, argv: Sequence[str]) -> set[str]:
+    key = tuple(argv)
+    return {path for route, paths in spec.env_skip_paths if route == key for path in paths}
+
+
+def host_command_argv(spec: HostStageSpec, argv: Sequence[str]) -> list[str]:
+    """*argv* as run on the host; a routed command also asks pytest for ``-rs`` skip reasons."""
+    from . import validation_skip_audit
+
+    flag = validation_skip_audit.SKIP_REPORT_FLAG
+    if _routed_paths(spec, argv) and flag not in argv:
+        return [*argv, flag]
+    return list(argv)
+
+
+def host_command_failed(spec: HostStageSpec, argv: Sequence[str], row: Mapping[str, Any]) -> bool:
+    """A host command row's verdict.
+
+    NF-2026-02371: a command routed from a canonical env-skip also fails when
+    the host still env-skipped a test in one of the files it was routed to run,
+    or reported a skip whose reason or location it cannot read (fail closed).
+    Every other command keeps the plain returncode judgment.
+    """
+    if _row_failed(row):
+        return True
+    routed = _routed_paths(spec, argv)
+    if not routed:
+        return False
+    from . import validation_runner, validation_skip_audit
+
+    output = f"{row.get('stdout_tail') or ''}\n{row.get('stderr_tail') or ''}"
+    outcomes = validation_runner.pytest_validation_evidence(output, 0).get("pytest_outcomes")
+    expected = outcomes.get("skipped") if isinstance(outcomes, Mapping) else None
+    for item in validation_skip_audit.environment_skips(
+        output, expected if isinstance(expected, int) else None
+    ):
+        path = validation_skip_audit.skip_location_path(str(item.get("location") or ""))
+        if path is None or path in routed:
+            return True
+    return False
 
 
 _SUMMARY_KEYS = (
@@ -1109,11 +1274,12 @@ def _run_host_stage_claimed(
                 before = snapshot(tree.path, tree.changed())
                 command_rows: list[Row] = []
                 for argv in spec.commands:
-                    command_rows.append(tree_runner(list(argv), tree.path))
-                    if _row_failed(command_rows[-1]):
+                    command_rows.append(tree_runner(host_command_argv(spec, argv), tree.path))
+                    if host_command_failed(spec, argv, command_rows[-1]):
                         break
                 commands_ok = len(command_rows) == len(spec.commands) and not any(
-                    _row_failed(row) for row in command_rows
+                    host_command_failed(spec, argv, row)
+                    for argv, row in zip(spec.commands, command_rows)
                 )
                 result["host_commands"] = [_row_summary(row) for row in command_rows]
                 generated = detect_generated(before, tree.path, tree.changed()) if spec.commands else {}
@@ -1295,6 +1461,8 @@ def accept_step(
     accept refuses the same way and starts nothing. A later accept reads the
     persisted result: only ``passed`` lets acceptance continue.
     """
+    # NF-2026-02371: a canonical-authored env-skip row routes its command here.
+    card = card_with_env_skip_host_commands(card, _evidence_validation_rows(evidence))
     if not card_requests_host_stage(card):
         return ""
     result = read_result(repo_root, request_id)

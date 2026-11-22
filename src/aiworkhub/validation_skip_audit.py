@@ -20,8 +20,10 @@ and the row is withheld as environmental (``skip_reasons_unreadable``).
 
 from __future__ import annotations
 
+import posixpath
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
+from pathlib import PurePosixPath
 from typing import Any
 
 # The one marker vocabulary (case-insensitive substrings of the skip reason).
@@ -35,8 +37,15 @@ ENVIRONMENT_SKIP_MARKERS: tuple[str, ...] = (
 )
 
 SKIP_REPORT_FLAG = "-rs"
+# Files whose presence decides pytest's rootdir (NF-2026-02371 F1).
+PYTEST_ROOTDIR_FILES = frozenset(
+    {"pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"}
+)
 VALIDATION_ENV_SKIPPED = "validation_env_skipped"
 SKIP_REASONS_UNREADABLE = "skip_reasons_unreadable"
+# NF-2026-02371: env-skip authored only by canonical-unchanged test files.
+ENV_SKIP_CANONICAL = "validation_env_skip_canonical"
+HOST_STAGE_COMMAND = "host_stage_command"
 MAX_REPORTED_SKIPS = 64
 MAX_REASON_CHARS = 300
 MAX_LINE_CHARS = 4096
@@ -140,7 +149,97 @@ def env_skip_row_fields(skips: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def apply_env_skip_audit(row: Mapping[str, Any], output: str) -> dict[str, Any]:
+def skip_location_path(location: str) -> str | None:
+    """Repo-relative POSIX path of one ``-rs`` skip location; ``None`` if unparseable.
+
+    ``path:line`` and module-level ``path`` both read as ``path``.  An absolute,
+    drive-qualified or ``..`` location, or a non-``.py`` file, cannot be compared
+    to the candidate's repo-relative changed paths, so it is refused.
+    """
+    text = str(location or "").strip().replace("\\", "/")
+    head, separator, tail = text.rpartition(":")
+    if separator and tail.isascii() and tail.isdigit():
+        text = head
+    pure = PurePosixPath(text)
+    if (
+        not text
+        or not text.endswith(".py")
+        or ":" in text
+        or text.startswith(("-", "@"))
+        or pure.is_absolute()
+        or ".." in pure.parts
+    ):
+        return None
+    return posixpath.normpath(text)
+
+
+def environment_skip_paths(skips: list[dict[str, Any]]) -> list[str] | None:
+    """Distinct files named by env-skip entries, in order; ``None`` if any is unparseable."""
+    paths: list[str] = []
+    for item in skips:
+        path = skip_location_path(str(item.get("location") or ""))
+        if path is None:
+            return None
+        if path not in paths:
+            paths.append(path)
+    return paths or None
+
+
+def conftest_chain(path: str) -> list[str]:
+    """Every ``conftest.py`` pytest may load for *path*, root first."""
+    parents = PurePosixPath(path).parts[:-1]
+    return ["/".join((*parents[:depth], "conftest.py")) for depth in range(len(parents) + 1)]
+
+
+def canonical_env_skip_paths(
+    skips: list[dict[str, Any]], changed_paths: Collection[str]
+) -> list[str] | None:
+    """The skipping files when none of them nor their conftests was changed, else ``None``."""
+    if not skips or len(skips) >= MAX_REPORTED_SKIPS:
+        return None  # truncated report: an unlisted skip could be candidate-authored
+    paths = environment_skip_paths(skips)
+    if paths is None:
+        return None
+    changed = {posixpath.normpath(str(item).replace("\\", "/")) for item in changed_paths}
+    # A changed ini file can move pytest's rootdir, so skip locations stop being repo-relative.
+    if any(PurePosixPath(path).name in PYTEST_ROOTDIR_FILES for path in changed):
+        return None
+    for path in paths:
+        if path in changed or any(conftest in changed for conftest in conftest_chain(path)):
+            return None
+    return paths
+
+
+def env_skip_canonical_fields(
+    row: Mapping[str, Any], skips: list[dict[str, Any]], paths: list[str]
+) -> dict[str, Any] | None:
+    """Green-row evidence for a canonical-authored env-skip; ``None`` without a command."""
+    command = row.get("declared_command") or row.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    prior = row.get("known_unknown")
+    known = [dict(item) for item in prior if isinstance(item, Mapping)] if isinstance(prior, list) else []
+    known.append(
+        {
+            "kind": ENV_SKIP_CANONICAL,
+            "paths": list(paths),
+            "reason": "environment skip in canonical-unchanged test file; host stage decides",
+        }
+    )
+    return {
+        ENV_SKIP_CANONICAL: list(paths),
+        "known_unknown": known,
+        "env_skipped_tests": [dict(item) for item in skips],
+        HOST_STAGE_COMMAND: command,
+    }
+
+
+def apply_env_skip_audit(
+    row: Mapping[str, Any],
+    output: str,
+    *,
+    changed_paths: Callable[[], Iterable[str]] | None = None,
+) -> dict[str, Any]:
     """The single lane entry point: audit one pytest row, return it (rewritten).
 
     Only an exit-0 row can be rewritten; any other row is returned unchanged.
@@ -148,6 +247,13 @@ def apply_env_skip_audit(row: Mapping[str, Any], output: str) -> dict[str, Any]:
     reach this function.  ``row["pytest_outcomes"]`` (the lane's own parse of
     the final summary line) supplies the skipped count for the fail-closed
     check.
+
+    NF-2026-02371: *changed_paths* is a zero-arg callable returning the
+    candidate's changed paths; it is called lazily, only for a non-timed-out
+    row with env skips.  An env-skip whose every skipping file and conftest on
+    its path is unchanged stays green with ``known_unknown`` evidence and a
+    ``host_stage_command``.  Without the callable (default), when it raises, a
+    timed-out row, or an unparseable location, the row is withheld.
     """
     updated = dict(row)
     if updated.get("returncode") != 0:
@@ -156,5 +262,14 @@ def apply_env_skip_audit(row: Mapping[str, Any], output: str) -> dict[str, Any]:
     expected = outcomes.get("skipped") if isinstance(outcomes, Mapping) else None
     skips = environment_skips(output, expected if isinstance(expected, int) else None)
     if skips:
-        updated.update(env_skip_row_fields(skips))
+        delta: frozenset[str] | None = None
+        if changed_paths is not None and not updated.get("timed_out"):
+            try:
+                delta = frozenset(changed_paths())
+            # Broad on purpose: WorkspaceError cannot be imported (circular) and any failure must withhold.
+            except Exception:
+                delta = None
+        canonical = canonical_env_skip_paths(skips, delta) if delta is not None else None
+        fields = env_skip_canonical_fields(updated, skips, canonical) if canonical else None
+        updated.update(fields if fields is not None else env_skip_row_fields(skips))
     return updated

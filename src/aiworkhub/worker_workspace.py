@@ -13688,8 +13688,9 @@ def run_validations(
             from . import validation_runner, validation_skip_audit
 
             record.update(validation_runner.pytest_validation_evidence(stdout, result.returncode))
-            if _is_pytest_validation_command(tokens):  # NF-2026-02307
-                record = validation_skip_audit.apply_env_skip_audit(record, stdout)
+            if _is_pytest_validation_command(tokens):  # NF-2026-02307 / NF-2026-02371
+                record = validation_skip_audit.apply_env_skip_audit(record, stdout, changed_paths=lambda: (
+                    *changed_paths(workspace, git_phase="validation_env_skip_audit"), *workspace.inherited_rework_paths))
             if broker_evidence:
                 record["metadata_broker_denials"] = broker_evidence
                 # This attribution is launcher-authored from the private pipe;
