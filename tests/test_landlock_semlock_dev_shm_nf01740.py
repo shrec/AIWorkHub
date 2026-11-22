@@ -354,7 +354,9 @@ class TestArgvComposition:
         assert argv[index + 1] == "/dev/shm"
         assert index < argv.index("--")
         plain = self._argv(workspace, validation_exec_scratch=scratch)
-        assert "--semlock-dev-shm" not in plain
+        # NF-2026-02355: an unrequested validation launch gets the same rule.
+        assert plain[plain.index("--semlock-dev-shm") + 1] == "/dev/shm"
+        assert plain.index("--semlock-dev-shm") < plain.index("--")
         monkeypatch.setattr(
             validation_runner, "landlock_semlock_dev_shm_root", lambda *a: None
         )
@@ -664,7 +666,9 @@ class TestBrokerSocketChmod:
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Landlock is Linux-only")
-def test_real_landlock_validation_runs_multiprocessing_pool(tmp_path: Path) -> None:
+def test_real_landlock_validation_runs_multiprocessing_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if worker_workspace.landlock_abi_version() < 1:
         pytest.skip("host kernel lacks landlock")
     if validation_runner.landlock_semlock_dev_shm_root() is None:
@@ -701,14 +705,22 @@ def test_real_landlock_validation_runs_multiprocessing_pool(tmp_path: Path) -> N
                 validation_semlock_dev_shm=grant,
                 validation_short_tmp=short_tmp,
             )
-            assert ("--semlock-dev-shm" in argv) is grant
+            # NF-2026-02355: the open gate grants every validation launch, so the
+            # rule follows the gate, not the static SemLock request.
+            gate_open = validation_runner.landlock_semlock_dev_shm_root() is not None
+            assert ("--semlock-dev-shm" in argv) is gate_open
             return subprocess.run(
                 argv, capture_output=True, text=True, timeout=120, check=False, env=env
             )
 
         granted = run(True)
         assert granted.returncode == 0, granted.stderr[-2000:]
-        denied = run(False)
+        unrequested = run(False)
+        assert unrequested.returncode == 0, unrequested.stderr[-2000:]
+        monkeypatch.setattr(
+            validation_runner, "landlock_semlock_dev_shm_root", lambda *a: None
+        )
+        denied = run(True)
         assert denied.returncode != 0
         assert "PermissionError" in denied.stderr, denied.stderr[-2000:]
     finally:

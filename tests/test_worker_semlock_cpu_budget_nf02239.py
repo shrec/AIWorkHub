@@ -124,7 +124,8 @@ class TestFlagDecision:
         _gate(monkeypatch, "/dev/shm")
         decide = sandbox_cpu_budget.landlock_semlock_dev_shm_flags
         assert decide(True, tmp_path) == [_VALIDATION_FLAG, "/dev/shm"]
-        assert decide(False, tmp_path) == []
+        # NF-2026-02355: an unrequested validation launch matches the worker lane.
+        assert decide(False, tmp_path) == [_VALIDATION_FLAG, "/dev/shm"]
         with pytest.raises(WorkspaceError, match="requires_validation"):
             decide(True, None)
 
@@ -169,7 +170,9 @@ class TestArgvComposition:
         scratch = tmp_path / "scratch"
         scratch.mkdir()
         plain = _argv(workspace, "validation", validation_exec_scratch=scratch)
-        assert _WORKER_FLAG not in plain and _VALIDATION_FLAG not in plain
+        assert _WORKER_FLAG not in plain
+        # NF-2026-02355: a plain validation launch carries the validation rule too.
+        assert plain[plain.index(_VALIDATION_FLAG) + 1] == "/dev/shm"
         needed = _argv(
             workspace,
             "validation",

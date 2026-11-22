@@ -7,13 +7,15 @@ the /dev/shm beneath-rule only to VALIDATION commands that need SemLock.  This
 module owns the parent-side half of the fix so ``worker_workspace`` (at its line
 ratchet ceiling) only forwards the result:
 
-* :func:`landlock_semlock_dev_shm_flags` -- the landlock-exec flag pair.  A
-  validation launch keeps the NF-2026-01740 behaviour byte for byte
-  (``--semlock-dev-shm`` only when requested, refused without an exec
-  scratch); a provider/worker launch now carries ``--worker-semlock-dev-shm``.
-  Both are decided by the ONE existing gate,
-  :func:`validation_runner.landlock_semlock_dev_shm_root` (a real, non-symlink
-  directory), and the child grants both through the same
+* :func:`landlock_semlock_dev_shm_flags` -- the landlock-exec flag pair.  The
+  two lanes now agree (NF-2026-02355): a validation launch (one with an exec
+  scratch) carries ``--semlock-dev-shm`` whenever the gate opens, whether or
+  not the static SemLock detector requested it, so indirect SemLock use that
+  works in the worker no longer goes red at hub validation; a provider/worker
+  launch carries ``--worker-semlock-dev-shm``.  Requesting the validation rule
+  without an exec scratch is still refused.  Both are decided by the ONE
+  existing gate, :func:`validation_runner.landlock_semlock_dev_shm_root` (a
+  real, non-symlink directory), and the child grants both through the same
   ``_landlock_semlock_dev_shm_rule`` with the same sem_open-only rights.
 * :func:`cpu_budget_env` -- ``AIWORKHUB_CPU_BUDGET`` for the worker and
   validation environments, derived from the observed core count with the
@@ -47,12 +49,15 @@ def landlock_semlock_dev_shm_flags(
 ) -> list[str]:
     """Return the /dev/shm SemLock landlock-exec flag pair, or ``[]``.
 
-    A validation launch (one with an exec scratch) gains the rule only when
-    ``run_validations`` requested it for a SemLock-needing command -- exactly the
-    NF-2026-01740 contract.  Requesting it without an exec scratch still fails
-    closed.  A provider/worker launch (no exec scratch, not requested) gains
-    the worker flag.  Either way the root comes from the single existing gate,
-    so the rule exists exactly where the SemLock preflight would grant it.
+    The worker and validation lanes agree (NF-2026-02355): a validation launch
+    (one with an exec scratch) gains ``--semlock-dev-shm`` whenever the gate
+    returns a root, regardless of ``requested`` -- the static SemLock detector
+    cannot see indirect use (a library, conftest or helper), and that use
+    already works in the worker sandbox.  A provider/worker launch (no exec
+    scratch) gains ``--worker-semlock-dev-shm``.  Requesting the rule without an
+    exec scratch still fails closed.  Either way the root comes from the single
+    existing gate, so the rule exists exactly where the SemLock preflight would
+    grant it, and ``[]`` for every lane when the gate is closed.
     """
     if validation_exec_scratch is None:
         if requested:
@@ -60,10 +65,8 @@ def landlock_semlock_dev_shm_flags(
 
             raise WorkspaceError("landlock_semlock_dev_shm_requires_validation")
         flag = WORKER_SEMLOCK_DEV_SHM_FLAG
-    elif requested:
-        flag = VALIDATION_SEMLOCK_DEV_SHM_FLAG
     else:
-        return []
+        flag = VALIDATION_SEMLOCK_DEV_SHM_FLAG
     root = validation_runner.landlock_semlock_dev_shm_root()
     return [flag, root] if root is not None else []
 
