@@ -1131,6 +1131,136 @@ def _pytest_spawns_subprocess(args: list[str]) -> bool:
     return False
 
 
+# NF-2026-02369: field 0.13.9 GeoAI Linux -- ``pytest -n 12`` through
+# worker_validation_run spawned 14 xdist processes at ~1 GB RSS each and drove
+# the host into swap (370 MB free at 04:25 UTC). One xdist worker is budgeted at
+# that measured ~1 GiB so the memory bound keeps the run out of swap.
+XDIST_WORKER_MEMORY_BUDGET_BYTES = 1 << 30
+# Same value and semantics as ``host_validation_stage.HEADROOM_FRACTION`` (that
+# module cannot be imported here or from worker_workspace without a cycle);
+# ``tests/test_validation_xdist_cap_nf02369.py`` asserts the two stay equal.
+XDIST_HEADROOM_FRACTION = 0.25
+_XDIST_AUTO_VALUES = frozenset({"auto", "logical"})
+
+
+def bounded_xdist_workers(requested: int | None = None) -> int:
+    """Return the xdist worker ceiling for this host, sampled at call time.
+
+    ``bound = max(1, min(cores - headroom, available_memory // budget))`` where
+    cores come from ``parallelism.get_cpu_capacity()``, headroom is
+    ``ceil(cores * XDIST_HEADROOM_FRACTION)`` and memory from
+    ``platform_io.available_memory_bytes()``. Unmeasured memory (``None``) falls
+    back to the core bound alone. A positive ``requested`` is never raised.
+    """
+
+    import math
+
+    from . import parallelism, platform_io
+
+    cores = max(1, int(parallelism.get_cpu_capacity()))
+    bound = cores - math.ceil(cores * XDIST_HEADROOM_FRACTION)
+    available = platform_io.available_memory_bytes()
+    if available is not None:
+        bound = min(bound, int(available) // XDIST_WORKER_MEMORY_BUDGET_BYTES)
+    bound = max(1, bound)
+    if requested is not None and requested > 0:
+        return min(requested, bound)
+    return bound
+
+
+def _capped_xdist_value(value: str) -> str | None:
+    """Replacement text for one ``-n`` value, or ``None`` to keep it as-is."""
+
+    text = value.strip()
+    if text.lower() in _XDIST_AUTO_VALUES:
+        return str(bounded_xdist_workers())
+    try:
+        requested = int(text)
+    except ValueError:
+        return None  # pytest-xdist itself rejects a malformed count
+    if requested <= 0:
+        return None  # ``-n 0`` disables distribution: leave byte-identical
+    capped = bounded_xdist_workers(requested)
+    return None if capped == requested else str(capped)
+
+
+XDIST_AUTO_NUM_WORKERS_ENV = "PYTEST_XDIST_AUTO_NUM_WORKERS"
+# A short-option cluster of pytest's value-less flags ending in xdist ``n``
+# (``-qn20``, ``-xn 20``, ``-vsn32``); group 1 is the attached value, if any.
+_XDIST_BUNDLED_SHORT = re.compile(r"-[qvxsl]+n(.*)", re.DOTALL)
+
+
+def xdist_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """``PYTEST_XDIST_AUTO_NUM_WORKERS`` bounded by ``bounded_xdist_workers()``.
+
+    pytest-xdist resolves ``-n auto``/``logical`` (including one injected by
+    ``addopts``, which no argv rewrite sees) through this variable first. The
+    bound is sampled at call time; a value already present in ``base`` is never
+    overridden, so the result is then empty.
+    """
+
+    if base is not None and XDIST_AUTO_NUM_WORKERS_ENV in base:
+        return {}
+    return {XDIST_AUTO_NUM_WORKERS_ENV: str(bounded_xdist_workers())}
+
+
+def _cap_attached_xdist(head: str, raw: str) -> str | None:
+    """Capped ``head + value`` for an attached ``-n`` value, else ``None``."""
+
+    if raw.startswith("="):
+        head, raw = head + "=", raw[1:]
+    replacement = _capped_xdist_value(raw)
+    return None if replacement is None else head + replacement
+
+
+def cap_pytest_xdist_argv(argv: list[str]) -> list[str]:
+    """Rewrite every xdist ``-n`` spelling in a pytest argv to the host bound.
+
+    Handles ``-n N``, ``-nN``, ``-n=N``, ``--numprocesses N`` and
+    ``--numprocesses=N`` including ``auto``/``logical``, and a bundled short
+    cluster (``-qn20``, ``-xn 20``, ``-vsn32``). Non-pytest argv, an argv
+    without ``-n``, ``-n 0`` and a count already within the bound are returned
+    unchanged (as a new list); every other token stays byte-identical.
+    """
+
+    result = list(argv)
+    args = _pytest_args(result)
+    if not args:
+        return result
+    offset = len(result) - len(args)
+    if offset < 0 or result[offset:] != args:
+        return result
+    index = offset
+    for kind, name, value in _iter_pytest_args(args):
+        token = result[index]
+        if kind != "option" or value is None:
+            bundle = _XDIST_BUNDLED_SHORT.fullmatch(token) if kind == "option" else None
+            if bundle is not None and bundle.group(1):
+                capped = _cap_attached_xdist(token[: bundle.start(1)], bundle.group(1))
+                if capped is not None:
+                    result[index] = capped
+            elif bundle is not None and index + 1 < len(result):
+                # ``-xn 20``: the parser yields ``20`` next as a positional.
+                replacement = _capped_xdist_value(result[index + 1])
+                if replacement is not None:
+                    result[index + 1] = replacement
+            index += 1
+            continue
+        attached = token != name  # ``-n4`` / ``-n=4`` / ``--numprocesses=4``
+        is_xdist = name == _PYTEST_XDIST_SHORT or name in _PYTEST_XDIST_LONG
+        if is_xdist:
+            if attached:
+                capped = _cap_attached_xdist(token[: len(token) - len(value)], value)
+                if capped is not None:
+                    result[index] = capped
+            else:
+                replacement = _capped_xdist_value(value)
+                if replacement is not None:
+                    result[index + 1] = replacement
+        index += 1 if attached else 2
+    return result
+
+
 def _segment_unrunnable_reason(args: list[str]) -> str | None:
     """Named reason one chained segment cannot run in the sandbox, else ``None``."""
 
@@ -1493,8 +1623,11 @@ VALIDATION_CHILD_UTF8_ENV: dict[str, str] = {"PYTHONIOENCODING": "utf-8", "PYTHO
 
 
 def validation_child_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The child environment: ``base`` (default ``os.environ``) plus the UTF-8 pins."""
-    return {**(os.environ if base is None else base), **VALIDATION_CHILD_UTF8_ENV}
+    """The child environment: ``base`` (default ``os.environ``) plus the UTF-8 pins
+    and the NF-2026-02369 xdist ``-n auto`` bound (see ``xdist_env``)."""
+    env = {**(os.environ if base is None else base), **VALIDATION_CHILD_UTF8_ENV}
+    env.update(xdist_env(env))
+    return env
 
 
 # ---- validation-environment signatures (NF-2026-01671) -----------------------

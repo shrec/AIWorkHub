@@ -7141,9 +7141,10 @@ def sanitized_env(
         safe["BITNN_TASK_QUEUE_DB"] = str(selected_home / TASK_QUEUE_ISOLATED_RELATIVE)
     if adapter_id == "validation":
         from aiworkhub import toolchain_authority as _ta, tree_sitter_cache as _tsc
+        from aiworkhub import validation_runner as _vr
 
         safe.update(_ta.validation_user_base_env(adapter_id))  # NF-2026-01969: POSIX only
-
+        safe.update(_vr.xdist_env(safe))  # NF-2026-02369: bound xdist ``-n auto``
         # NF-2026-01042/02004: with a repo the AppContainer reads the host-owned
         # repo mirror (mirror_read_grants), never the C: profile cache.
         tree_sitter_cache_root = _tsc.validation_cache_root(repo if home is not None else None)
@@ -8248,10 +8249,10 @@ def worker_validation_affordance_env(
         except (OSError, ValueError):
             continue
     temp = PurePosixPath(temp_dir) if os.name != "nt" else Path(temp_dir)
-    env["RUFF_CACHE_DIR"] = str(temp / "ruff-cache")
-    env["MYPY_CACHE_DIR"] = str(temp / "mypy-cache")
+    env.update(RUFF_CACHE_DIR=str(temp / "ruff-cache"), MYPY_CACHE_DIR=str(temp / "mypy-cache"))
+    from . import validation_runner as _vr  # NF-2026-02369: bound xdist ``-n auto``
     env.update(PYTEST_ADDOPTS=_WORKER_PYTEST_ADDOPTS, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
-    return env
+    return {**env, **_vr.xdist_env(env)}
 
 
 def _normalize_trusted_validation_executable_argv(
@@ -11983,9 +11984,10 @@ def _normalize_pytest_validation_argv(argv: list[str]) -> list[str]:
     Explicit ``python* -m pytest`` commands remain byte-for-byte unchanged.
     """
 
+    from . import validation_runner
     if argv and ntpath.basename(argv[0]) == "pytest":
-        return [sys.executable, "-m", "pytest", *argv[1:]]
-    return list(argv)
+        argv = [sys.executable, "-m", "pytest", *argv[1:]]
+    return validation_runner.cap_pytest_xdist_argv(list(argv))  # NF-2026-02369 -n cap
 
 
 def _is_candidate_pytest_wrapper_command(argv: list[str]) -> bool:
