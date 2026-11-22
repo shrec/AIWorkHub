@@ -9105,10 +9105,19 @@ def sandbox_argv(
             for value in rewritten
             for value_path in (Path(value).resolve(strict=False),)
         ]
-    from .validation_interpreter_binds import identity_runtime_binds as _identity_binds
+    from .validation_interpreter_binds import (
+        coordinator_runtime_binds as _coordinator_binds,
+        identity_runtime_binds as _identity_binds,
+    )
     validation_binds.extend(
         _identity_binds(adapter_id, adapter_argv[0], validation_python_runtime_identity_root)
     )
+    if package_import_root is not None:
+        # NF-2026-02332: the worker MCP server the provider CLI spawns runs on
+        # the coordinator ``sys.executable`` (never adapter_argv[0], the CLI),
+        # so its runtime is published read-only at identity paths; roots the
+        # validation binds above already published are not repeated.
+        validation_binds.extend(_coordinator_binds(validation_binds))
     if validation_readonly_dirs:
         validation_binds.extend(("--dir", "/validation-pythonpath"))
         for index, path in enumerate(validation_readonly_dirs):

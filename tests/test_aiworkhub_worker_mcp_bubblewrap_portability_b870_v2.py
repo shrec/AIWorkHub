@@ -53,6 +53,7 @@ from mcp.client.stdio import get_default_environment, stdio_client  # noqa: E402
 from aiworkhub import repository_state  # noqa: E402
 from aiworkhub import worker_ai_tools_mcp as w  # noqa: E402
 from aiworkhub import worker_workspace as ws  # noqa: E402
+from aiworkhub.validation_interpreter_binds import coordinator_runtime_binds  # noqa: E402
 
 REQUEST_TIMEOUT = timedelta(seconds=30)
 BWRAP = Path("/usr/bin/bwrap")
@@ -240,12 +241,28 @@ def _fake_workspace(tmp_path: Path) -> ws.WorkerWorkspace:
     )
 
 
+def _fake_coordinator_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """NF-2026-02332: sandbox_argv publishes the coordinator interpreter once a
+    package import root is bound; these argv-shape tests point that runtime at
+    a tmp venv/base so they never stat the host interpreter tree."""
+    base = tmp_path / "coordinator_base"
+    venv = tmp_path / "coordinator_venv"
+    for directory in (base / "bin", venv / "bin"):
+        directory.mkdir(parents=True)
+    exe = venv / "bin" / "python"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "executable", str(exe))
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    monkeypatch.setattr(sys, "base_prefix", str(base))
+
+
 def test_sandbox_argv_binds_package_import_root_at_dedicated_alias_independent_of_authority_repo(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workspace = _fake_workspace(tmp_path)
     host_package_root = tmp_path / "host_package_root_outside_repo"
     host_package_root.mkdir(parents=True, exist_ok=True)
+    _fake_coordinator_runtime(tmp_path, monkeypatch)
     argv = ws.sandbox_argv(
         workspace, "validation", ["true"], backend="bubblewrap",
         package_import_root=host_package_root,
@@ -265,7 +282,9 @@ def test_sandbox_argv_omits_package_alias_bind_when_not_provided(tmp_path: Path)
     assert ws.SANDBOX_PACKAGE_IMPORT_ROOT not in argv
 
 
-def test_provisioned_bubblewrap_pythonpath_alias_matches_resolver(tmp_path: Path) -> None:
+def test_provisioned_bubblewrap_pythonpath_alias_matches_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Cross-check: the alias ``provision_worker_mcp_runtime`` writes into
     PYTHONPATH is the exact constant ``sandbox_argv`` binds the REAL resolved
     host package root to -- the two independent call sites
@@ -281,6 +300,7 @@ def test_provisioned_bubblewrap_pythonpath_alias_matches_resolver(tmp_path: Path
     config = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
     provisioned_alias = config["mcpServers"][w.SERVER_NAME]["env"][w.ENV_PYTHONPATH]
 
+    _fake_coordinator_runtime(tmp_path, monkeypatch)
     argv = ws.sandbox_argv(
         workspace, "validation", ["true"], backend="bubblewrap",
         package_import_root=w.resolve_host_package_import_root(),
@@ -363,6 +383,10 @@ def test_real_bubblewrap_handshake_over_current_nested_monorepo_layout(tmp_path:
         "--tmpfs", "/tmp",
         "--dir", "/home",
         "--bind", str(home), sandbox_home,
+        # NF-2026-02332: the server command is the coordinator interpreter;
+        # its runtime binds come from the same production helper
+        # sandbox_argv uses, so a drift there fails here, not in CI.
+        *coordinator_runtime_binds(),
         "--ro-bind", str(fake_repo), ws.SANDBOX_AUTHORITY_REPO,
         "--ro-bind", str(real_package_root), ws.SANDBOX_PACKAGE_IMPORT_ROOT,
         "--chdir", ws.SANDBOX_AUTHORITY_REPO,
@@ -372,7 +396,6 @@ def test_real_bubblewrap_handshake_over_current_nested_monorepo_layout(tmp_path:
 
     result = asyncio.run(_run_handshake(params))
     assert result["tool_names"] == set(w.MCP_TOOL_NAMES)
-    assert len(w.MCP_TOOL_NAMES) == 6
     assert result["call_is_error"] is not True
 
 

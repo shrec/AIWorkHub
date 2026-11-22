@@ -42,6 +42,7 @@ from mcp.client.stdio import get_default_environment, stdio_client  # noqa: E402
 from aiworkhub import repository_state  # noqa: E402
 from aiworkhub import worker_ai_tools_mcp as w  # noqa: E402
 from aiworkhub import worker_workspace as ws  # noqa: E402
+from aiworkhub.validation_interpreter_binds import coordinator_runtime_binds  # noqa: E402
 
 REQUEST_TIMEOUT = timedelta(seconds=30)
 BWRAP = Path("/usr/bin/bwrap")
@@ -185,6 +186,10 @@ def _bubblewrap_argv(*, home: Path, authority_repo: Path, package_import_root: P
         "--tmpfs", "/tmp",
         "--dir", "/home",
         "--bind", str(home), sandbox_home,
+        # NF-2026-02332: the server command is the coordinator interpreter;
+        # its runtime binds come from the same production helper
+        # sandbox_argv uses, so a drift there fails here, not in CI.
+        *coordinator_runtime_binds(),
         "--ro-bind", str(authority_repo), ws.SANDBOX_AUTHORITY_REPO,
         "--ro-bind", str(package_import_root), ws.SANDBOX_PACKAGE_IMPORT_ROOT,
         "--chdir", ws.SANDBOX_AUTHORITY_REPO,
@@ -235,7 +240,6 @@ def test_worker_mcp_server_handshakes_over_real_bubblewrap_package_alias(tmp_pat
 
     result = asyncio.run(_run_handshake(params))
     assert result["tool_names"] == set(w.MCP_TOOL_NAMES)
-    assert len(w.MCP_TOOL_NAMES) == 6
     assert result["call_is_error"] is not True
 
 

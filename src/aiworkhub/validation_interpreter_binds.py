@@ -14,6 +14,7 @@ Landlock, AppContainer and vscode_lm never come through here.
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 _USR = Path("/usr")
@@ -30,10 +31,16 @@ def _is_anchor(path: Path) -> bool:
 
 
 def _candidate_roots(
-    executable: str, explicit_root: Path | None, adapter_id: str
+    executable: str,
+    explicit_root: Path | None,
+    adapter_id: str,
+    *,
+    publish_coordinator: bool = False,
 ) -> list[Path]:
     roots: list[Path] = []
-    coordinator = adapter_id == "validation" and executable == sys.executable
+    coordinator = publish_coordinator or (
+        adapter_id == "validation" and executable == sys.executable
+    )
     if explicit_root is None and not coordinator:
         return roots
     raw_base = Path(sys.base_prefix)
@@ -58,18 +65,53 @@ def _candidate_roots(
     return roots
 
 
+# bwrap flags this module needs to skip over when scanning earlier binds.
+_FLAG_ARITY = {"--dir": 1, "--ro-bind": 2, "--ro-bind-try": 2, "--bind": 2, "--symlink": 2}
+
+
+def _prior_identity(prior_binds: Sequence[str]) -> tuple[list[Path], set[str]]:
+    """Return identity ``--ro-bind`` roots and ``--dir`` paths already emitted."""
+    roots: list[Path] = []
+    dirs: set[str] = set()
+    index = 0
+    while index < len(prior_binds):
+        flag = prior_binds[index]
+        arity = _FLAG_ARITY.get(flag, 0)
+        if arity and index + arity < len(prior_binds):
+            values = prior_binds[index + 1 : index + 1 + arity]
+            if flag == "--dir":
+                dirs.add(values[0])
+            elif flag == "--ro-bind" and values[0] == values[1]:
+                roots.append(Path(values[0]))
+            index += 1 + arity
+            continue
+        index += 1
+    return roots, dirs
+
+
 def identity_runtime_binds(
-    adapter_id: str, executable: str, explicit_root: Path | None = None
+    adapter_id: str,
+    executable: str,
+    explicit_root: Path | None = None,
+    *,
+    publish_coordinator: bool = False,
+    prior_binds: Sequence[str] = (),
 ) -> list[str]:
     """Return ``--dir``/``--ro-bind`` args publishing the interpreter runtime.
 
     ``explicit_root`` is the version probe's base prefix; for a validation run
     whose final head is the coordinator ``sys.executable`` the venv root
     (``sys.prefix``, when it differs) and ``sys.base_prefix`` are published.
+    ``publish_coordinator`` requests that same coordinator runtime explicitly
+    for any adapter (the worker MCP server runs on ``sys.executable``).
     Roots already covered by the ``/usr`` bind, duplicates and roots nested in
-    another published root are skipped so nothing is bound twice.
+    another published root are skipped so nothing is bound twice;
+    ``prior_binds`` names binds already emitted, whose identity roots and
+    ``--dir`` entries are likewise never repeated.
     """
-    candidates = _candidate_roots(executable, explicit_root, adapter_id)
+    candidates = _candidate_roots(
+        executable, explicit_root, adapter_id, publish_coordinator=publish_coordinator
+    )
     if not candidates:
         return []
     published: list[Path] = []
@@ -90,9 +132,11 @@ def identity_runtime_binds(
         for root in published
     ):
         _refuse("validation_python_runtime_executable_outside_root")
+    prior_roots, seen_dirs = _prior_identity(prior_binds)
     binds: list[str] = []
-    seen_dirs: set[str] = set()
     for root in published:
+        if any(root.is_relative_to(other) for other in prior_roots):
+            continue
         for parent in reversed(root.parents):
             text = str(parent)
             if _is_anchor(parent) or text in seen_dirs:
@@ -101,3 +145,18 @@ def identity_runtime_binds(
             seen_dirs.add(text)
         binds.extend(("--ro-bind", str(root), str(root)))
     return binds
+
+
+def coordinator_runtime_binds(prior_binds: Sequence[str] = ()) -> list[str]:
+    """Binds publishing the coordinator ``sys.executable`` runtime.
+
+    The single owner of the worker-MCP interpreter bind set: ``sandbox_argv``
+    calls it whenever the worker MCP package root is bound, and the real
+    bubblewrap handshake test builds its argv from it.
+    """
+    return identity_runtime_binds(
+        "coordinator",
+        sys.executable,
+        publish_coordinator=True,
+        prior_binds=prior_binds,
+    )

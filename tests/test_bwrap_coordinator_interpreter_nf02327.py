@@ -131,3 +131,140 @@ def test_bubblewrap_argv_execs_unresolved_sys_executable(tmp_path, monkeypatch):
             head[i : i + 3] == ["--ro-bind", text, text] for i in range(len(head) - 2)
         )
         assert head.count(text) == 2
+
+
+# --- NF-2026-02332: worker MCP server runs on the coordinator interpreter ---
+
+
+def _triples(args: list[str]) -> list[tuple[str, str, str]]:
+    return list(zip(args, args[1:], args[2:]))
+
+
+def test_coordinator_runtime_binds_publish_for_any_adapter(tmp_path, monkeypatch):
+    venv, base, _exe = _fake_runtime(tmp_path, monkeypatch)
+    args = binds.coordinator_runtime_binds()
+    assert args == binds.identity_runtime_binds(
+        "claude_cli", sys.executable, publish_coordinator=True
+    )
+    for root in (venv, base.resolve()):
+        assert ("--ro-bind", str(root), str(root)) in _triples(args)
+    # Existing validation-only callers are unchanged.
+    assert binds.identity_runtime_binds("claude_cli", sys.executable) == []
+
+
+def test_coordinator_runtime_binds_skip_prior_roots_and_dirs(tmp_path, monkeypatch):
+    _venv, _base, exe = _fake_runtime(tmp_path, monkeypatch)
+    prior = binds.identity_runtime_binds("validation", str(exe))
+    assert prior
+    assert binds.coordinator_runtime_binds(prior) == []
+
+
+def test_coordinator_runtime_binds_usr_resident_adds_nothing(tmp_path, monkeypatch):
+    usr = tmp_path / "usr"
+    (usr / "bin").mkdir(parents=True)
+    exe = usr / "bin" / "python3"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(binds, "_USR", usr)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    monkeypatch.setattr(sys, "prefix", str(usr))
+    monkeypatch.setattr(sys, "base_prefix", str(usr))
+    assert binds.coordinator_runtime_binds() == []
+
+
+def _workspace(tmp_path: Path) -> WorkerWorkspace:
+    root = tmp_path / "w"
+    workspace = WorkerWorkspace(
+        request_id="nf02332",
+        repo=root,
+        path=root / "worktree",
+        home=root / "home",
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    workspace.path.mkdir(parents=True)
+    (workspace.path / ".git").write_text("gitdir: /nonexistent\n", encoding="utf-8")
+    workspace.home.mkdir()
+    return workspace
+
+
+def _package_root(tmp_path: Path) -> Path:
+    package = tmp_path / "pkg" / "src"
+    package.mkdir(parents=True)
+    return package
+
+
+_POSIX_ONLY = pytest.mark.skipif(
+    os.name != "posix",
+    reason="bubblewrap argv assembly uses POSIX paths; rerun in WSL/Linux",
+)
+
+
+@_POSIX_ONLY
+def test_worker_mcp_binds_coordinator_runtime_for_provider_adapter(tmp_path, monkeypatch):
+    venv, base, _exe = _fake_runtime(tmp_path, monkeypatch)
+    workspace = _workspace(tmp_path)
+    cli = ["/opt/claude/bin/claude", "-p"]
+    argv = sandbox_argv(
+        workspace, "claude_cli", cli, backend="bubblewrap",
+        package_import_root=_package_root(tmp_path),
+    )
+    head = argv[: argv.index("--")]
+    home_at = head.index(str(workspace.home))
+    workspace_at = head.index(str(workspace.path))
+    for root in (venv, base.resolve()):
+        text = str(root)
+        positions = [
+            i for i in range(len(head) - 2) if head[i : i + 3] == ["--ro-bind", text, text]
+        ]
+        assert len(positions) == 1
+        assert home_at < positions[0] < workspace_at
+    dirs = _pairs(head, "--dir")
+    assert len(dirs) == len(set(dirs))
+    assert argv[argv.index("--") + 1 :] == cli
+
+
+@_POSIX_ONLY
+def test_no_package_import_root_adds_no_interpreter_bind(tmp_path, monkeypatch):
+    venv, base, _exe = _fake_runtime(tmp_path, monkeypatch)
+    workspace = _workspace(tmp_path)
+    argv = sandbox_argv(
+        workspace, "claude_cli", ["/opt/claude/bin/claude"], backend="bubblewrap"
+    )
+    assert str(venv) not in argv
+    assert str(base.resolve()) not in argv
+
+
+@_POSIX_ONLY
+def test_usr_resident_interpreter_with_package_root_adds_no_bind(tmp_path, monkeypatch):
+    usr = tmp_path / "usr"
+    (usr / "bin").mkdir(parents=True)
+    exe = usr / "bin" / "python3"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(binds, "_USR", usr)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    monkeypatch.setattr(sys, "prefix", str(usr))
+    monkeypatch.setattr(sys, "base_prefix", str(usr))
+    workspace = _workspace(tmp_path)
+    package = _package_root(tmp_path)
+    with_root = sandbox_argv(
+        workspace, "claude_cli", ["/opt/claude/bin/claude"], backend="bubblewrap",
+        package_import_root=package,
+    )
+    assert str(usr) not in with_root
+
+
+@_POSIX_ONLY
+def test_validation_coordinator_head_with_package_root_binds_once(tmp_path, monkeypatch):
+    venv, base, exe = _fake_runtime(tmp_path, monkeypatch)
+    workspace = _workspace(tmp_path)
+    argv = sandbox_argv(
+        workspace, "validation", [str(exe), "x.py"], backend="bubblewrap",
+        package_import_root=_package_root(tmp_path),
+    )
+    head = argv[: argv.index("--")]
+    for root in (venv.resolve(), base.resolve()):
+        text = str(root)
+        assert head.count(text) == 2
+    dirs = _pairs(head, "--dir")
+    assert len(dirs) == len(set(dirs))
