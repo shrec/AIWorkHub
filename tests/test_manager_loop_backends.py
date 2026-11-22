@@ -60,6 +60,9 @@ _FAKE_CLI = textwrap.dedent(
             deadline = time.monotonic() + 20
             while not os.path.exists(config["gate"]) and time.monotonic() < deadline:
                 time.sleep(0.01)
+        elif step == "@ready":
+            with open(config["ready"], "w", encoding="utf-8") as ready:
+                ready.write("ready")
         elif step == "@hang":
             time.sleep(30)
         elif isinstance(step, str) and step.startswith("@sleep:"):
@@ -89,14 +92,25 @@ _ADAPTER_SHAPES: dict[str, Callable[[str, str], list[str]]] = {
 class FakeCli:
     """A scripted provider CLI: one recorded argv and one real child per turn."""
 
-    def __init__(self, tmp_path: Path, turns: list[list[Any]], *, exit_code: int = 0) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        turns: list[list[Any]],
+        *,
+        exit_code: int = 0,
+        hold_spawn_until_ready: bool = False,
+    ) -> None:
         self.root = tmp_path
         self.script = tmp_path / "fake_cli.py"
         self.script.write_text(_FAKE_CLI, encoding="utf-8")
         self.gate = tmp_path / "gate.open"
+        self.ready = tmp_path / "ready.flag"
+        self.hold_spawn_until_ready = hold_spawn_until_ready
         self.config = tmp_path / "fake_cli.json"
         self.config.write_text(
-            json.dumps({"turns": turns, "exit": exit_code, "gate": str(self.gate)}),
+            json.dumps(
+                {"turns": turns, "exit": exit_code, "gate": str(self.gate), "ready": str(self.ready)}
+            ),
             encoding="utf-8",
         )
         self.prompts: list[str] = []
@@ -122,6 +136,13 @@ class FakeCli:
             bufsize=1,
         )
         self.children.append(child)
+        if self.hold_spawn_until_ready:
+            # Return only once the child's "@ready" step ran, i.e. every line
+            # before it is already flushed into the stdout pipe.
+            deadline = time.monotonic() + 60
+            while not self.ready.exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert self.ready.exists(), "the fake CLI never reached its @ready step"
         return child
 
     def open_gate(self) -> None:
@@ -601,12 +622,19 @@ def test_a_non_zero_exit_without_a_provider_error_carries_the_stderr_text(tmp_pa
 
 
 def test_a_turn_timeout_kills_the_process_and_reports_exactly_one_error(tmp_path: Path):
+    # NF-2026-02337: the silence window opens when spawn returns, so a child
+    # still importing Python under load could miss the 0.5 s window before its
+    # first event. The fake now reports "@ready" once the text line is flushed
+    # into the pipe and spawn returns only after that: the window opens with the
+    # text already pending, and the hang that follows is what expires it.
     fake = FakeCli(
         tmp_path,
         [[
             {"type": "assistant", "message": {"content": [{"type": "text", "text": "then stall"}]}},
+            "@ready",
             "@hang",
         ]],
+        hold_spawn_until_ready=True,
     )
     cli = backend(fake, timeout_seconds=0.5)
     cli.start("brief")
@@ -618,6 +646,30 @@ def test_a_turn_timeout_kills_the_process_and_reports_exactly_one_error(tmp_path
     assert "manager_turn_timeout_seconds=0.5" == errors[0]["payload"]["error"]
     assert kinds(events) == ["assistant_text", "error"]
     assert not cli.is_running()
+    assert [child.poll() is not None for child in fake.children] == [True]
+    cli.close()
+
+
+def test_a_first_event_later_than_the_window_reports_only_the_timeout(tmp_path: Path):
+    # NF-2026-02337, forced ordering: the interleaving the test above used to
+    # leave to the scheduler. The child's first event is later than the 0.5 s
+    # silence window, so the window expires first and only the error is
+    # reported -- one error, the process still killed.
+    fake = FakeCli(
+        tmp_path,
+        [[
+            "@sleep:2.0",
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "too late"}]}},
+        ]],
+    )
+    cli = backend(fake, timeout_seconds=0.5)
+    cli.start("brief")
+    events = drain(cli.send("go"))
+
+    assert kinds(events) == ["error"]
+    assert events[0]["payload"]["source"] == "timeout"
+    assert not cli.is_running()
+    assert [child.poll() is not None for child in fake.children] == [True]
     cli.close()
 
 

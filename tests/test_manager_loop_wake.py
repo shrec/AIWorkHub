@@ -524,6 +524,21 @@ def test_wake_claims_callbacks_from_every_provider_family_not_just_claude(
     filed on the chat session whatever family coordinated them."""
     backends = _install_fakes(monkeypatch)
     connect = _real_task_db(monkeypatch, tmp_path)
+    # NF-2026-02337: the real claim seeds this session's review cards itself
+    # (``seed_missing_review_callbacks`` -> ``enqueue_callback``) every
+    # WAKE_IDLE_POLL_SECONDS. Left running while the test files its own rows,
+    # a claim landing between a card's INSERT and its enqueue wins the dedup
+    # key, so the test's own enqueue correctly returns False (rowcount 0).
+    # Hold the service's claim until every row is filed; the claim itself is
+    # still the real one, so the wake path under test is unchanged.
+    rows_filed = threading.Event()
+    real_source = manager_loop_wake.default_callback_source
+
+    def held_source(**kwargs: Any) -> Any:
+        real_claim, real_ack = real_source(**kwargs)
+        return (lambda: real_claim() if rows_filed.is_set() else None), real_ack
+
+    monkeypatch.setattr(manager_loop_service, "default_callback_source", held_source)
     started = manager_loop_service.start(tmp_path, "fake", "model-a")
     assert started["ok"] is True
     session_id = started["session"]["session_id"]
@@ -550,6 +565,7 @@ def test_wake_claims_callbacks_from_every_provider_family_not_just_claude(
         assert lane_rows == 0
     finally:
         conn.close()
+        rows_filed.set()
 
     assert backends[0].entered.wait(timeout=10)
     deadline = time.monotonic() + 15
@@ -562,6 +578,43 @@ def test_wake_claims_callbacks_from_every_provider_family_not_just_claude(
         "callback: CARD_X -> review_ready",
     ]
     assert manager_loop_service.close(tmp_path)["ok"] is True
+
+
+def test_a_claim_between_a_cards_insert_and_its_enqueue_owns_the_row_and_enqueue_stays_exactly_once(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """NF-2026-02337, forced ordering. The interleaving the wake test above used
+    to leave to the scheduler, made explicit: (1) the card's INSERT commits,
+    (2) the chat's claim seeds that card's review wake through
+    ``enqueue_callback`` itself, (3) the test's own ``enqueue_callback`` for the
+    same route/transition/episode finds the dedup key taken and returns False
+    (rowcount 0) -- the exactly-once contract working, not a lost callback."""
+    connect = _real_task_db(monkeypatch, tmp_path)
+    session_id = "mls-" + "ab" * 16
+    claim, _ack = manager_loop_wake.default_callback_source(session_id=session_id)
+    conn = connect()
+    try:
+        _insert_review_card(conn, "CARD_X", {"coordinator_provider": "codex", "origin_thread_id": session_id})
+        batch = claim()
+        assert batch is not None, "the claim seeded and claimed the card's wake first"
+        assert [member["task_id"] for member in batch["members"]] == ["CARD_X"]
+        assert (
+            callback_store.enqueue_callback(
+                conn,
+                "CARD_X",
+                "some-other-route-thread-id",
+                "review_ready",
+                provider="codex",
+                episode_id="0",
+            )
+            is False
+        )
+    finally:
+        conn.close()
+    rows = _outbox_rows(connect, "CARD_X")
+    assert [(provider, origin) for provider, origin, _state, _error in rows] == [
+        ("manager_chat", session_id)
+    ]
 
 
 def test_claim_does_not_wake_cards_the_chat_did_not_launch(

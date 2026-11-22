@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,19 @@ def _count_calls(monkeypatch: pytest.MonkeyPatch, owner, name: str) -> list[tupl
 
     monkeypatch.setattr(owner, name, counted)
     return calls
+
+
+def _calls_for_repo(calls: list[tuple], repo: Path) -> list[tuple]:
+    """The recorded calls whose first argument (the repository root) is ``repo``."""
+    target = Path(repo).resolve()
+    own: list[tuple] = []
+    for args in calls:
+        try:
+            if args and Path(args[0]).resolve() == target:
+                own.append(args)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+    return own
 
 
 def test_roadmap_snapshot_incomplete_snapshot_reads_once(
@@ -125,8 +139,45 @@ def test_resolve_active_state_hooks_incomplete_snapshot_reads_readiness_once(
         card = get_task_fn(_task_id(index))
         assert card is not None and card["task_id"] == _task_id(index)
 
-    assert len(get_calls) == _TASK_COUNT
-    assert len(readiness_calls) == 1
+    # NF-2026-02337: the counters wrap process-wide attributes, so a thread
+    # another test leaked into this worker (one reading the real repository)
+    # lands in them too. Only this test's own repository is counted.
+    assert len(_calls_for_repo(get_calls, repo)) == _TASK_COUNT
+    assert len(_calls_for_repo(readiness_calls, repo)) == 1
+
+
+def test_readiness_counter_ignores_reads_of_other_repositories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forced ordering for NF-2026-02337: a foreign thread reads another
+    repository's readiness while this repository's hooks are being resolved.
+    The unfiltered counter sees two reads (the old assertion's failure); the
+    per-repository count stays exactly one, and a second read of this
+    repository would still be counted."""
+    repo = _seed_repo(tmp_path)
+    other = tmp_path / "other_repo"
+    other.mkdir()
+    readiness_calls = _count_calls(monkeypatch, task_store, "storage_readiness")
+
+    def foreign_reader() -> None:
+        try:
+            task_store.storage_readiness(other)
+        except Exception:  # an unbootstrapped repository may refuse; the call is what counts
+            pass
+
+    reader = threading.Thread(target=foreign_reader)
+    reader.start()
+    reader.join(timeout=30)
+    assert not reader.is_alive()
+
+    _get, _status, _list, reason = needfix_ingest._resolve_active_state_hooks(
+        repo, task_cards_snapshot=(), task_cards_snapshot_complete=False
+    )
+
+    assert reason is None
+    assert len(readiness_calls) >= 2, "the foreign read reached the process-wide counter"
+    assert len(_calls_for_repo(readiness_calls, repo)) == 1
+    assert len(_calls_for_repo(readiness_calls, other)) == 1
 
 
 def test_list_task_cards_matches_old_query_and_plans_a_rowid_lookup(
