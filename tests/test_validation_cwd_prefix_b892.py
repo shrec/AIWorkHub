@@ -139,6 +139,7 @@ def _fixture_workspace(tmp_path: Path) -> worker_workspace.WorkerWorkspace:
     path = tmp_path / "worktree"
     (path / "sub").mkdir(parents=True)
     (path / "out").mkdir(parents=True)
+    (path / ".git").write_text("gitdir: " + str(tmp_path / "gitdir") + "\n", encoding="utf-8")
     (path / "out" / "result.txt").write_text("v1", encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir(parents=True, mode=0o700)
@@ -305,6 +306,7 @@ def _manual_workspace(
     path = base / "worktree"
     home = base / "home"
     path.mkdir(parents=True)
+    (path / ".git").write_text("gitdir: " + str(base / "gitdir") + "\n", encoding="utf-8")
     home.mkdir(parents=True, mode=0o700)
     (home / "tmp").mkdir(mode=0o700)
     workspace = worker_workspace.WorkerWorkspace(

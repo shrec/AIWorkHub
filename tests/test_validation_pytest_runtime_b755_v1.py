@@ -51,6 +51,7 @@ def _manual_workspace(tmp_path: Path, request_id: str) -> tuple[Path, worker_wor
     path = base / "worktree"
     home = base / "home"
     path.mkdir(parents=True)
+    (path / ".git").write_text("gitdir: " + str(base / "gitdir") + "\n", encoding="utf-8")
     home.mkdir(parents=True, mode=0o700)
     (home / "tmp").mkdir(mode=0o700)
     workspace = worker_workspace.WorkerWorkspace(

@@ -4793,7 +4793,12 @@ def test_validation_cd_prefix_changes_child_cwd_under_landlock(
             ["cd read && python3 -c \"print(__import__('os').getcwd())\""],
         )
         assert result["returncode"] == 0, result["stderr_tail"]
-        assert result["stdout_tail"].strip() == str((workspace.path / "read").resolve())
+        # Landlock runs the child at the host path; bubblewrap maps the
+        # workspace to SANDBOX_WORKSPACE, so the child sees that view instead.
+        assert result["stdout_tail"].strip() in {
+            str((workspace.path / "read").resolve()),
+            worker_workspace.SANDBOX_WORKSPACE + "/read",
+        }
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
