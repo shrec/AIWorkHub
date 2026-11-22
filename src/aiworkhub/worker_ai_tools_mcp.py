@@ -5288,6 +5288,54 @@ def _reapply_elided_row_defaults(
     return full
 
 
+def _single_file_freshness(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the one per-file freshness proof a single-file reply carries.
+
+    ``None`` unless every ``matches``/``contexts``/``sections`` row that names a
+    file names the SAME file, at least one carries a dict ``freshness`` with a
+    ``state``, and all such rows agree on state and hash.  The hash comes from
+    ``freshness.indexed_source_hash``, else the row's (or its ``file``'s)
+    ``source_hash``: never invented, so an unproven reply keeps no dict.
+    """
+
+    proofs: set[tuple[str, str, str]] = set()
+    disks: set[str] = set()
+    paths: set[str] = set()
+    for key in ("matches", "contexts", "sections"):
+        items = payload.get(key)
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("file_path")
+            if isinstance(path, str) and path:
+                paths.add(path)
+            fresh = item.get("freshness")
+            if not isinstance(fresh, dict) or not isinstance(fresh.get("state"), str):
+                continue
+            file_row = item.get("file") if isinstance(item.get("file"), dict) else {}
+            indexed = (
+                fresh.get("indexed_source_hash")
+                or item.get("source_hash")
+                or file_row.get("source_hash")
+            )
+            if not isinstance(indexed, str) or not indexed:
+                return None
+            # A disk hash is reported only when a row measured one: never copied from indexed.
+            disk = fresh.get("disk_source_hash")
+            if isinstance(disk, str) and disk:
+                disks.add(disk)
+            proofs.add((str(path or ""), fresh["state"], indexed))
+    if len(paths) != 1 or len(proofs) != 1 or len(disks) > 1:
+        return None
+    path, state, indexed = next(iter(proofs))
+    if path and path not in paths:
+        return None
+    proof = {"state": state, "file_path": next(iter(paths)), "indexed_source_hash": indexed}
+    if disks:
+        proof["disk_source_hash"] = next(iter(disks))
+    return proof
+
+
 def _reapply_elided_defaults_in_rows(rows: object, default_code: str = "") -> object:
     """Apply ``_reapply_elided_row_defaults`` to each dict in a match/symbol list."""
     if not isinstance(rows, list):
@@ -6937,6 +6985,16 @@ def source_graph_query(
         meta["retrieval_reason"] = payload["retrieval_reason"]
     if isinstance(payload, dict) and isinstance(payload.get("freshness"), str):
         meta["freshness"] = payload["freshness"]
+    if authority_source == "candidate_overlay" and isinstance(payload, dict):
+        # NF-2026-02356: the reviewer's step-1 proof is freshness.state plus a
+        # source hash for the listed path.  It used to live only inside
+        # ``content``; once a large reply is outer-paged, ``content`` is an
+        # opaque byte slice and pages after the first carried just the bare
+        # string above.  Lift the single file's freshness onto the envelope,
+        # which every continuation page reuses verbatim.
+        file_freshness = _single_file_freshness(payload)
+        if file_freshness is not None:
+            meta["freshness"] = file_freshness
     if refreshed_files:
         meta["refresh"] = "inline"
     for key, value in (
