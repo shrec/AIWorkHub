@@ -347,8 +347,13 @@ def select_reviewer_route(
     *,
     excluded_routes: frozenset[tuple[str, str, str]] = frozenset(),
     excluded_adapters: frozenset[str] = frozenset(),
+    started_routes: tuple[tuple[str, str, str], ...] = (),
 ) -> Mapping[str, Any]:
-    """Select one currently available review worker through canonical policy."""
+    """Select one currently available review worker through canonical policy.
+
+    ``started_routes`` (NF-2026-02356) are routes with a recorded successful
+    start on this host, best first; empty keeps the plain ranked selection.
+    """
     readiness = task_store.storage_readiness(repo)
     if not readiness.ready:
         raise RuntimeError("review_route_storage_not_ready:" + readiness.reason)
@@ -416,6 +421,11 @@ def select_reviewer_route(
             repo, route, identity, model_policy, excluded_routes, excluded_adapters,
         )
 
+    # NF-2026-02356: with a recorded start on this host, a ranked route that
+    # has started beats a ranked one that never has; with none, the first
+    # launchable ranked route wins exactly as before.
+    started = frozenset(started_routes)
+    first_launchable: dict[str, str] | None = None
     for candidate in primary:
         examined = _examine(candidate)
         if examined is None:
@@ -424,7 +434,33 @@ def select_reviewer_route(
         if refusal:
             _record_skip(route, refusal)
             continue
-        return route
+        if not started or _review_route_identity(route) in started:
+            return route
+        if first_launchable is None:
+            first_launchable = route
+    if first_launchable is not None:
+        return first_launchable
+    # Every ranked route is refused. A route that has STARTED on this host is
+    # better evidence than a never-started one the ranker set aside, so it is
+    # tried first -- through the same hard filters, and never past a ranker
+    # exclusion that says the route cannot run.
+    ranker_hard = {
+        _review_route_identity(entry): reasons
+        for entry, reasons in ranker_excluded
+        if not _ranker_exclusion_is_fallback_eligible(reasons)
+    }
+    for identity in started_routes:
+        examined = _examine(dict(zip(("runner", "adapter_id", "model"), identity)))
+        if examined is None:
+            continue
+        route, refusal = examined
+        if identity in ranker_hard:
+            _record_skip(route, "ranker_excluded:" + ",".join(ranker_hard[identity]))
+            continue
+        if refusal:
+            _record_skip(route, refusal)
+            continue
+        return {**route, "route_fallback": {"reason": "started_route_fallback"}}
     # Fallback pass: the ranker preferred nothing, so a launchable route it
     # excluded only for a soft reason beats parking every reviewer lens.
     for candidate, reasons in ranker_excluded:
@@ -747,6 +783,171 @@ def reviewer_route_adapter_credential(failure_reason: Any) -> bool:
     """Whether a retired attempt's reason says its adapter's credential failed."""
     tokens = [token.strip() for token in str(failure_reason or "").split(":")]
     return _ADAPTER_CREDENTIAL_MARKER.lstrip(":") in tokens
+
+
+# --- successor start failure (NF-2026-02356) ----------------------------
+#
+# Measured shape, through the real dispatch over fake launcher receipts: a
+# successor that never starts retires as ``launch_failed:mechanical_terminal``
+# with ``:hold=manager_judgment_unknown`` (relaunch_distinct_route False), and a
+# bare ``ok: False`` refusal carrying no state raised ``reviewer_launch_failed``
+# out of ``_require_ok``. Either way the lens then met
+# ``review_route_retries_exhausted`` at attempt 2 and parked until a manager
+# launched a reviewer by hand.
+#
+# A start failure is NOT a verdict: no provider ran, so nothing about the
+# candidate or the route's judgment is known. It is stamped ``start_failed``,
+# which excludes that exact route, lifts the unknown-cause hold, lets the
+# successor chain plan the next route, and does not spend an NF847 slot. A typed
+# hold (credential, dependency, capacity, account limit), a cancel, a submitted
+# report and every failure of a reviewer that RAN keep today's behaviour.
+_START_FAILED_MARKER = ":start_failed"
+_START_FAILURE_ACTIONS = frozenset({
+    terminal_failure_classification.ACTION_MANAGER_JUDGMENT_UNKNOWN,
+    terminal_failure_classification.ACTION_ROUTE_RETRY,
+})
+# Extra attempt rows a lens may hold beyond ``_MAX_ROUTE_ATTEMPTS`` for
+# successors that never started: the absolute bound on launches per lens.
+_MAX_START_FAILURE_SLOTS = 2
+_STARTED_ROUTE_SCAN_LIMIT = 512
+_BARE_START_REFUSAL = "launch_failed:launch_refused"
+
+
+def reviewer_route_start_failed(failure_reason: Any) -> bool:
+    """Whether a retired attempt's reason says its reviewer never started."""
+    tokens = [token.strip() for token in str(failure_reason or "").split(":")]
+    return _START_FAILED_MARKER.lstrip(":") in tokens
+
+
+def _attempt_never_started(failure_reason: Any) -> bool:
+    """Whether a bound attempt's reason proves no provider ever ran for it."""
+    return reviewer_route_start_failed(failure_reason) or str(
+        failure_reason or ""
+    ).startswith("launch_failed:")
+
+
+def _spent_route_attempts(attempts: Iterable[Mapping[str, Any]]) -> int:
+    """Attempts that count against the NF847 ceiling: all but start failures."""
+    return sum(
+        1 for row in attempts
+        if not (
+            row["state"] == "retired"
+            and reviewer_route_start_failed(row["failure_reason"])
+        )
+    )
+
+
+_EXITED_BEFORE_OUTPUT_STATES = frozenset({"worker_failed", "failed", "spawn_failed"})
+_PROGRESS_FACT_KEYS = (
+    "heartbeat_at", "last_heartbeat_at", "heartbeat_count",
+    "last_progress_at", "progress_at", "progress",
+)
+
+
+def _provider_exited_before_output(status: Mapping[str, Any], state: str) -> bool:
+    """Whether a terminal failure's provider process wrote nothing and never beat.
+
+    NF-2026-02356 (F0). Only process-owned facts decide it, never model prose:
+    the state is a terminal failure, the launcher's provider stdout record
+    (``metadata.stdout_path``, the file process_launcher reads the provider's
+    output from) is absent or 0 bytes, and no heartbeat or progress fact was
+    recorded. An unknown stdout location is not evidence of silence, so a
+    status that names no ``stdout_path`` is never a start failure here.
+    """
+    if state not in _EXITED_BEFORE_OUTPUT_STATES:
+        return False
+    metadata = status.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    raw_path = str(metadata.get("stdout_path") or status.get("stdout_path") or "")
+    if not raw_path:
+        return False
+    if any(
+        source.get(key) not in (None, "", 0, False, [], {})
+        for source in (status, metadata)
+        for key in _PROGRESS_FACT_KEYS
+    ):
+        return False
+    try:
+        return Path(raw_path).stat().st_size == 0
+    except FileNotFoundError:
+        return True
+    except OSError:
+        # An unreadable record is unknown, and unknown is never a start failure.
+        return False
+
+
+def _reviewer_start_failure(status: Any, dispatch: Mapping[str, Any]) -> bool:
+    """Whether a terminal launch receipt or status is a START failure.
+
+    Only the process vocabulary decides it: a ``launch_failed`` state (no model
+    can produce one -- it never ran), a refusal with ``ok: False`` and no
+    state at all, or a terminal failure whose provider process exited before
+    writing any output or recording any heartbeat. The typed dispatch must
+    leave the cause unestablished or name the route itself; any typed hold is
+    a cause a second route cannot fix.
+    """
+    if not isinstance(status, Mapping):
+        return False
+    card = status.get("task_card")
+    card = card if isinstance(card, Mapping) else {}
+    state = str(status.get("state") or "").strip().lower()
+    reason = mechanical_reviewer_failure_reason(status)
+    never_ran = (
+        reason.startswith("launch_failed:")
+        or (status.get("ok") is False and not state)
+        or _provider_exited_before_output(status, state)
+    )
+    return (
+        never_ran
+        and dispatch.get("action") in _START_FAILURE_ACTIONS
+        and dispatch.get("adapter_credential") is not True
+        and not reviewer_route_account_limited(reason)
+        and not _reviewer_route_retry_barred(state, card)
+        and str(status.get("recovery_state") or "")
+        != reviewer_launch_refusal.RETAINED_RECOVERY_STATE
+    )
+
+
+def _mark_start_failure(
+    attempt: Mapping[str, Any], status: Any, retirement: str,
+    dispatch: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Stamp a SUCCESSOR that never started so the chain plans the next route."""
+    if int(attempt["attempt_index"]) < 2 or not _reviewer_start_failure(
+        status, dispatch,
+    ):
+        return retirement, dispatch
+    return retirement + _START_FAILED_MARKER, {
+        **dispatch,
+        "relaunch_distinct_route": True,
+        "route_hold": False,
+        "start_failure": True,
+    }
+
+
+def _bare_start_refusal_reason(attempt: Mapping[str, Any], result: Any) -> str:
+    """The route failure of a successor's bare ``ok: False`` launch refusal, or ``""``."""
+    if (
+        int(attempt["attempt_index"]) < 2
+        or not isinstance(result, Mapping)
+        or result.get("ok") is not False
+        or str(result.get("state") or "")
+        or str(result.get("recovery_state") or "")
+        == reviewer_launch_refusal.RETAINED_RECOVERY_STATE
+    ):
+        return ""
+    return _BARE_START_REFUSAL
+
+
+def _successor_launch_raised_again(attempt: Mapping[str, Any]) -> bool:
+    """Whether a successor already recorded one raised launch and bound no request."""
+    return (
+        int(attempt["attempt_index"]) >= 2
+        and not str(attempt.get("reviewer_request_id") or "")
+        and str(attempt.get("failure_reason") or "").startswith(
+            reviewer_launch_refusal.LAUNCH_EXCEPTION_PREFIX + ":"
+        )
+    )
 
 
 def _route_attempt_exclusions(
@@ -3988,12 +4189,14 @@ class ReviewOrchestrator:
         excluded: frozenset[tuple[str, str, str]],
         *,
         excluded_adapters: frozenset[str] = frozenset(),
+        started_routes: tuple[tuple[str, str, str], ...] = (),
     ) -> dict[str, Any]:
         if self.route_selector is select_reviewer_route:
             selected = select_reviewer_route(
                 self.manager.repo, reviewer_task_id, lens,
                 excluded_routes=excluded,
                 excluded_adapters=excluded_adapters,
+                started_routes=started_routes,
             )
         else:
             selected = self.route_selector(self.manager.repo, reviewer_task_id, lens)
@@ -4016,6 +4219,38 @@ class ReviewOrchestrator:
         if isinstance(fallback, Mapping):
             route["route_fallback"] = dict(fallback)
         return route
+
+    def _started_routes(self) -> tuple[tuple[str, str, str], ...]:
+        """Reviewer routes with a recorded successful start on this host, best first.
+
+        NF-2026-02356. A successful start is a route attempt whose launch bound
+        a reviewer request and that did not later retire as never having
+        started. The side table is this host's own launch ledger across every
+        chain; the most recent ``_STARTED_ROUTE_SCAN_LIMIT`` rows are read and
+        the result is ordered by start count, then identity, so selection is
+        deterministic. An unreadable ledger yields no preference at all, which
+        is exactly the selection that existed before.
+        """
+        try:
+            # A plain read: no write lease, no write lock and no DDL. A missing
+            # side table raises OperationalError, which is "no preference" below.
+            with closing(_side_table_connection(self.db_path, readonly=True)) as conn:
+                rows = conn.execute(
+                    "SELECT runner,adapter_id,model,failure_reason "
+                    "FROM review_orchestrator_route_attempts "
+                    "WHERE reviewer_request_id<>'' ORDER BY rowid DESC LIMIT ?",
+                    (_STARTED_ROUTE_SCAN_LIMIT,),
+                ).fetchall()
+        except (sqlite3.Error, OSError):
+            return ()
+        counts: dict[tuple[str, str, str], int] = {}
+        for runner, adapter_id, model, failure_reason in rows:
+            if _attempt_never_started(failure_reason):
+                continue
+            identity = (str(runner), str(adapter_id), str(model))
+            counts[identity] = counts.get(identity, 0) + 1
+        ranked = sorted(counts, key=lambda identity: (-counts[identity], identity))
+        return tuple(ranked[:_REVIEW_ROUTE_SKIP_LIMIT])
 
     def _attempt_route_binding_matches(
         self, status: Mapping[str, Any], attempt: Mapping[str, Any]
@@ -4093,9 +4328,15 @@ class ReviewOrchestrator:
         retirement, dispatch = self._credential_failover(
             action, attempt, route_failure, dispatch,
         )
-        retirement, dispatch = _allow_same_route_successor(
-            attempt, retirement, dispatch,
+        retirement, dispatch = _mark_start_failure(
+            attempt, status, retirement, dispatch,
         )
+        if not dispatch.get("start_failure"):
+            # A start failure excludes its own route; it never earns a
+            # same-route successor.
+            retirement, dispatch = _allow_same_route_successor(
+                attempt, retirement, dispatch,
+            )
         if dispatch["route_hold"]:
             retirement = f"{retirement}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
         if not self._retire_route_attempt(action, attempt, retirement):
@@ -4218,11 +4459,16 @@ class ReviewOrchestrator:
         adopted = self._adopt_existing_lens_reviewer(action, attempts)
         if adopted is not None:
             return adopted
-        if len(attempts) >= _MAX_ROUTE_ATTEMPTS:
+        if (
+            _spent_route_attempts(attempts) >= _MAX_ROUTE_ATTEMPTS
+            or len(attempts) >= _MAX_ROUTE_ATTEMPTS + _MAX_START_FAILURE_SLOTS
+        ):
             # The NF847 ceiling, stated once where the spend actually happens.
             # Every caller turns a ``review_route_`` failure into a durable
             # deferral, so an exhausted lens waits on a named reason instead of
             # quietly planning a third route the policy never authorised.
+            # NF-2026-02356: a successor that never started a provider does not
+            # spend a slot, but the absolute row count still bounds the lens.
             raise RuntimeError("review_route_retries_exhausted:" + action.lens)
         attempt_index = len(attempts) + 1
         identity = action.descriptor["chain_identity"]
@@ -4234,6 +4480,7 @@ class ReviewOrchestrator:
             route = self._select_attempt_route(
                 reviewer_task_id, action.lens, excluded,
                 excluded_adapters=excluded_adapters,
+                started_routes=self._started_routes() if attempts else (),
             )
         except ReviewRouteUnavailable:
             # NF-2026-02359: a distinct route is still preferred, but a reviewer
@@ -4337,6 +4584,7 @@ class ReviewOrchestrator:
                     attempt_index=len(attempts) + 1,
                 ),
                 action.lens, excluded, excluded_adapters=excluded_adapters,
+                started_routes=self._started_routes(),
             )
         except RuntimeError as exc:
             if str(exc).startswith("review_route_unavailable:"):
@@ -4471,9 +4719,46 @@ class ReviewOrchestrator:
                    if hedge_incumbent_request_id else {}),
             )
         except Exception as exc:  # noqa: BLE001 -- reconcile the pre-bound task on retry
+            exception_reason = reviewer_launch_refusal.launch_exception_reason(exc)
+            # The exception reason goes through the SAME typed vocabulary the
+            # synchronous refusal path uses: a credential, dependency, route,
+            # capacity, account-limit or retained-recovery hold named by it is
+            # a cause a second route cannot fix, so it never retires as a start
+            # failure and keeps the old reconcile behaviour below.
+            exception_receipt = {"ok": False, "error": exception_reason}
+            if (
+                _successor_launch_raised_again(attempt)
+                and not reviewer_route_account_limited(exception_reason)
+                and _reviewer_start_failure(
+                    exception_receipt,
+                    reviewer_recovery_dispatch(
+                        exception_receipt, attempts_made=int(attempt["attempt_index"]),
+                    ),
+                )
+            ):
+                # NF-2026-02356: the SAME pre-bound successor raised on a
+                # second launch with no request ever bound -- the first retry
+                # was its reconcile chance. It never started a provider, so it
+                # retires as a start failure and the next route is planned.
+                retirement = exception_reason + _START_FAILED_MARKER
+                if not self._retire_route_attempt(action, attempt, retirement):
+                    return None
+                return {
+                    "_route_terminal_failure": retirement,
+                    "_route_dispatch": {
+                        "action": terminal_failure_classification.ACTION_ROUTE_RETRY,
+                        "relaunch_distinct_route": True,
+                        "route_hold": False,
+                        "adapter_credential": False,
+                        "start_failure": True,
+                        "disposition": {},
+                    },
+                }
             self._note_route_attempt_launch_fault(action, attempt, exc)
             return None
-        route_failure = mechanical_reviewer_failure_reason(result)
+        route_failure = mechanical_reviewer_failure_reason(
+            result
+        ) or _bare_start_refusal_reason(attempt, result)
         if route_failure:
             # A synchronous terminal receipt still belongs to the exact route
             # just invoked.  Validate any identity fields it supplies before
@@ -4513,6 +4798,9 @@ class ReviewOrchestrator:
             )
             retirement, dispatch = self._credential_failover(
                 action, attempt, retirement, dispatch,
+            )
+            retirement, dispatch = _mark_start_failure(
+                attempt, result, retirement, dispatch,
             )
             pre_provider_credential_hold = (
                 dispatch["action"]
