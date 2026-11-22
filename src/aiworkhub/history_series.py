@@ -112,29 +112,34 @@ _POPULATION_EXPR = "COALESCE(card_population.population, 'unknown_topic')"
 # the deterministic evidence verdict measured anything at all, which turns
 # "a validation failed" into "a validation failed and nothing was measured".
 _Q_TERMINAL_OUTCOMES = f"""
-WITH {_CARD_POPULATION_CTE}
+WITH {_CARD_POPULATION_CTE},
+terminal AS MATERIALIZED (
+    SELECT
+        task_id,
+        substr(created_at, 1, 10) AS day,
+        COALESCE(json_extract(payload_json, '$.substatus'), 'unknown_substatus')
+            AS substatus,
+        json_extract(
+            payload_json,
+            '$.deterministic_verification.evidence_verdict.nothing_measured'
+        ) AS measured
+    FROM task_events
+    WHERE event IN ('terminal_review', 'terminal_failure')
+      AND created_at >= ?
+)
 SELECT
-    substr(e.created_at, 1, 10) AS day,
+    e.day,
     {_POPULATION_EXPR} AS population,
-    COALESCE(json_extract(e.payload_json, '$.substatus'), 'unknown_substatus')
-        AS substatus,
+    e.substatus,
     CASE
-        WHEN json_extract(
-            e.payload_json,
-            '$.deterministic_verification.evidence_verdict.nothing_measured'
-        ) = 1 THEN 'nothing_measured'
-        WHEN json_extract(
-            e.payload_json,
-            '$.deterministic_verification.evidence_verdict.nothing_measured'
-        ) = 0 THEN 'evidence_measured'
+        WHEN e.measured = 1 THEN 'nothing_measured'
+        WHEN e.measured = 0 THEN 'evidence_measured'
         ELSE 'verdict_absent'
     END AS evidence_cause,
     COUNT(*) AS events
-FROM task_events AS e
+FROM terminal AS e
 LEFT JOIN card_population ON card_population.task_id = e.task_id
-WHERE e.event IN ('terminal_review', 'terminal_failure')
-  AND e.created_at >= ?
-GROUP BY day, population, substatus, evidence_cause
+GROUP BY e.day, population, e.substatus, evidence_cause
 """
 
 # Series 2: one vote per DISTINCT card per day -- its latest decision that

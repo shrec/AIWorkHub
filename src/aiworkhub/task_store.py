@@ -10264,13 +10264,16 @@ def manager_decision_counts(root: str | Path) -> dict[str, Any]:
             "  WHEN event IN ('archived','superseded') "
             "   AND json_extract(payload_json, '$.reason') LIKE 'reject_review:%' "
             "  THEN 1 ELSE 0 END) rejected "
-            "FROM task_events"
+            "FROM task_events "
+            "WHERE event IN ('accept_review','reject_review','archived','superseded')"
         ).fetchone()
         accepted = int(row["accepted"] or 0)
         rejected = int(row["rejected"] or 0)
         latency_rows = conn.execute(
             "WITH decisions AS MATERIALIZED ("
-            " SELECT event_id,task_id,event,payload_json,created_at "
+            " SELECT event_id,task_id,event,"
+            "  CASE WHEN event IN ('archived','superseded') THEN payload_json END "
+            "   AS payload_json,created_at "
             " FROM task_events "
             " WHERE event IN ('accept_review','reject_review','archived','superseded') "
             " ORDER BY event_id DESC LIMIT 5000"

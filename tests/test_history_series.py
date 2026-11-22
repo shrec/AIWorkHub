@@ -776,3 +776,136 @@ def test_the_window_excludes_events_older_than_its_bound(tmp_path: Path):
 
     assert series["window"]["since"] == "2026-07-16"
     assert series["daily_decisions"]["totals"]["work_card"]["accepted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The terminal-outcome query: same rows, JSON extracted once per event.
+# ---------------------------------------------------------------------------
+
+_NOTHING_MEASURED_PATH = (
+    "$.deterministic_verification.evidence_verdict.nothing_measured"
+)
+
+# Covers a missing substatus, ``nothing_measured`` 1 / 0 / absent, a terminal
+# failure, a repeated terminal event and two populations.
+_TERMINAL_FIXTURE = [
+    (
+        "W_MEASURED",
+        "task_mcp",
+        "2026-08-01",
+        [
+            ("terminal_review", _terminal("review_ready", nothing_measured=False)),
+            ("terminal_failure", {}),
+            ("accept_review", _terminal("not_terminal", nothing_measured=True)),
+        ],
+    ),
+    (
+        "W_NOTHING",
+        "task_mcp",
+        "2026-08-01",
+        [
+            ("terminal_review", _terminal("validation_failed", nothing_measured=True)),
+            ("terminal_review", _terminal("validation_failed", nothing_measured=True)),
+        ],
+    ),
+    (
+        "W_ABSENT",
+        "task_mcp",
+        "2026-08-02",
+        [("terminal_failure", _terminal("launch_failed"))],
+    ),
+    (
+        "R_CHILD",
+        "quality_review",
+        "2026-08-01",
+        [("terminal_review", _terminal("review_ready", nothing_measured=True))],
+    ),
+]
+
+_TERMINAL_EXPECTED_ROWS = [
+    ("2026-08-01", "work_card", "review_ready", "evidence_measured", 1),
+    ("2026-08-01", "work_card", "unknown_substatus", "verdict_absent", 1),
+    ("2026-08-01", "work_card", "validation_failed", "nothing_measured", 2),
+    ("2026-08-02", "work_card", "launch_failed", "verdict_absent", 1),
+    ("2026-08-01", "reviewer_child", "review_ready", "nothing_measured", 1),
+]
+
+
+def _json_extract_counter(calls: list[tuple[str, str]]):
+    """A two-argument ``json_extract`` that counts every call it serves.
+
+    SQLite resolves an application function with an exact argument count ahead
+    of the variadic built-in, so registering this on a connection observes every
+    ``json_extract(doc, path)`` the statement evaluates -- no wall clock.
+    """
+
+    def json_extract(document, path):
+        calls.append((str(path), str(document)))
+        if document is None:
+            return None
+        value = json.loads(document)
+        for key in str(path)[2:].split("."):
+            if not isinstance(value, dict) or key not in value:
+                return None
+            value = value[key]
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return value
+
+    return json_extract
+
+
+def test_terminal_outcome_rows_and_published_payload_are_unchanged(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed(repo, _TERMINAL_FIXTURE)
+    _readiness, db_path = task_store._require_ready(repo)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        # The SQL has no ORDER BY, so compare as a multiset.
+        rows = conn.execute(
+            history_series._Q_TERMINAL_OUTCOMES, ("quality_review", "0000-00-00")
+        ).fetchall()
+    finally:
+        conn.close()
+    assert sorted(rows) == sorted(_TERMINAL_EXPECTED_ROWS)
+
+    series = _build(repo)
+    daily, composition = history_series._terminal_series(list(_TERMINAL_EXPECTED_ROWS))
+    assert series["daily_outcomes"] == daily
+    assert series["terminal_composition"] == composition
+    assert series["daily_outcomes"]["events"] == 6
+    assert series["terminal_composition"]["by_population"]["reviewer_child"][
+        "baseline"
+    ] == 1
+
+
+def test_terminal_outcome_json_is_extracted_once_per_event_before_grouping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed(repo, _TERMINAL_FIXTURE)
+    calls: list[tuple[str, str]] = []
+    real_connect = sqlite_readonly.connect_readonly
+
+    def counting_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.create_function("json_extract", 2, _json_extract_counter(calls))
+        return conn
+
+    monkeypatch.setattr(sqlite_readonly, "connect_readonly", counting_connect)
+
+    _build(repo)
+
+    terminal_events = 6
+    measured = [c for c in calls if c[0] == _NOTHING_MEASURED_PATH]
+    substatus = [c for c in calls if c[0] == "$.substatus"]
+    # Every terminal event is probed exactly once for each extracted field; the
+    # non-terminal accept_review event is never probed. The old CASE probed the
+    # verdict up to twice per event.
+    assert len(measured) == terminal_events
+    assert len(substatus) == terminal_events

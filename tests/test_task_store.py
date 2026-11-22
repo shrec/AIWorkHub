@@ -312,6 +312,170 @@ def test_manager_decision_counts_uses_nearest_prior_review_per_decision(tmp_path
     }
 
 
+def _seed_decision_events(repo: Path, rows: list[tuple[str, str, str]]) -> None:
+    """Insert ``(event, payload_json, created_at)`` rows for one task, in order."""
+    _insert_task(repo, "TASK_DECISION_MIX", status="pending")
+    _readiness, db_path = task_store._require_ready(repo)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executemany(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES('TASK_DECISION_MIX',?,'codex',?,?)",
+            rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+class _RecordedCursor:
+    def __init__(self, cursor: sqlite3.Cursor, sql: str, log: list[tuple[str, list[Any]]]) -> None:
+        self._cursor = cursor
+        self._sql = sql
+        self._log = log
+
+    def fetchone(self) -> Any:
+        row = self._cursor.fetchone()
+        self._log.append((self._sql, [] if row is None else [row]))
+        return row
+
+    def fetchall(self) -> list[Any]:
+        rows = self._cursor.fetchall()
+        self._log.append((self._sql, list(rows)))
+        return rows
+
+
+class _RecordingConnection:
+    """Delegating read-only connection that records every statement and its rows."""
+
+    def __init__(self, connection: sqlite3.Connection, log: list[tuple[str, list[Any]]]) -> None:
+        self._connection = connection
+        self._log = log
+
+    def execute(self, sql: str, *params: Any) -> _RecordedCursor:
+        return _RecordedCursor(self._connection.execute(sql, *params), sql, self._log)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def _record_readonly_statements(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, list[Any]]]:
+    log: list[tuple[str, list[Any]]] = []
+    real_connect = task_store._connect
+
+    def recording_connect(path: Path, **kwargs: Any) -> Any:
+        connection = real_connect(path, **kwargs)
+        if kwargs.get("readonly"):
+            return _RecordingConnection(connection, log)
+        return connection
+
+    monkeypatch.setattr(task_store, "_connect", recording_connect)
+    return log
+
+
+_DECISION_MIX_ROWS = [
+    ("terminal_review", "{}", "2026-08-02T00:00:00Z"),
+    ("accept_review", "not json", "2026-08-02T00:00:10Z"),
+    ("terminal_review", "{}", "2026-08-02T00:01:00Z"),
+    ("reject_review", '{"to":"pending"}', "2026-08-02T00:01:30Z"),
+    ("terminal_review", "{}", "2026-08-02T00:02:00Z"),
+    ("archived", '{"reason":"reject_review:not useful"}', "2026-08-02T00:02:05Z"),
+    ("terminal_review", "{}", "2026-08-02T00:03:00Z"),
+    ("superseded", '{"reason":"reject_review:replaced"}', "2026-08-02T00:03:20Z"),
+    ("archived", '{"reason":"dashboard cleanup"}', "2026-08-02T00:03:30Z"),
+    ("superseded", "{}", "2026-08-02T00:03:40Z"),
+    ("claim", '{"reason":"reject_review:not a decision"}', "2026-08-02T00:03:50Z"),
+]
+
+
+def test_manager_decision_counts_result_is_unchanged_for_every_decision_kind(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_events(repo, _DECISION_MIX_ROWS)
+
+    assert task_store.manager_decision_counts(repo) == {
+        "accepted": 1,
+        "rejected": 3,
+        "total": 4,
+        "accepted_latency": {"count": 1, "p50_seconds": 10.0, "p95_seconds": 10.0},
+        "rejected_latency": {"count": 3, "p50_seconds": 20.0, "p95_seconds": 20.0},
+        "latency_sample_limit": 5000,
+    }
+
+
+def test_manager_decision_counts_without_decisions_is_zero(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_events(
+        repo,
+        [
+            ("terminal_review", "{}", "2026-08-02T00:00:00Z"),
+            ("claim", '{"reason":"reject_review:not a decision"}', "2026-08-02T00:00:01Z"),
+        ],
+    )
+
+    assert task_store.manager_decision_counts(repo) == {
+        "accepted": 0,
+        "rejected": 0,
+        "total": 0,
+        "accepted_latency": {"count": 0, "p50_seconds": None, "p95_seconds": None},
+        "rejected_latency": {"count": 0, "p50_seconds": None, "p95_seconds": None},
+        "latency_sample_limit": 5000,
+    }
+
+
+def test_manager_decision_counts_decision_rows_carry_payload_only_where_python_reads_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_events(repo, _DECISION_MIX_ROWS)
+    log = _record_readonly_statements(monkeypatch)
+
+    task_store.manager_decision_counts(repo)
+
+    latency_rows = [
+        row for sql, rows in log if "WITH decisions" in sql for row in rows
+    ]
+    stored = {
+        (event, created_at): payload for event, payload, created_at in _DECISION_MIX_ROWS
+    }
+    assert {row["event"] for row in latency_rows} == {
+        "accept_review", "reject_review", "archived", "superseded",
+    }
+    for row in latency_rows:
+        if row["event"] in {"accept_review", "reject_review"}:
+            assert row["payload_json"] is None
+        else:
+            assert row["payload_json"] == stored[(row["event"], row["decision_at"])]
+
+
+def test_manager_decision_counts_totals_visit_only_the_four_decision_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import re
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _seed_decision_events(repo, _DECISION_MIX_ROWS)
+    log = _record_readonly_statements(monkeypatch)
+
+    task_store.manager_decision_counts(repo)
+
+    totals = [
+        sql for sql, _rows in log
+        if "accept_review" in sql and "WITH decisions" not in sql
+    ]
+    assert len(totals) == 1
+    restriction = re.search(r"WHERE\s+event\s+IN\s*\(([^)]*)\)", totals[0])
+    assert restriction is not None
+    assert set(re.findall(r"'([^']+)'", restriction.group(1))) == {
+        "accept_review", "reject_review", "archived", "superseded",
+    }
+
+
 def test_list_task_cards_matches_canonical_detail_in_one_bounded_batch(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
