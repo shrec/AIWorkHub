@@ -1560,7 +1560,25 @@ IMPACT_MODULE = "src/aiworkhub/alpha.py"
 IMPACT_TEST = "tests/test_alpha.py"
 IMPACT_NODE = f"{IMPACT_TEST}::test_alpha"
 RATCHET = "tests/test_module_size_ratchet.py"
-DESCRIBE = ("git", "describe", "--tags", "--abbrev=0", "--match", "v*", "--first-parent", "HEAD")
+# What _last_release_tag asks git: the nearest tag that is v and a release triple.
+DESCRIBE = (
+    "git",
+    "describe",
+    "--tags",
+    "--abbrev=0",
+    "--match",
+    "v[0-9]*.[0-9]*.[0-9]*",
+    "--exclude",
+    "v*[!0-9.]*",
+    "--exclude",
+    "*.*.*.*",
+    "--exclude",
+    "v0[0-9]*",
+    "--exclude",
+    "*.0[0-9]*",
+    "--first-parent",
+    "HEAD",
+)
 
 
 class FakeSelector:
@@ -2242,3 +2260,78 @@ def test_the_real_host_flushes_every_line_it_prints(monkeypatch: pytest.MonkeyPa
         "run     host_tests: python -m pytest\n",
         "run     host_tests: python -m pytest\nok      host_tests: 12 passed\n",
     ]
+
+
+# -- the narrowing base is a release tag, never a hold or rc tag (NF-2026-02343) --------
+
+RELEASE_BASE = "v0.13.8"
+# v* tags that are no release: at least one for each glob the describe skips a tag by.
+NOT_RELEASES = ("v0.13.9/hold", "v0.13.10-rc1", "v0.13.9.1", "v0.13", "v0.13.09", "v00.13.9")
+
+
+def _cut_in(root: Path, runner: Any, env: dict[str, str]) -> Any:
+    """A cut of VERSION in ``root`` whose commands go to ``runner``; no step has run."""
+
+    host = release_cut.Host(
+        root=root,
+        runner=runner,
+        python=sys.executable,
+        cpu_count=1,
+        env=env,
+        is_windows=False,
+        out=lambda line: None,
+    )
+    return release_cut.ReleaseCut(release_cut.Options(VERSION), host)
+
+
+@pytest.mark.parametrize("nearer", NOT_RELEASES)
+def test_the_last_release_tag_is_the_nearest_semver_tag_behind_a_nearer_other_tag(
+    tmp_path: Path, nearer: str
+) -> None:
+    """v0.13.9/hold, nearer on HEAD's first parent than v0.13.8, was the narrowing base.
+
+    Real git, so its describe proves the globs skip the nearer tag: a base after the
+    release leaves out every change between the release and that tag.
+    """
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not on PATH")
+    # Only this repository's git: an inherited GIT_DIR must not redirect these commands.
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    root = tmp_path / "repo"
+    _write(root / "notes.txt", "the release\n")
+    cut = _cut_in(root, release_cut.run_subprocess, env)
+    identity = ("-c", "user.name=release", "-c", "user.email=release@localhost")
+    unsigned = ("-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false")
+    for args in (
+        ("init", "--quiet"),
+        ("add", "notes.txt"),
+        ("commit", "--quiet", "-m", "the release"),
+        ("tag", RELEASE_BASE),
+        ("commit", "--quiet", "--allow-empty", "-m", "held"),
+        ("tag", nearer),
+        ("commit", "--quiet", "--allow-empty", "-m", "what the next release changes"),
+    ):
+        done = cut._git(*identity, *unsigned, "-c", "core.autocrlf=false", *args)
+        assert done.returncode == 0, done.output
+
+    assert cut._last_release_tag() == RELEASE_BASE
+    # Only with no release tag left on the first parent is there no base.
+    deleted = cut._git("tag", "--delete", RELEASE_BASE)
+    assert deleted.returncode == 0, deleted.output
+    assert cut._last_release_tag() is None
+
+
+@pytest.mark.parametrize("answer", [*NOT_RELEASES, "0.13.8", "V0.13.8", TAG])
+def test_a_describe_answer_that_is_no_semver_release_tag_is_no_base(
+    tmp_path: Path, answer: str
+) -> None:
+    """git applies the globs; whatever it answers is checked against the release triple too."""
+
+    runner = FakeRunner(tmp_path, {"git describe": Completed(0, f"{answer}\n")})
+    cut = _cut_in(tmp_path, runner, {})
+
+    assert cut._last_release_tag() is None
+    runner.responses["git describe"] = Completed(0, f"{RELEASE_BASE}\n")
+    assert cut._last_release_tag() == RELEASE_BASE
+    assert runner.argv_of("git describe") == [DESCRIBE, DESCRIBE]

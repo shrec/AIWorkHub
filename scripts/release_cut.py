@@ -1488,16 +1488,41 @@ class ReleaseCut:
         return "release_metadata_full_suite_required" if FULL_SUITE_MARKER in notes else ""
 
     def _last_release_tag(self) -> str | None:
-        """The nearest ``v*`` tag on HEAD's first-parent history, else None."""
+        """The nearest release tag on HEAD's first-parent history, else None.
+
+        A release tag is ``v`` and a version release_metadata.RELEASE_TRIPLE matches. A
+        nearer ``v0.13.9/hold`` or ``v0.13.10-rc1`` is none, and narrowing from it would
+        leave out every change between the release and that tag: the globs admit exactly
+        the release tags, so git's first-parent walk skips every other tag and the release
+        tag behind it wins. What git answers is checked against the triple once more, and
+        anything else is no base.
+        """
 
         done = self._git(
-            "describe", "--tags", "--abbrev=0", "--match", "v*", "--first-parent", "HEAD"
+            "describe",
+            "--tags",
+            "--abbrev=0",
+            # v and three dot-separated parts that each start with a digit,
+            "--match",
+            "v[0-9]*.[0-9]*.[0-9]*",
+            # nothing but digits between the dots and no fourth part,
+            "--exclude",
+            "v*[!0-9.]*",
+            "--exclude",
+            "*.*.*.*",
+            # and no part with a leading 0 but a lone 0.
+            "--exclude",
+            "v0[0-9]*",
+            "--exclude",
+            "*.0[0-9]*",
+            "--first-parent",
+            "HEAD",
         )
         text = done.stdout.strip()
         if (
             done.returncode != 0
             or not text.startswith("v")
-            or any(char.isspace() for char in text)
+            or release_metadata.RELEASE_TRIPLE.fullmatch(text[1:]) is None
             or text == self.tag
         ):
             return None
