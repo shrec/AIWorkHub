@@ -47,6 +47,7 @@ from . import task_plan
 from . import dependency_autolaunch
 from . import learning_commit
 from . import terminal_failure_classification
+from . import tree_baseline_projection
 from .learning_commit import FailureCategory, classify_failure_category
 from .route_identity import MANAGER_PROVIDERS
 
@@ -1937,12 +1938,7 @@ def summarize_card_baselines(value: Any, *, depth: int = 0) -> Any:
                 and isinstance(item, dict)
                 and len(item) >= _BASELINE_SUMMARY_MIN_ENTRIES
             ):
-                canonical = json.dumps(item, sort_keys=True, separators=(",", ":"), default=str)
-                folded[key] = {
-                    "summarized": True,
-                    "entry_count": len(item),
-                    "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-                }
+                folded[key] = tree_baseline_projection.baseline_stand_in(item)
                 continue
             folded[key] = summarize_card_baselines(item, depth=depth + 1)
         return folded
@@ -6131,11 +6127,22 @@ def _verify_retained_zero_diff(
 
     baseline = workspace.get("workspace_baseline")
     allowed = workspace.get("allowed_writes")
-    tree_baseline = workspace.get("tree_baseline")
     if type(baseline) is not dict or type(allowed) is not list:
         return _ZERO_DIFF_UNSEALED_BASELINE
     if len(baseline) > _MAX_ZERO_DIFF_BASELINE_ENTRIES:
         return _ZERO_DIFF_BUDGET_EXCEEDED
+    # NF-2026-02350: a card carries a tree_baseline stand-in; the full map is
+    # this request's own on-disk metadata, accepted only when its digest
+    # equals the stand-in.  A legacy inline map is used as stored.
+    from .process_launcher import PROCESS_DIR_DEFAULT_REL, PROCESS_DIR_ENV
+
+    process_dir = Path(
+        os.environ.get(PROCESS_DIR_ENV) or str(Path(authority_repo) / PROCESS_DIR_DEFAULT_REL)
+    )
+    tree_baseline = tree_baseline_projection.resolve_tree_baseline(
+        workspace,
+        metadata_path=tree_baseline_projection.request_metadata_path(process_dir, request_id),
+    )
     if type(tree_baseline) is not dict:
         return _ZERO_DIFF_UNSEALED_TREE
 

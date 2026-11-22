@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import vscode_lm_bridge
+from .tree_baseline_projection import is_stand_in as _is_tree_stand_in
 
 
 def _provider_tool_denials_from_output(path: Path) -> dict[str, Any]:
@@ -346,7 +347,12 @@ def _semantic_edit_coverage(
     if workspace is not None:
         baselines = dict(getattr(workspace, "workspace_baseline", None) or {})
         raw_tree = getattr(workspace, "tree_baseline", None)
-        tree_baseline = dict(raw_tree) if isinstance(raw_tree, dict) else None
+        # A persisted-card stand-in (NF-2026-02350) is an identity, not a manifest.
+        tree_baseline = (
+            dict(raw_tree)
+            if isinstance(raw_tree, dict) and not _is_tree_stand_in(raw_tree)
+            else None
+        )
         root = getattr(workspace, "path", None)
         workspace_root = Path(str(root)) if root else None
         inherited = {

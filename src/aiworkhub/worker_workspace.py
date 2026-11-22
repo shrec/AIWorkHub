@@ -614,6 +614,8 @@ class WorkerWorkspace:
 
     @classmethod
     def from_metadata(cls, payload: dict[str, Any]) -> "WorkerWorkspace":
+        from .tree_baseline_projection import payload_tree_baseline  # stand-in -> on-disk map
+
         return cls(
             request_id=str(payload["request_id"]),
             repo=Path(payload["repo"]).resolve(),
@@ -630,7 +632,7 @@ class WorkerWorkspace:
             },
             tree_baseline={
                 str(k): (None if v is None else str(v))
-                for k, v in dict(payload.get("tree_baseline") or {}).items()
+                for k, v in payload_tree_baseline(payload).items()
             } or None,
             provisioning_timings_ms={
                 str(k): float(v)

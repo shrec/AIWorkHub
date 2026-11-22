@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import attempt_artifacts, mcp_summary_folds, platform_io, storage_retention, task_store
+from . import tree_baseline_projection
 
 SCHEMA_ID = "aiworkhub.task_store_compaction.v1"
 DEFAULT_MAX_AGE_SECONDS = 3 * 86_400
@@ -261,13 +262,31 @@ assert not any(
 )
 
 
+def _fold_tree(doc: dict[str, Any], paths: Sequence[Sequence[str]]) -> bool:
+    """Fold an inline ``workspace.tree_baseline`` to its identity (NF-2026-02350).
+
+    The one exception to ``workspace`` staying exact under
+    ``_PRESERVED_EVIDENCE_KEYS``, and it needs no durable bundle: the full map
+    is an authority only while the attempt is active, where readers resolve it
+    from the request's own on-disk metadata and bind it to this stand-in's
+    sha256 (``tree_baseline_projection.resolve_tree_baseline``).  No reader
+    uses the stored copy once the attempt finished.  Every other key of the
+    workspace block -- ``workspace_baseline``/``parent_baseline`` included --
+    stays byte-exact.
+    """
+
+    return tree_baseline_projection.fold_tree_baselines(doc, paths)
+
+
 def bound_event_payload(event: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     """The ``task_events`` payload to store for ``event`` (NF-2026-02106).
 
     ``terminal_review``: its ``evidence`` foldable blocks become identities.
     ``accept_review``: the payload is the acceptance evidence itself, so its
-    own top-level foldable blocks do. Any other event, and every other key, is
-    returned exactly. The caller's mapping (the card's block) is never mutated.
+    own top-level foldable blocks do. Both also fold an inline
+    ``workspace.tree_baseline`` (``_fold_tree``). Any other event, and every
+    other key, is returned exactly. The caller's mapping (the card's block) is
+    never mutated.
     """
 
     result = dict(payload)
@@ -277,6 +296,8 @@ def bound_event_payload(event: str, payload: Mapping[str, Any]) -> dict[str, Any
             result["evidence"], _changed = _fold_keys(evidence, _stand_in)
     elif event == "accept_review":
         result, _changed = _fold_keys(result, _stand_in)
+    if event in BOUND_EVENTS:
+        _fold_tree(result, tree_baseline_projection.EVENT_WORKSPACE_PATHS)
     return result
 
 
@@ -590,11 +611,16 @@ def _plan_batch(
             card_after=None,
             refs=frozenset(refs),
         )
+        # The tree_baseline fold needs no durable bundle (see _fold_tree).
+        card_changed = _fold_tree(card, tree_baseline_projection.CARD_WORKSPACE_PATHS)
         if card_durable is None:
             counters["skipped_not_durable"] += 1
         elif _compact_containers(card, card_durable):
+            card_changed = True
+        if card_changed:
             plan.card_after = _dump(card)
         for event, payload in events:
+            changed = _fold_tree(payload, tree_baseline_projection.EVENT_WORKSPACE_PATHS)
             own_request = str(payload.get("request_id") or "").strip()
             receipt = _receipt_of(payload)
             durable = _verify_receipt(receipt, cache, artifact_root)
@@ -602,21 +628,20 @@ def _plan_batch(
                 # A verified bundle of some other attempt never vouches for
                 # this card's event; neither does the card's own bundle then.
                 counters["skipped_event_unbound"] += 1
-                continue
-            if durable is None and receipt is None and card_durable is not None:
+                durable = None
+            elif durable is None and receipt is None and card_durable is not None:
                 # A payload without any receipt is bound to the card's
                 # verified attempt only when it names that exact attempt.
                 if own_request == card_durable.attempt_id:
                     durable = card_durable
-            if durable is None:
-                continue
-            changed = _compact_containers(payload, durable)
-            evidence = payload.get("evidence")
-            if isinstance(evidence, dict):
-                folded, did = _fold_evidence(evidence, durable)
-                if did:
-                    payload["evidence"] = folded
-                    changed = True
+            if durable is not None:
+                changed = _compact_containers(payload, durable) or changed
+                evidence = payload.get("evidence")
+                if isinstance(evidence, dict):
+                    folded, did = _fold_evidence(evidence, durable)
+                    if did:
+                        payload["evidence"] = folded
+                        changed = True
             if changed:
                 plan.events.append(
                     (int(event["event_id"]), str(event["payload_json"]), json.dumps(payload, sort_keys=True))

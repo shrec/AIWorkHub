@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .process_launcher_acceptance import changed_path_hashes
+from .tree_baseline_projection import card_workspace_metadata
 from .worker_workspace import WorkerWorkspace, WorkspaceError
 
 
@@ -33,7 +34,7 @@ def retained_candidate_identity_evidence(
         path_hashes = changed_path_hashes(workspace, changed)
     if not path_hashes or set(path_hashes) != set(changed):
         return {}
-    workspace_metadata = workspace.as_metadata()
+    workspace_metadata = card_workspace_metadata(workspace)  # NF-2026-02350
     candidate_authority = {
         "schema_id": "aiworkhub.python_candidate_authority.v1",
         "sources": [

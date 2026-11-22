@@ -713,6 +713,9 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "validation_stall.py",
         # ...and its bubblewrap interpreter identity binds (NF-2026-02327).
         "validation_interpreter_binds.py",
+        # NF-2026-02350: from_metadata's tree_baseline stand-in decoder and its size bound.
+        "tree_baseline_projection.py",
+        "request_metadata_limits.py",
     ):
         shutil.copyfile(source_package / name, destination_package / name)
     # write_bytes, not write_text: several tests compare a raw on-disk byte

@@ -135,6 +135,7 @@ from .launch_zero_delta import (
 from .process_launcher_evidence import (
     DELTA_RETAINING_TERMINAL_STATES,
     REWORK_NO_DELTA as _REWORK_NO_DELTA,
+    card_workspace_metadata as _card_workspace_metadata,  # NF-2026-02350 stand-in
     SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED as _SOURCE_GRAPH_LIVE_CALLS_ALL_FAILED,
     is_rework_attempt as _is_rework_attempt,
     path_manifest as _path_manifest,
@@ -11397,12 +11398,10 @@ class ProcessManager:
                                 evidence={
                                     "quality_review_receipt": verified_receipt,
                                     "quality_review": metadata["quality_review"],
-                                    "attempt_artifact_manifest": (
-                                        attempt_artifact_receipt
-                                    ),
+                                    "attempt_artifact_manifest": attempt_artifact_receipt,
                                     "evidence_record": outcome_evidence_record,
                                     "claim_state": claim_state,
-                                    "workspace": workspace.as_metadata(),
+                                    "workspace": _card_workspace_metadata(workspace),
                                     "changed_paths": [],
                                     "changed_path_hashes": {},
                                     "request_identity": {
@@ -11670,7 +11669,7 @@ class ProcessManager:
                                     attempt_artifact_receipt
                                 ),
                                 "evidence_record": outcome_evidence_record,
-                                "workspace": workspace.as_metadata(),
+                                "workspace": _card_workspace_metadata(workspace),
                                 "request_identity": {
                                     "request_id": request_id,
                                     "task_id": str(metadata["task_id"]),
@@ -11764,7 +11763,7 @@ class ProcessManager:
                         "worker_mcp_gate": worker_mcp_gate,
                         "quality_gate": quality_gate,
                         "residual_contract": residual_contract_result,
-                        "workspace": workspace.as_metadata(),
+                        "workspace": _card_workspace_metadata(workspace),
                         "request_identity": {
                             "request_id": request_id,
                             "task_id": str(metadata["task_id"]),
@@ -11823,7 +11822,7 @@ class ProcessManager:
                             "error": error[:500],
                             "changed_paths": changed,
                             "promoted_paths": promoted,
-                            "workspace": workspace.as_metadata(),
+                            "workspace": _card_workspace_metadata(workspace),
                             "request_identity": {
                                 "request_id": request_id,
                                 "task_id": str(metadata["task_id"]),
