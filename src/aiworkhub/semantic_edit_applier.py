@@ -15,9 +15,11 @@ manager both get the same guarantees rather than the manager getting none.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
-import tempfile
+import secrets
+import stat
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -38,12 +40,15 @@ def replace_prepared_range(
     prepare time, so a file that moved underneath the edit is refused instead
     of silently overwritten.
 
-    The replacement is atomic, and the destination's real mode is captured
-    before the swap and restored after: ``mkstemp`` creates 0600 and
-    ``os.replace`` carries that onto the destination, which would otherwise
-    rewrite an executable 0755 script down to 0600 on every apply. Restoring
-    the mode is best effort, because some sandboxed filesystems forbid chmod
-    and the content edit must still land atomically there.
+    The replacement is atomic and never changes the destination's mode
+    (NF-2026-01970, NF-2026-02365). The temp is created with the original
+    mode, so the normal path needs no chmod syscall, and the temp is
+    installed by ``os.replace`` only when its permission bits match the
+    original's. When they differ -- a umask, a sandbox that forbids
+    ``fchmod`` -- the new bytes are written in place into the original
+    inode, which keeps its mode and owner. When neither path can keep the
+    mode the edit is refused with ``semantic_edit_mode_not_preserved`` and
+    the original bytes are left untouched; a mode is never changed silently.
 
     Raises ``SemanticEditError`` or ``OSError``; the caller decides how a
     refusal is reported.
@@ -101,41 +106,130 @@ def replace_prepared_range(
         regression = semantic_edit.syntax_regression(relative, current_text, next_text)
         if regression:
             raise semantic_edit.SemanticEditError(regression)
-        fd, temp_name = tempfile.mkstemp(
-            prefix=f".{file_path.name}.aiworkhub-", dir=file_path.parent
-        )
-        mode_restored = False
+        payload = next_text.encode("utf-8")
+        # NF-2026-02365: the temp is created with the original mode, so no
+        # chmod syscall is needed on the normal path; a chmod a sandbox denies
+        # can no longer leave a 0600 file behind under a successful apply.
+        temp_path, fd = _create_temp_with_mode(file_path, original_mode)
         try:
             try:
-                chmod_fd(fd, original_mode)
-                mode_restored = posix_path_modes_supported()
-            except OSError:
-                pass
-            with os.fdopen(fd, "w", encoding="utf-8", newline="", closefd=False) as handle:
-                handle.write(next_text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.close(fd)
-            fd = -1
-            if original_mode == 0o600:
-                mode_restored = True
-            else:
-                try:
-                    os.chmod(temp_name, original_mode)
-                    mode_restored = True
-                except OSError:
-                    pass
-            metrics["mode_restored"] = mode_restored
-            metrics["original_mode"] = original_mode
-            os.replace(temp_name, file_path)
-        finally:
-            if fd >= 0:
+                with os.fdopen(fd, "wb", closefd=False) as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if not _fd_mode_matches(fd, original_mode):
+                    # The umask narrowed the creation mode; one descriptor
+                    # chmod may still fix it where the host allows it.
+                    try:
+                        chmod_fd(fd, original_mode)
+                    except OSError:
+                        pass
+                replace_keeps_mode = _fd_mode_matches(fd, original_mode)
+            finally:
                 os.close(fd)
+            metrics["original_mode"] = original_mode
+            if replace_keeps_mode:
+                os.replace(temp_path, file_path)
+                metrics["mode_write_path"] = "replace"
+            else:
+                # Installing the temp would change the mode: rewrite the
+                # original inode instead, which keeps its mode and owner.
+                try:
+                    _write_in_place(file_path, payload, data, original_mode)
+                except OSError as exc:
+                    raise semantic_edit.SemanticEditError(
+                        f"semantic_edit_mode_not_preserved:{relative}"
+                    ) from exc
+                metrics["mode_write_path"] = "in_place"
+            metrics["mode_restored"] = True
+        finally:
             try:
-                os.unlink(temp_name)
+                os.unlink(temp_path)
             except FileNotFoundError:
                 pass
     return next_text, metrics
+
+
+_TEMP_NAME_ATTEMPTS = 16
+
+
+def _comparable_mode(mode: int) -> int:
+    """The permission bits this host can represent and therefore must keep.
+
+    POSIX keeps all of ``0o7777``. Windows reports only the read-only
+    attribute through ``S_IWRITE``; its execute bits are derived from the
+    file extension by ``os.stat`` and never appear on a descriptor, so they
+    carry no information an edit could lose.
+    """
+
+    if posix_path_modes_supported():
+        return mode & 0o7777
+    return mode & stat.S_IWRITE
+
+
+def _fd_mode_matches(fd: int, mode: int) -> bool:
+    """Whether the open file ``fd`` carries exactly the permission bits ``mode``."""
+
+    return _comparable_mode(os.fstat(fd).st_mode) == _comparable_mode(mode)
+
+
+def _create_temp_with_mode(file_path: Path, mode: int) -> tuple[Path, int]:
+    """Create a uniquely named sibling of ``file_path`` with ``mode`` set at creation.
+
+    ``os.open`` with ``O_EXCL`` (never following a link) replaces ``mkstemp``,
+    whose fixed 0600 needed a chmod afterwards. The name is random and retried
+    a bounded number of times; exhaustion is refused with a named reason.
+    """
+
+    flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for _attempt in range(_TEMP_NAME_ATTEMPTS):
+        candidate = file_path.parent / f".{file_path.name}.aiworkhub-{secrets.token_hex(8)}"
+        try:
+            return candidate, os.open(candidate, flags, mode & 0o7777)
+        except FileExistsError:
+            continue
+    raise semantic_edit.SemanticEditError(
+        f"semantic_edit_temp_name_exhausted:{file_path.name}:{_TEMP_NAME_ATTEMPTS}"
+    )
+
+
+def _write_in_place(file_path: Path, payload: bytes, original: bytes, mode: int) -> None:
+    """Rewrite ``file_path``'s own inode with ``payload``, keeping mode and owner.
+
+    Used only when installing a temp would change the mode. Raises ``OSError``
+    when the file cannot be opened, does not carry ``mode``, or cannot be
+    written; a failed write is rolled back to ``original`` before re-raising,
+    so a refusal never leaves half-written bytes.
+    """
+
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(file_path, flags)
+    try:
+        if not _fd_mode_matches(fd, mode):
+            raise PermissionError(
+                errno.EPERM, "semantic_edit_mode_not_preserved", str(file_path)
+            )
+        with os.fdopen(fd, "r+b", closefd=False) as handle:
+            try:
+                handle.write(payload)
+                handle.truncate()
+                handle.flush()
+                os.fsync(handle.fileno())
+            except BaseException:
+                try:
+                    handle.seek(0)
+                    handle.write(original)
+                    handle.truncate()
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                except OSError:
+                    pass
+                raise
+    finally:
+        os.close(fd)
 
 
 def create_target(root: Path, path: str, *, allowed_writes: Iterable[str]) -> str:

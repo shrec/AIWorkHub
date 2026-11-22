@@ -72,9 +72,11 @@ def test_semantic_edit_exec_bit_survives_path_chmod_failure(
     assert metrics["mode_restored"] is True
 
 
-def test_chmod_failure_is_reported_not_swallowed(
+def test_chmod_failure_cannot_change_the_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # NF-2026-02365 superseded "report the failure": the temp is created with
+    # the original mode, so a forbidden chmod no longer costs the mode at all.
     path = _write_script(tmp_path, 0o755 if os.name != "nt" else 0o666)
     original_mode = path.stat().st_mode & 0o7777
 
@@ -87,7 +89,8 @@ def test_chmod_failure_is_reported_not_swallowed(
     metrics = _edit_line_two(tmp_path)
 
     assert path.read_text() == "#!/bin/sh\necho edited\n"
-    assert metrics["mode_restored"] is False
+    assert path.stat().st_mode & 0o7777 == original_mode
+    assert metrics["mode_restored"] is True
     assert metrics["original_mode"] == original_mode
 
 
