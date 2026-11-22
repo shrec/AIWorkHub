@@ -152,8 +152,8 @@ class _CacheEntry:
     size: int
     mtime_ns: int
     usage: _FileUsage
-    # In-process only: never persisted and never part of equality, so the
-    # persisted-cache "changed?" comparison is about usage alone.
+    # Resume state is persisted with the entry but is never part of equality,
+    # so a state-only change does not rewrite the persisted cache.
     state: _ParseState | None = field(default=None, compare=False)
 
 
