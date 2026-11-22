@@ -2307,6 +2307,52 @@ function registerOwnedDashboardChild(child) {
   }
 }
 
+// NF-2026-02345: the first reader of a fresh stable generation gets one
+// bytecode precompile beside it. Gated on a storageRoot (never the test host or
+// the bundled fallback), once per runtimeDir, and only when the job count is at
+// least two. Its outcome is never awaited and never reaches the reader.
+// __pycache__ alone is no signal: the interpreter preflight and the MCP server
+// write there before the reader starts. The marker is the reader's own bytecode.
+// ponytail: a marker from another interpreter or from an interrupted precompile skips this and leaves the serial compile.
+const precompiledStableRuntimeDirs = new Set();
+function precompileStableRuntimeGeneration(python, runtimeDir) {
+  if (!runtimeDir || !stableRuntimeInfo || !stableRuntimeInfo.storageRoot) return;
+  if (stableRuntimeInfo.runtimeDir !== runtimeDir || precompiledStableRuntimeDirs.has(runtimeDir)) return;
+  const packageDir = path.join(runtimeDir, "aiworkhub");
+  try {
+    if (fs.readdirSync(path.join(packageDir, "__pycache__")).some((name) => /^dashboard_reader\..+\.pyc$/.test(name))) return;
+  } catch (_err) {
+    // No readable bytecode directory: the reader's module is not cached yet.
+  }
+  let cores = 0;
+  try {
+    cores = typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
+  } catch (_err) {
+    cores = 0;
+  }
+  const jobs = Math.min(61, Math.floor(cores / 2));
+  if (!(jobs >= 2)) return;
+  precompiledStableRuntimeDirs.add(runtimeDir);
+  const env = { ...process.env };
+  delete env.BITNN_TASKCTL_COORDINATOR_TOKEN;
+  delete env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE;
+  let child;
+  try {
+    child = childProcess.spawn(
+      python.command,
+      [...python.argsPrefix, "-I", "-m", "compileall", "-q", "-j", String(jobs), packageDir],
+      { cwd: runtimeDir, env, shell: false, windowsHide: true, stdio: "ignore" },
+    );
+  } catch (_err) {
+    return;
+  }
+  if (!child) return;
+  registerOwnedDashboardChild(child);
+  trackStableRuntimeChild(child, runtimeDir);
+  child.once("exit", () => releaseStableRuntimeChild(child));
+  child.on("error", () => { if (!child.pid) releaseStableRuntimeChild(child); });
+}
+
 // NF-2026-02287: newline-delimited JSON client for exactly one
 // `python -m aiworkhub.dashboard_reader --repo <root>` child. Request
 // {id, tool, arguments}; reply {id, result} or {id, error: {code}}. The child
@@ -2394,6 +2440,7 @@ class DashboardProcessClient {
     }
     if (this.disposed) throw new Error("dashboard_process_disposed");
     const runtimeDir = extensionRuntimeDir;
+    precompileStableRuntimeGeneration(python, runtimeDir);
     const env = repoBoundPythonChildEnv(root, this.repositoryIdentity, this.claimEpisode, runtimeDir);
     for (const key of DASHBOARD_PROCESS_STRIPPED_ENV) delete env[key];
     let child;

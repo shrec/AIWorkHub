@@ -113,9 +113,11 @@ assert.ok(ext.includes("getHtmlForNavigatorWebview"));
 assert.ok(ext.includes("Open Dashboard"));
 assert.ok(ext.includes("Select Repository"));
 
-// Exactly two owned Python children: the MCP routing/dispatcher server and
-// the dashboard-only process (NF-2026-02287).
-assert.strictEqual((ext.match(/childProcess\.spawn\(/g) || []).length, 2);
+// Exactly three owned Python children: the MCP routing/dispatcher server, the
+// dashboard-only process (NF-2026-02287), and the one-shot bytecode precompile
+// beside a fresh stable generation's first reader (NF-2026-02345).
+assert.strictEqual((ext.match(/childProcess\.spawn\(/g) || []).length, 3);
+assert.strictEqual(ext.split('[...python.argsPrefix, "-I", "-m", "compileall", "-q", "-j", String(jobs), packageDir]').length - 1, 1);
 assert.ok(ext.includes('[...python.argsPrefix, "-m", "aiworkhub.server"]'));
 assert.ok(ext.includes('const DASHBOARD_READER_MODULE = "aiworkhub.dashboard_reader"'));
 assert.ok(ext.includes('[...python.argsPrefix, "-m", DASHBOARD_READER_MODULE, "--repo", root]'));
