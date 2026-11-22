@@ -23,7 +23,14 @@ from aiworkhub import (
 @pytest.fixture(autouse=True)
 def _fresh_trim_state() -> Any:
     def reset() -> None:
-        platform_io._HEAP_TRIM_STATE.update({"probed": False, "handle": None, "last": None})
+        platform_io._HEAP_TRIM_STATE.update({
+            "probed": False,
+            "handle": None,
+            "libc": None,
+            "last": None,
+            "timer": None,
+            "arena_cap": None,
+        })
 
     reset()
     yield

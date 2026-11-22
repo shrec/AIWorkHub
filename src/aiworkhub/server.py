@@ -562,6 +562,8 @@ except ModuleNotFoundError:
         # afterwards would already have allocated an arbitrarily large client
         # line.  The one-byte look-ahead detects overflow; the remainder is
         # drained in bounded chunks so the next request keeps its framing.
+        from . import platform_io
+
         stdin = sys.stdin.buffer
         # MCP stdio is a byte protocol.  Writing Unicode JSON through the
         # platform text wrapper makes transport correctness depend on the
@@ -654,6 +656,9 @@ except ModuleNotFoundError:
                 # NF-2026-02053: the deferred startup sweep may begin only once
                 # the client holds its first tool listing.
                 _mark_first_tools_list_served()
+            # NF-2026-02273: hand the request's freed heap back to the OS once
+            # the response is on the wire (coalesced, never more than one timer).
+            platform_io.schedule_heap_trim()
 
         # Tool calls may legitimately wait on providers or repository locks.
         # Keep the reader and lightweight status calls serviceable while those
@@ -661,6 +666,10 @@ except ModuleNotFoundError:
         # upper bound. JSON-RPC permits responses to arrive out of order; the
         # immutable request id remains the exact correlation authority.
         max_workers = max(4, min(32, os.cpu_count() or 4))
+        # NF-2026-02273: glibc latches its arena limit once more than
+        # arena_test arenas exist, so cap arenas before any tool thread
+        # allocates; per-thread arenas otherwise retain freed heap.
+        platform_io.cap_malloc_arenas()
         executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="aiworkhub-mcp-tool",

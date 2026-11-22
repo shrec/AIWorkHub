@@ -947,7 +947,20 @@ def process_memory_bytes() -> dict[str, int | None]:
 # lifetime.  malloc_trim(0) hands the free top and interior pages back.
 HEAP_TRIM_MIN_INTERVAL_SECONDS = 5.0
 _HEAP_TRIM_LOCK = threading.Lock()
-_HEAP_TRIM_STATE: dict[str, Any] = {"probed": False, "handle": None, "last": None}
+# "libc" caches the loaded glibc handle (reused by cap_malloc_arenas), "timer"
+# is the one armed deferred trim, "arena_cap" the cached mallopt outcome.
+_HEAP_TRIM_STATE: dict[str, Any] = {
+    "probed": False,
+    "handle": None,
+    "libc": None,
+    "last": None,
+    "timer": None,
+    "arena_cap": None,
+}
+# Factory for the deferred trim timer; tests inject a fake.
+_HEAP_TRIM_TIMER: Callable[..., Any] = threading.Timer
+# glibc <malloc.h> M_ARENA_MAX.
+_M_ARENA_MAX = -8
 _HeapTrimmed = TypeVar("_HeapTrimmed", bound=Callable[..., Any])
 
 
@@ -962,18 +975,22 @@ def _glibc_malloc_trim() -> Any:
     if _HEAP_TRIM_STATE["probed"]:
         return _HEAP_TRIM_STATE["handle"]
     _HEAP_TRIM_STATE["probed"] = True
+    _HEAP_TRIM_STATE["libc"] = None
     try:
         confstr = getattr(os, "confstr", None)
         if not is_linux() or not callable(confstr):
             return None
         if not str(confstr("CS_GNU_LIBC_VERSION")).lower().startswith("glibc"):
             return None
-        trim = ctypes.CDLL("libc.so.6").malloc_trim
+        libc = ctypes.CDLL("libc.so.6")
+        trim = libc.malloc_trim
         trim.argtypes = (ctypes.c_size_t,)
         trim.restype = ctypes.c_int
         _HEAP_TRIM_STATE["handle"] = trim
+        _HEAP_TRIM_STATE["libc"] = libc
     except Exception:
         _HEAP_TRIM_STATE["handle"] = None
+        _HEAP_TRIM_STATE["libc"] = None
     return _HEAP_TRIM_STATE["handle"]
 
 
@@ -1015,6 +1032,123 @@ def trim_heap_after(func: _HeapTrimmed) -> _HeapTrimmed:
             trim_process_heap()
 
     return cast(_HeapTrimmed, wrapper)
+
+
+def _fire_scheduled_heap_trim(armed: list[Any]) -> None:
+    """Timer body: free the armed slot and trim unconditionally; never raises.
+
+    The rate limit is bypassed on purpose: the timer was armed for the rest of
+    the interval, so a deferred trim is never dropped.  Only the timer that
+    still owns the slot clears it.
+    """
+
+    try:
+        with _HEAP_TRIM_LOCK:
+            if armed and _HEAP_TRIM_STATE["timer"] is armed[0]:
+                _HEAP_TRIM_STATE["timer"] = None
+            trim = _glibc_malloc_trim()
+            if trim is None:
+                return
+            _HEAP_TRIM_STATE["last"] = time.monotonic()
+            trim(0)
+    except Exception:
+        return
+
+
+def schedule_heap_trim() -> dict[str, Any]:
+    """Trailing-edge coalescing heap trim for hot request paths; never raises.
+
+    Off glibc Linux: ``{"available": False, ...}`` and no thread.  When no trim
+    ran within ``HEAP_TRIM_MIN_INTERVAL_SECONDS`` it trims inline now.  Otherwise
+    it arms ONE daemon timer (built by ``_HEAP_TRIM_TIMER``) for the remaining
+    interval; a call while that timer is armed arms nothing and reports
+    ``coalesced: True``.
+    """
+
+    try:
+        with _HEAP_TRIM_LOCK:
+            trim = _glibc_malloc_trim()
+            if trim is None:
+                return {
+                    "available": False,
+                    "trimmed": False,
+                    "scheduled": False,
+                    "reason": "not_glibc_linux",
+                }
+            if _HEAP_TRIM_STATE["timer"] is not None:
+                return {
+                    "available": True,
+                    "trimmed": False,
+                    "scheduled": False,
+                    "coalesced": True,
+                }
+            now = time.monotonic()
+            last = _HEAP_TRIM_STATE["last"]
+            if last is None or now - last >= HEAP_TRIM_MIN_INTERVAL_SECONDS:
+                _HEAP_TRIM_STATE["last"] = now
+                return {"available": True, "trimmed": bool(trim(0)), "scheduled": False}
+            delay = max(0.0, HEAP_TRIM_MIN_INTERVAL_SECONDS - (now - last))
+            armed: list[Any] = []
+            timer = _HEAP_TRIM_TIMER(delay, _fire_scheduled_heap_trim, args=(armed,))
+            timer.daemon = True
+            armed.append(timer)
+            timer.start()
+            _HEAP_TRIM_STATE["timer"] = timer
+            return {
+                "available": True,
+                "trimmed": False,
+                "scheduled": True,
+                "delay_seconds": round(delay, 3),
+            }
+    except Exception as exc:
+        return {
+            "available": False,
+            "trimmed": False,
+            "scheduled": False,
+            "reason": f"schedule_failed:{type(exc).__name__}",
+        }
+
+
+def cap_malloc_arenas(limit: int = 2) -> dict[str, Any]:
+    """Cap glibc malloc arenas in-process via ``mallopt(M_ARENA_MAX, limit)``.
+
+    Runs ``mallopt`` at most once per process (the outcome is cached), skips
+    with ``skipped: "malloc_arena_max_env_set"`` when the operator already set
+    ``MALLOC_ARENA_MAX``, and reports ``{"available": False, ...}`` off glibc
+    Linux or on a load failure.  Unlike the env var it is not inherited by
+    child processes.  Must run before worker threads allocate: glibc latches
+    the limit once more than ``arena_test`` arenas exist.  Never raises.
+    """
+
+    try:
+        with _HEAP_TRIM_LOCK:
+            cached = _HEAP_TRIM_STATE["arena_cap"]
+            if cached is not None:
+                return dict(cached)
+            if _glibc_malloc_trim() is None or _HEAP_TRIM_STATE["libc"] is None:
+                return {"available": False, "capped": False, "reason": "not_glibc_linux"}
+            if "MALLOC_ARENA_MAX" in os.environ:
+                return {
+                    "available": True,
+                    "capped": False,
+                    "skipped": "malloc_arena_max_env_set",
+                }
+            mallopt = _HEAP_TRIM_STATE["libc"].mallopt
+            mallopt.argtypes = (ctypes.c_int, ctypes.c_int)
+            mallopt.restype = ctypes.c_int
+            result = {
+                "available": True,
+                "capped": bool(mallopt(_M_ARENA_MAX, int(limit))),
+                "limit": int(limit),
+            }
+            _HEAP_TRIM_STATE["arena_cap"] = result
+            return dict(result)
+    except Exception as exc:
+        return {
+            "available": False,
+            "capped": False,
+            "reason": f"cap_failed:{type(exc).__name__}",
+        }
 
 
 def _windows_creation_flag() -> int:

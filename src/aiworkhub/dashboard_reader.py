@@ -41,6 +41,8 @@ import types
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
+from . import platform_io
+
 SCHEMA_ID = "aiworkhub.dashboard_reader.v1"
 
 # The exact dashboard tool maps of ``dashboard_mcp_app`` this process serves:
@@ -416,6 +418,9 @@ def _serve_loop(stdin: BinaryIO, stdout: BinaryIO, tools: Mapping[str, Callable[
         # The reply is already on the wire; background refreshes the view
         # scheduled run now, so the next poll publishes their result.
         drain_deferred_work()
+        # NF-2026-02273: synchronous, thread-free trim (this process is fenced
+        # single-threaded); a rate-limited skip is fine, the next poll trims.
+        platform_io.trim_process_heap()
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
