@@ -347,7 +347,13 @@ def test_run_validations_executes_inside_the_cd_prefix_directory(
         )
         assert results[0]["returncode"] == 0
         assert results[0]["cwd"] == "tools/geoai-task-mcp"
-        assert f"CWD_MARKER={sub}" in results[0]["stdout_tail"]
+        # Landlock runs the child at the host path; bubblewrap maps the
+        # workspace to SANDBOX_WORKSPACE, so the child sees that view instead.
+        lines = set(results[0]["stdout_tail"].splitlines())
+        assert {
+            f"CWD_MARKER={sub}",
+            f"CWD_MARKER={worker_workspace.SANDBOX_WORKSPACE}/tools/geoai-task-mcp",
+        } & lines
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
@@ -371,7 +377,13 @@ def test_run_validations_without_cd_prefix_runs_at_workspace_root(
         results = worker_workspace.run_validations(workspace, ["python3 check_cwd.py"])
         assert results[0]["returncode"] == 0
         assert results[0]["cwd"] is None
-        assert f"CWD_MARKER={workspace.path}" in results[0]["stdout_tail"]
+        # Landlock runs the child at the host path; bubblewrap maps the
+        # workspace to SANDBOX_WORKSPACE, so the child sees that view instead.
+        lines = set(results[0]["stdout_tail"].splitlines())
+        assert {
+            f"CWD_MARKER={workspace.path}",
+            f"CWD_MARKER={worker_workspace.SANDBOX_WORKSPACE}",
+        } & lines
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
