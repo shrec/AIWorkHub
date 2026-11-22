@@ -322,7 +322,8 @@ def test_unexpected_runner_exception_is_named_not_raised(env) -> None:
         metadata=env.metadata, commands=[_COMMAND], candidate_digest="d" * 64,
         key_path=env.key, ledger_path=env.ledger, run_full_snapshot=boom,
     )
-    assert out == {"ok": False, "reason": "full_snapshot_failed:RuntimeError"}
+    # NF-2026-02364: <step>:<Class>:<errno>:<path>; the exception text never leaks.
+    assert out == {"ok": False, "reason": "full_snapshot_failed:run:RuntimeError:-:-"}
 
 
 def test_workspace_error_reason_carries_no_exception_text(env) -> None:

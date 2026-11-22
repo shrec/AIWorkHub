@@ -239,10 +239,56 @@ def metadata_candidates(authority_repo: Path, request_id: str) -> list[Path]:
     return paths
 
 
-def _default_full_snapshot_runner() -> FullSnapshotRunner:
-    from .process_launcher import _run_full_snapshot_validations
+def worker_full_snapshot_runner(
+    *,
+    writable_root: Path | None = None,
+    run_validations: Callable[..., list[dict[str, Any]]] | None = None,
+    route_resolver: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+    baseline_comparer: Callable[..., list[dict[str, Any]]] | None = None,
+) -> FullSnapshotRunner:
+    """The launcher's full-snapshot runner with the worker-lane snapshot (NF-2026-02364).
 
-    return _run_full_snapshot_validations
+    Only ``create_snapshot``/``cleanup_workspace`` differ from
+    ``process_launcher._run_full_snapshot_validations``: they come from
+    ``worker_snapshot_tree``, which writes only beneath ``writable_root`` and
+    never runs ``git worktree`` (impossible inside the worker's Landlock
+    ruleset).  The validation runner, route resolver and baseline comparer
+    are the launcher's own unless a test injects them.
+    """
+
+    from functools import partial
+
+    from . import process_launcher as launcher
+    from . import process_launcher_validation as launcher_validation
+    from . import worker_snapshot_tree
+
+    def runner(
+        workspace: Any,
+        authority: Mapping[str, Any],
+        route_metadata: Mapping[str, Any],
+        candidate: Sequence[str],
+        *,
+        reuse: Mapping[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return launcher_validation.run_full_snapshot_validations(
+            workspace, authority, route_metadata, candidate,
+            create_snapshot=partial(
+                worker_snapshot_tree.create_worker_snapshot, writable_root=writable_root
+            ),
+            cleanup_workspace=worker_snapshot_tree.cleanup_worker_snapshot,
+            run_validations=run_validations or partial(
+                launcher._run_validations_with_toolchain_receipt, authority=authority
+            ),
+            route_resolver=route_resolver or launcher._validation_route_kwargs,
+            baseline_comparer=baseline_comparer or launcher._compare_schema_mypy_baseline,
+            reuse=reuse,
+        )
+
+    return runner
+
+
+def _default_full_snapshot_runner() -> FullSnapshotRunner:
+    return worker_full_snapshot_runner()
 
 
 def _worker_row(position: int, command: str, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -382,7 +428,9 @@ def run_worker_full_snapshot(
     except worker_workspace.ValidationRunError as exc:
         rows, snapshot = list(exc.results or []), None
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"full_snapshot_failed:{type(exc).__name__}"}
+        from .worker_snapshot_tree import failure_reason  # step, errno, path (NF-2026-02364)
+
+        return {"ok": False, "reason": failure_reason(exc, repo=workspace.repo)}
     results = [
         _worker_row(position, str(commands[position]), rows[position])
         if position < len(rows) and isinstance(rows[position], Mapping)
