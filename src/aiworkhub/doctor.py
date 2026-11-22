@@ -30,7 +30,6 @@ REPLY_MAX_BYTES = 8 * 1024
 HEAP_CENSUS_MAX_OBJECTS = 3_000_000
 HEAP_CENSUS_TOP_TYPES = 15
 HEAP_CENSUS_LARGEST_OBJECTS = 10
-HEAP_CENSUS_MAX_REFERRERS = 256
 HEAP_CENSUS_NAME_CHARS = 120
 HEAP_CENSUS_CONTAINER_TYPES = (dict, list, str, bytes, bytearray)
 # Untracked payload totals (NF-2026-02331): gc never tracks these; counted via referents.
@@ -255,34 +254,61 @@ def _container_len(obj: Any) -> int | None:
     return None
 
 
-def _register_owner(obj: Any, owners: dict[int, tuple[str, str]]) -> None:
-    """Remember the namespace dict of a module, class or function by id."""
+def _register_owner(
+    obj: Any, owners: dict[int, tuple[str, str]], namespaces: list[dict[Any, Any]]
+) -> None:
+    """Remember the namespace dict of a module, class or function by id, and keep the dict."""
     kind = type(obj)
     if issubclass(kind, types.ModuleType):
         namespace = vars(types.ModuleType)["__dict__"].__get__(obj)
         if type(namespace) is dict:
             name = namespace.get("__name__")
             owners[id(namespace)] = ("module", str(name)[:HEAP_CENSUS_NAME_CHARS])
+            namespaces.append(namespace)
     elif issubclass(kind, type):
         proxy = type.__dict__["__dict__"].__get__(obj)
         for ref in gc.get_referents(proxy):
             if type(ref) is dict:
                 owners[id(ref)] = ("class", _type_name(obj))
+                namespaces.append(ref)
     elif kind is types.FunctionType:
         # Reading __dict__ would create it; the referents expose it without allocating.
         for ref in gc.get_referents(obj):
-            if type(ref) is dict and ref is not obj.__globals__ and ref is not obj.__kwdefaults__:
+            # Every function also references the one shared builtins dict; skip it and
+            # any dict already registered so the owner pass scans each namespace once.
+            if (
+                type(ref) is dict
+                and id(ref) not in owners
+                and ref is not obj.__globals__
+                and ref is not obj.__kwdefaults__
+                and ref is not obj.__builtins__
+            ):
                 owners[id(ref)] = ("function", str(obj.__qualname__)[:HEAP_CENSUS_NAME_CHARS])
+                namespaces.append(ref)
 
 
-def _first_owner(obj: Any, owners: Mapping[int, tuple[str, str]]) -> tuple[str, str] | None:
-    """Best effort: the first referrer that is a module/class/function namespace dict."""
-    for ref in itertools.islice(gc.get_referrers(obj), HEAP_CENSUS_MAX_REFERRERS):
-        if type(ref) is dict:
-            owner = owners.get(id(ref))
-            if owner is not None:
-                return owner
-    return None
+def _namespace_owners(
+    targets: list[Any],
+    namespaces: list[dict[Any, Any]],
+    owners: Mapping[int, tuple[str, str]],
+) -> dict[int, tuple[str, str]]:
+    """First registered namespace dict directly referencing each target, in one pass.
+
+    Never gc.get_referrers: that walks the whole heap once per target (NF-2026-02334).
+    """
+    wanted = {id(target) for target in targets}
+    found: dict[int, tuple[str, str]] = {}
+    for namespace in namespaces:
+        if len(found) >= len(wanted):
+            break
+        owner = owners.get(id(namespace))
+        if owner is None:
+            continue
+        for ref in gc.get_referents(namespace):
+            key = id(ref)
+            if key in wanted and key not in found:
+                found[key] = owner
+    return found
 
 
 class _TopBySize:
@@ -309,13 +335,6 @@ class _TopBySize:
 
     def ranked(self) -> list[tuple[int, Any]]:
         return [(size, obj) for size, _, obj in sorted(self._heap, key=lambda i: (-i[0], i[1]))]
-
-
-def _owner_or_none(obj: Any, owners: Mapping[int, tuple[str, str]]) -> tuple[str, str] | None:
-    try:
-        return _first_owner(obj, owners)
-    except Exception:
-        return None
 
 
 def _census_entry(
@@ -352,7 +371,8 @@ def _heap_census(max_objects: int) -> dict[str, Any]:
     one level through untracked dict/tuple referents, and ranks the containers
     that directly reference the most payload bytes.
     Ceiling: gc.get_objects() materialises one list of every tracked object
-    (8 bytes each), and each largest-object referrer lookup walks the heap once.
+    (8 bytes each). Owners of the ranked objects come from one pass over the
+    namespace dicts registered during the walk, never gc.get_referrers (NF-2026-02334).
     """
     started = time.monotonic()
     before = list(gc.get_count())
@@ -362,6 +382,7 @@ def _heap_census(max_objects: int) -> dict[str, Any]:
     truncated = len(objects) > max_objects
     by_type: dict[type, list[int]] = {}
     owners: dict[int, tuple[str, str]] = {}
+    namespaces: list[dict[Any, Any]] = []
     largest = _TopBySize(HEAP_CENSUS_LARGEST_OBJECTS)
     holders = _TopBySize(HEAP_CENSUS_LARGEST_OBJECTS)
     payload_totals: dict[type, list[int]] = {base: [0, 0] for base in HEAP_CENSUS_PAYLOAD_TYPES}
@@ -415,7 +436,7 @@ def _heap_census(max_objects: int) -> dict[str, Any]:
             slot[0] += 1
             slot[1] += size
         try:
-            _register_owner(obj, owners)
+            _register_owner(obj, owners, namespaces)
             if issubclass(kind, HEAP_CENSUS_CONTAINER_TYPES):
                 largest.offer(obj, size)
             held = 0
@@ -434,16 +455,22 @@ def _heap_census(max_objects: int) -> dict[str, Any]:
             skipped += 1
     del objects
     top = heapq.nlargest(HEAP_CENSUS_TOP_TYPES, by_type.items(), key=lambda item: item[1])
+    ranked_largest = largest.ranked()
+    ranked_holders = holders.ranked()
+    found = _namespace_owners(
+        [obj for _, obj in ranked_largest] + [obj for _, obj in ranked_holders],
+        namespaces,
+        owners,
+    )
+    del namespaces
     largest_objects = [
-        _census_entry(obj, "shallow_bytes", size, _owner_or_none(obj, owners))
-        for size, obj in largest.ranked()
+        _census_entry(obj, "shallow_bytes", size, found.get(id(obj)))
+        for size, obj in ranked_largest
     ]
     # A holder that is itself a module/class/function namespace is named directly.
     top_holders = [
-        _census_entry(
-            obj, "payload_bytes", held, owners.get(id(obj)) or _owner_or_none(obj, owners)
-        )
-        for held, obj in holders.ranked()
+        _census_entry(obj, "payload_bytes", held, owners.get(id(obj)) or found.get(id(obj)))
+        for held, obj in ranked_holders
     ]
     return {
         "top_types": [

@@ -276,3 +276,39 @@ def test_diagnose_drops_top_holders_before_largest_objects(
     assert fitted["largest_objects"] and fitted["top_types"]
     assert "largest_objects_dropped" not in fitted
     assert "summaries_dropped" not in reply
+
+
+def test_census_resolves_owners_without_get_referrers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NF-2026-02334: gc.get_referrers walks the whole heap per object; never call it."""
+
+    def refuse(*_objects: Any) -> list[Any]:
+        raise AssertionError("gc.get_referrers must not be called by the heap census")
+
+    monkeypatch.setattr(doctor.gc, "get_referrers", refuse)
+    global _BIG_BYTES
+    _BIG_BYTES = bytes(FIVE_MB)
+    try:
+        census = _census()
+    finally:
+        _BIG_BYTES = None
+    assert census["objects_skipped"] >= 0
+    hits = [
+        entry
+        for entry in census["largest_objects"]
+        if entry["type"] == "bytes" and entry["len"] == FIVE_MB
+    ]
+    assert len(hits) == 1, census["largest_objects"]
+    assert hits[0]["referrer"] == "module"
+    assert hits[0]["referrer_name"] == __name__
+
+
+def test_register_owner_skips_the_shared_builtins_dict() -> None:
+    """NF-2026-02334 review: every function references one builtins dict; register it never."""
+    owners: dict[int, tuple[str, str]] = {}
+    namespaces: list[dict[Any, Any]] = []
+    shared = _census.__builtins__
+    for fn in (_census, test_census_resolves_owners_without_get_referrers, _census):
+        doctor._register_owner(fn, owners, namespaces)
+    assert id(shared) not in owners
+    assert all(namespace is not shared for namespace in namespaces)
+    assert len({id(namespace) for namespace in namespaces}) == len(namespaces)
