@@ -3842,6 +3842,15 @@ def run_review_ready_quality_gate(
         destructive_checks=destructive_checks,
         requested_risk_tier=requested_risk_tier,
     )
+    # NF-2026-02344: a sparse worker tree omits the policy file on disk, so
+    # unless the candidate changes it, read the canonical policy -- exactly as
+    # accept does -- instead of silently loading no declared checks.
+    candidate_changes_policy = any(
+        posixpath.normpath(path.strip().replace("\\", "/")) == CONFIG_RELATIVE_PATH
+        for path in affected
+        if path.strip()
+    )
+    inherit_policy = canonical_repo is not None and not candidate_changes_policy
     gate = run_completion_quality_gate(
         candidate_root,
         changed_paths=affected,
@@ -3849,8 +3858,12 @@ def run_review_ready_quality_gate(
         risk_signals=observation["signals"],
         reachability_inputs=reachability_inputs,
         review_meta_gates=False,
+        policy_root=canonical_repo if inherit_policy else None,
         # Only findings the candidate INTRODUCES over the canonical copy block.
         baseline_root=canonical_repo,
+    )
+    gate["review_ready_policy_source"] = (
+        "canonical_inherited" if inherit_policy else "candidate"
     )
     gate["review_risk_profile"] = observation
     gate["review_ready_destructive_diff_checks"] = destructive_rows
