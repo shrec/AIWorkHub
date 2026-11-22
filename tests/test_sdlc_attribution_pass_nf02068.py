@@ -225,9 +225,9 @@ def test_inverted_explaining_card_matches_the_old_loop(tmp_path, monkeypatch):
     walked: list[str] = []
     original = sdlc_attribution.AcceptedCatalog.holding_commit
 
-    def counting(self, card):
+    def counting(self, card, *, deadline=None):
         walked.append(card.task_id)
-        return original(self, card)
+        return original(self, card, deadline=deadline)
 
     monkeypatch.setattr(sdlc_attribution.AcceptedCatalog, "holding_commit", counting)
 

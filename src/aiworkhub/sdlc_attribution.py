@@ -31,6 +31,7 @@ call is an argument list; ``shell=True`` appears nowhere in this module.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -40,7 +41,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from . import needfix_store, task_store
 
@@ -62,7 +63,8 @@ class BudgetExceeded(Exception):
     """Raised mid-``attribute_needfix`` when the pass deadline has passed.
 
     The id must never reach ``pending_done``: it stays pending for the next
-    pass, exactly like an id the loop never started.
+    pass, exactly like an id the loop never started. :func:`first_holding_commit`
+    raises it too when its own walk outlives the deadline.
     """
 
 
@@ -88,6 +90,26 @@ GIT_ENV_BLOCKLIST = (
 #: is not a history that answered "no such commit", so they are typed apart.
 GIT_UNAVAILABLE = "git_unavailable"
 HASH_MISMATCH = "hash_mismatch"
+
+#: Holding-walk progress a :class:`HoldingWalkStore` records per
+#: ``(task_id, request_id, base_oid)`` (NF-2026-02342): the found holding commit,
+#: or the last descendant commit a walk fully examined without a match.
+WALK_FOUND = "found"
+WALK_THROUGH = "walked_through"
+
+
+class HoldingWalkStore(Protocol):
+    """Durable holding-commit walk progress, so a deadline-bounded walk converges.
+
+    ``read_walk`` answers ``(kind, commit)`` with ``kind`` one of
+    :data:`WALK_FOUND` / :data:`WALK_THROUGH`, or ``None`` when nothing is
+    recorded or the record is unreadable.
+    """
+
+    def read_walk(self, key: tuple[str, str, str]) -> tuple[str, str] | None: ...
+
+    def record_walk(self, key: tuple[str, str, str], kind: str, commit: str) -> None: ...
+
 
 MAX_TASK_CARDS = 5000
 MAX_NEEDFIX_ROWS = 5000
@@ -214,6 +236,18 @@ def commit_path_sha256(repo: Path, commit: str, path: str) -> str | None:
     return hashlib.sha256(blob).hexdigest()
 
 
+def commit_is_ancestor_of_head(repo: Path, commit: str) -> bool:
+    """True only when ``git merge-base --is-ancestor commit HEAD`` says so.
+
+    Any other answer -- not an ancestor, an unsafe name, an unreadable
+    history -- is False, so a caller re-walks rather than trusting a record.
+    """
+    if not safe_git_oid(commit):
+        return False
+    rc, _out = git_run(repo, "merge-base", "--is-ancestor", commit, "HEAD")
+    return rc == 0
+
+
 def first_holding_commit(
     repo: Path,
     base_oid: str,
@@ -221,6 +255,9 @@ def first_holding_commit(
     path_hashes: Mapping[str, str],
     *,
     path_sha256: Callable[[str, str], str | None] | None = None,
+    deadline: float | None = None,
+    resume_after: str | None = None,
+    on_walked: Callable[[str], None] | None = None,
 ) -> tuple[str | None, str]:
     """First canonical descendant of ``base_oid`` holding every promoted-path hash.
 
@@ -232,15 +269,35 @@ def first_holding_commit(
 
     ``path_sha256(commit, path)`` replaces :func:`commit_path_sha256` -- the
     ``AcceptedCatalog`` passes its per-pass memo -- and must answer identically.
+
+    NF-2026-02342, all three ``None`` by default (the unbounded walk from
+    ``base_oid``): ``deadline`` is a ``time.monotonic()`` value checked before
+    each (commit, path) lookup, and once it has passed :class:`BudgetExceeded`
+    is raised.
+    ``resume_after`` is a commit an earlier walk of the same receipt fully
+    examined without a match; while it is still in this walk's descendant list
+    (so still an ancestor of HEAD) the walk starts after it, otherwise from
+    ``base_oid``. ``on_walked(commit)`` is told, once, the last commit this walk
+    fully examined without a match when it ends in ``HASH_MISMATCH`` or
+    :class:`BudgetExceeded` having examined at least one commit; a failing
+    ``on_walked`` never replaces that outcome.
     """
     lookup = path_sha256 or (lambda commit, relative: commit_path_sha256(repo, commit, relative))
     commits = descendant_commits(repo, base_oid)
     if commits is None:
         return None, GIT_UNAVAILABLE
-    for commit in commits:
+    start = 0
+    if resume_after and resume_after in commits:
+        start = commits.index(resume_after) + 1
+    for position in range(start, len(commits)):
+        commit = commits[position]
         observed: dict[str, str] = {}
         missing = False
         for relative in paths:
+            if deadline is not None and time.monotonic() >= deadline:
+                if on_walked is not None and position > start:
+                    _record_walked(on_walked, commits[position - 1])
+                raise BudgetExceeded(base_oid)
             digest = lookup(commit, relative)
             if digest is None:
                 missing = True
@@ -250,7 +307,17 @@ def first_holding_commit(
             continue
         if observed == path_hashes:
             return commit, ""
+    if on_walked is not None and len(commits) > start:
+        _record_walked(on_walked, commits[-1])
     return None, HASH_MISMATCH
+
+
+def _record_walked(on_walked: Callable[[str], None], commit: str) -> None:
+    """Best-effort walk note: a store failure never replaces the walk's own outcome."""
+    try:
+        on_walked(commit)
+    except Exception:  # noqa: BLE001 - an injected store; the next pass re-walks from its older record
+        return
 
 
 def _digest(payload: Any) -> str:
@@ -490,12 +557,20 @@ class AcceptedCatalog:
     per-instance and bounded by the card count -- never a module-level cache.
     """
 
-    def __init__(self, repo: Path, cards: Sequence[AcceptedCard]) -> None:
+    def __init__(
+        self,
+        repo: Path,
+        cards: Sequence[AcceptedCard],
+        *,
+        walk_store: HoldingWalkStore | None = None,
+    ) -> None:
         self._repo = repo
         self._cards = tuple(cards)
         self._by_task = {card.task_id: card for card in self._cards}
         self._by_key = {card.key: card for card in self._cards}
         self._holding: dict[tuple[str, str], tuple[str | None, str]] = {}
+        # None keeps every walk in this pass's memory only (the pre-NF-02342 shape).
+        self._walk_store = walk_store
         # One catalog lives for one attribution pass; every holding-commit walk
         # and every blamed-commit lookup in that pass shares these bytes. Bounded
         # by MAX_PATH_SHA_MEMO, with hits/misses kept so the hit rate is measured.
@@ -525,19 +600,60 @@ class AcceptedCatalog:
             self._path_sha[key] = digest
         return digest
 
-    def holding_commit(self, card: AcceptedCard) -> tuple[str | None, str]:
-        """``first_holding_commit`` for ``card``, computed at most once."""
+    def use_walk_store(self, walk_store: HoldingWalkStore | None) -> None:
+        """Persist holding-commit walk progress through ``walk_store`` from now on."""
+        self._walk_store = walk_store
+
+    def holding_commit(
+        self, card: AcceptedCard, *, deadline: float | None = None,
+    ) -> tuple[str | None, str]:
+        """``first_holding_commit`` for ``card``, computed at most once per catalog.
+
+        ``deadline`` bounds the walk; an aborted walk raises
+        :class:`BudgetExceeded` and is never memoized as a result. With a walk
+        store (NF-2026-02342) a recorded found commit that is still an ancestor
+        of HEAD is the answer without a walk, a recorded walked-through commit
+        is where the walk resumes, and the store learns the found commit or the
+        last commit walked without a match. ``GIT_UNAVAILABLE`` is never
+        recorded: an unreadable history is not progress.
+        """
         memo = self._holding.get(card.key)
-        if memo is None:
-            memo = first_holding_commit(
-                self._repo, card.base_oid, card.promoted_paths, card.changed_path_hashes,
-                path_sha256=self.path_sha256,
-            )
-            self._holding[card.key] = memo
+        if memo is not None:
+            return memo
+        store = self._walk_store
+        walk_key = (card.task_id, card.request_id, card.base_oid)
+        resume_after: str | None = None
+        on_walked: Callable[[str], None] | None = None
+        if store is not None:
+            recorded = store.read_walk(walk_key)
+            if recorded is not None:
+                kind, recorded_commit = recorded
+                if kind == WALK_FOUND and commit_is_ancestor_of_head(self._repo, recorded_commit):
+                    memo = (recorded_commit, "")
+                    self._holding[card.key] = memo
+                    return memo
+                if kind == WALK_THROUGH:
+                    resume_after = recorded_commit
+            on_walked = functools.partial(store.record_walk, walk_key, WALK_THROUGH)
+        memo = first_holding_commit(
+            self._repo, card.base_oid, card.promoted_paths, card.changed_path_hashes,
+            path_sha256=self.path_sha256,
+            deadline=deadline,
+            resume_after=resume_after,
+            on_walked=on_walked,
+        )
+        if store is not None and memo[0] is not None:
+            _record_walked(functools.partial(store.record_walk, walk_key, WALK_FOUND), memo[0])
+        self._holding[card.key] = memo
         return memo
 
     def explaining_card(
-        self, path: str, commit: str, *, exclude: tuple[str, str]
+        self,
+        path: str,
+        commit: str,
+        *,
+        exclude: tuple[str, str],
+        deadline: float | None = None,
     ) -> AcceptedCard | None:
         """The accepted card that promoted ``path`` in exactly ``commit``.
 
@@ -565,7 +681,7 @@ class AcceptedCatalog:
                     return None
             if card.changed_path_hashes.get(path) != observed:
                 continue
-            if self.holding_commit(card)[0] == commit:
+            if self.holding_commit(card, deadline=deadline)[0] == commit:
                 return card
         return None
 
@@ -733,6 +849,7 @@ def attribute_needfix(
     blame work below -- the part that scales per blamed line -- is still
     running, :class:`BudgetExceeded` is raised and nothing is written; the
     caller leaves this id pending rather than marking it attributed or failed.
+    The same deadline bounds every holding-commit walk this call starts.
     """
     def _expired() -> bool:
         return deadline is not None and time.monotonic() >= deadline
@@ -762,7 +879,7 @@ def attribute_needfix(
         return _attribution(
             needfix_id, repository_id, UNKNOWN_NO_SOURCE_PATHS, fix_task_id=fix_task_id,
         )
-    fix_commit, failure = index.holding_commit(fix)
+    fix_commit, failure = index.holding_commit(fix, deadline=deadline)
     if fix_commit is None:
         return _attribution(
             needfix_id,
@@ -796,10 +913,13 @@ def attribute_needfix(
                 )
             for commit in blamed:
                 # explaining_card can walk a candidate's history (git per commit
-                # on a memo miss), so the budget is re-checked per blamed line.
+                # on a memo miss), so the budget is re-checked per blamed line
+                # and reaches that walk too (NF-2026-02342).
                 if _expired():
                     raise BudgetExceeded(needfix_id)
-                cause = index.explaining_card(path, commit, exclude=fix.key)
+                cause = index.explaining_card(
+                    path, commit, exclude=fix.key, deadline=deadline,
+                )
                 if cause is None:
                     unexplained += 1
                 else:

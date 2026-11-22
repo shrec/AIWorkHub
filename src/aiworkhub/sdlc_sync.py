@@ -319,6 +319,67 @@ def _write_state(
         conn.close()
 
 
+class HoldingWalkStore:
+    """``sdlc_attribution.HoldingWalkStore`` over this module's state DB (NF-2026-02342).
+
+    One row per ``(task_id, request_id, base_oid)``: the found holding commit or
+    the last descendant commit a walk examined without a match. Reads use a
+    read-only connection; each record is its own short IMMEDIATE transaction in
+    this process, against this file only -- never the task DB.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def read_walk(self, key: tuple[str, str, str]) -> tuple[str, str] | None:
+        if not self._path.is_file():
+            return None
+        try:
+            conn = connect_readonly(self._path)
+        except (sqlite3.Error, OSError):
+            return None  # unreadable store: the walk starts from base_oid
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT kind, commit_oid FROM holding_walk "
+                    "WHERE task_id=? AND request_id=? AND base_oid=?",
+                    tuple(key),
+                ).fetchone()
+            except sqlite3.Error:
+                return None  # no table yet, or not a database: nothing recorded
+        finally:
+            conn.close()
+        return None if row is None else (str(row[0]), str(row[1]))
+
+    def record_walk(self, key: tuple[str, str, str], kind: str, commit: str) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sdlc_case_store.connect_writer(self._path)
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS holding_walk ("
+                    "task_id TEXT NOT NULL, request_id TEXT NOT NULL, base_oid TEXT NOT NULL, "
+                    "kind TEXT NOT NULL, commit_oid TEXT NOT NULL, "
+                    "PRIMARY KEY (task_id, request_id, base_oid))"
+                )
+                conn.execute(
+                    "INSERT INTO holding_walk(task_id, request_id, base_oid, kind, commit_oid) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(task_id, request_id, base_oid) DO UPDATE SET "
+                    "kind=excluded.kind, commit_oid=excluded.commit_oid "
+                    "WHERE kind != excluded.kind OR commit_oid != excluded.commit_oid",
+                    (*key, kind, commit),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+
+
 def _read_stages_resume(path: Path) -> dict[str, Any]:
     """The stages resume marker a deferred pass left: ``{"last", "task_id", "transient"}``, or {}.
 
@@ -712,6 +773,10 @@ def sync_once(
             None if _expired()
             else sdlc_attribution.load_accepted_catalog(root, repository_id, deadline=deadline)
         )
+        if isinstance(catalog, sdlc_attribution.AcceptedCatalog):
+            # NF-2026-02342: a holding-commit walk the deadline cut short resumes
+            # next pass from the progress this state DB recorded.
+            catalog.use_walk_store(HoldingWalkStore(state_path))
         remaining = 0
         if catalog is None:
             remaining = len(pending)

@@ -168,7 +168,10 @@ def git_spies(monkeypatch):
         holding=[], blame=0, writes=[], blame_cost=0.0, clock=None,
     )
 
-    def first_holding_commit(_repo, _base, _paths, hashes, *, path_sha256):
+    def first_holding_commit(
+        _repo, _base, _paths, hashes, *, path_sha256,
+        deadline=None, resume_after=None, on_walked=None,
+    ):
         spent.holding.append(tuple(hashes.values()))
         return (FIX_COMMIT if "h-fix" in hashes.values() else CAUSE_COMMIT), ""
 
