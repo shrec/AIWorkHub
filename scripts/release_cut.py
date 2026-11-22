@@ -49,8 +49,10 @@ The cut:
                   fails again stops the cut. It runs the test-impact selection
                   (aiworkhub.test_impact_select) from the last v* tag on HEAD's
                   first parent to the working tree, plus the invariant tests
-                  and every changed test file, when the recorded map is fresh
-                  for every changed path; otherwise, or with --full-suite, a
+                  and every changed test file, when the recorded map records
+                  every changed path as it is now or was at that tag, the
+                  release documents and the bump's rewrites excepted
+                  (_impact_targets); otherwise, or with --full-suite, a
                   full_suite_required token in the CHANGELOG [VERSION] notes,
                   no previous tag, or a selector that raises or answers
                   full_suite_required, the whole tests directory; only that
@@ -724,7 +726,8 @@ class Host:
     env: Mapping[str, str]
     is_windows: bool
     out: Callable[[str], None]
-    # aiworkhub.test_impact_select.select_tests(root, base) unless a test injects another.
+    # Asked (root, base) when a test injects one; else test_impact_select.select_tests,
+    # which also takes the pathspec _impact_targets scopes the diff with.
     impact_selector: Callable[[Path, str], Any] | None = None
 
     @classmethod
@@ -1299,7 +1302,7 @@ class ReleaseCut:
             "metadata_check": f"release_metadata.check --tag {self.tag}",
             "host_tests": f"{shlex.join(self._host_test_argv())}; {FULL_SUITE_TARGET} narrows to "
             "the test-impact selection since the last v* tag, the same for wsl_tests, when the "
-            "map is fresh for every changed path and neither --full-suite nor the CHANGELOG "
+            "map vouches for every changed path and neither --full-suite nor the CHANGELOG "
             f"notes' {FULL_SUITE_MARKER} asks for everything; only a whole-suite run loads "
             f"-p {TEST_IMPACT_RECORDER_PLUGIN}, which records the map the next cut narrows with",
             "package": shlex.join(self._package_argv()),
@@ -1432,8 +1435,8 @@ class ReleaseCut:
         """Set the one target list the host and the WSL suite both run, and record why.
 
         The test-impact selection since the last release tag (``impact_map``) when the
-        map is fresh for every path changed since that tag; otherwise the whole
-        ``tests`` directory (``full_suite``) with the named reason. An unknown never
+        map vouches for every path changed since that tag (``_impact_targets``); otherwise
+        the whole ``tests`` directory (``full_suite``) with the named reason. An unknown never
         selects less: every miss, raise or full-suite answer falls back.
         """
 
@@ -1503,52 +1506,68 @@ class ReleaseCut:
     def _impact_targets(self, base: str) -> tuple[tuple[str, ...], str]:
         """The selector's tests for ``base`` to the working tree plus the invariants.
 
+        A whole-suite cut records the map, so the map normally describes a release tag's
+        tree and records a path changed since then as ``base`` holds it (NF-2026-02335).
+        A changed non-test path therefore keeps the map's edges when the map records it as
+        the working tree or as ``base`` holds it. Two kinds of changed path need less:
+
+        * a release document holds no code, so its map state is not asked; the selector
+          still picks the tests that read it;
+        * a file the version bump rewrites may be unmapped, or recorded as HEAD holds it,
+          or recorded as anything when the bump is its only change since ``base`` (HEAD
+          holds ``base``'s bytes; the worktree step found it clean before the bump).
+
         Returns ``(tests, "")``, or ``((), reason)`` when the map is missing, does not
-        record a changed path, records a changed path stale (a file the version bump
-        rewrites is accepted when HEAD's bytes match the map; no other path is), or
-        records any other non-test path stale. The selection always adds every
+        record or records stale any other changed path, or records an unchanged non-test
+        path stale. The selection always adds every
         ``accept_neighbour_tests.INVARIANT_TESTS`` file (the module size ratchet among
         them) and every changed test file; argv folding and the per-entry checks are
         that module's ``_impact_tests``.
         """
 
         neighbours, impact = _impact_modules()
-        selector = self.host.impact_selector or impact.select_tests
-        result = selector(self.root, base)
+        generated = self._generated_files()
+        at_head = self._blob_digests(impact, "HEAD", generated)
+        at_base = self._blob_digests(impact, base, generated)
+        bump_only = {path for path, digest in at_head.items() if at_base.get(path) == digest}
+        # The version literal is module-level code and tests/conftest.py imports aiworkhub,
+        # so the selector would answer the bump alone with every test file. When the bump
+        # is that file's only change, it stays out of the diff the selector reads; the
+        # projections stay in, and with them the tests that read the version from those.
+        version_file = release_metadata.CANONICAL_VERSION_FILE
+        diff_paths = (".", f":(exclude){version_file}") if version_file in bump_only else ()
+        if self.host.impact_selector is not None:
+            result = self.host.impact_selector(self.root, base)
+        else:
+            result = impact.select_tests(self.root, base, paths=diff_paths)
         if result.full_suite_required:
             return (), "selector_full_suite:" + ";".join(result.full_suite_reasons)
         payload, problem = impact.load_map(impact.map_directory(self.root) / impact.MAP_FILE_NAME)
         digests = payload.get("digests") if payload is not None else None
         if not isinstance(digests, Mapping):
             return (), f"impact_map_unavailable:{problem or 'map_schema_mismatch'}"
-        changed = sorted(set(result.changed_paths))
-        # A changed test file runs whole whatever the map records of it, so only the
-        # other changed paths need the map's edges.
+        # The bump changed each of its files, also the one left out of the selector's diff.
+        changed = sorted({*result.changed_paths, *bump_only})
+        # A changed test file runs whole whatever the map records of it and a release
+        # document holds no code, so only the other changed paths need the map's edges.
         states = {
             path: neighbours._map_state(self.root, digests, path)
             for path in changed
-            if not impact.is_test_module(path)
+            if not impact.is_test_module(path) and path not in release_metadata.RELEASE_DOCUMENTS
         }
-        unmapped = [path for path, state in states.items() if state == "unmapped"]
+        unmapped = [
+            path for path, state in states.items() if state == "unmapped" and path not in generated
+        ]
         if unmapped:
             return (), f"impact_map_unmapped:{unmapped[0]}"
-        stale = [path for path, state in states.items() if state]
-        # Only the files the version bump rewrites may be accepted on a HEAD digest
-        # match; any other stale changed path means the map predates its bytes.
-        generated = set(self._generated_files())
-        relaxable = [path for path in stale if path in generated]
-        if relaxable:
-            try:
-                at_head = impact.read_blobs(self.root, "HEAD", relaxable)
-            except Exception:  # HEAD unreadable: the working tree's answer stands
-                at_head = {}
-            stale = [
-                path
-                for path in stale
-                if path not in generated
-                or at_head.get(path) is None
-                or impact.content_digest(at_head[path]) != digests[path]
-            ]
+        stale = [path for path, state in states.items() if state not in ("", "unmapped")]
+        at_base.update(self._blob_digests(impact, base, stale))
+        # at_head holds generated files only: no other path is accepted on a HEAD match.
+        stale = [
+            path
+            for path in stale
+            if path not in bump_only and digests[path] not in (at_base.get(path), at_head.get(path))
+        ]
         if stale:
             return (), f"impact_map_stale:{stale[0]}"
         for path in sorted(set(digests) - set(changed)):
@@ -1563,6 +1582,17 @@ class ReleaseCut:
             if impact.is_test_module(path) and (self.root / path).is_file():
                 entries.setdefault(path, ("changed_test",))
         return neighbours._impact_tests(self.root, entries, ())
+
+    def _blob_digests(self, impact: ModuleType, rev: str, paths: Sequence[str]) -> dict[str, str]:
+        """The map's digest of each path's blob at ``rev``; a path without a blob has none."""
+
+        try:
+            blobs = impact.read_blobs(self.root, rev, paths)
+        except Exception:  # an unreadable rev relaxes nothing: the working tree's answer stands
+            return {}
+        return {
+            path: impact.content_digest(data) for path, data in blobs.items() if data is not None
+        }
 
     def _step_host_tests(self) -> str:
         self.scratch.mkdir(parents=True, exist_ok=True)

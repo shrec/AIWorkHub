@@ -1843,17 +1843,22 @@ def test_only_the_whole_suite_host_run_loads_the_test_impact_recorder(tmp_path: 
     assert RECORDER_PLUGIN not in plan["wsl_tests"]
 
 
-def _head_blobs(
-    monkeypatch: pytest.MonkeyPatch, blobs: dict[str, bytes]
+def _git_blobs(
+    monkeypatch: pytest.MonkeyPatch, revs: dict[str, dict[str, bytes]]
 ) -> list[tuple[str, tuple[str, ...]]]:
-    """Answer ``read_blobs(root, rev, paths)`` from ``blobs``; returns the recorded calls."""
+    """Answer ``read_blobs(root, rev, paths)`` from ``revs``; returns the recorded calls.
+
+    A path its rev does not list has no blob there; a rev not listed cannot be read.
+    """
 
     _, impact = release_cut._impact_modules()
     calls: list[tuple[str, tuple[str, ...]]] = []
 
     def read_blobs(_root: Path, rev: str, paths: Sequence[str]) -> dict[str, bytes | None]:
         calls.append((rev, tuple(paths)))
-        return {path: blobs.get(path) for path in paths}
+        if rev not in revs:
+            raise impact.SelectionError(f"git_failed:cat-file:128:{rev}")
+        return {path: revs[rev].get(path) for path in paths}
 
     monkeypatch.setattr(impact, "read_blobs", read_blobs)
     return calls
@@ -1877,13 +1882,14 @@ def test_a_stale_non_generated_path_matching_head_still_runs_the_whole_suite(
     recorded = (root / IMPACT_MODULE).read_bytes()
     _write(root / IMPACT_MODULE, "def alpha():\n    return 2\n")
     # HEAD holds exactly the bytes the map recorded: only generated files may use that.
-    calls = _head_blobs(monkeypatch, {IMPACT_MODULE: recorded})
+    revs = {IMPACT_BASE: {IMPACT_MODULE: b"at the tag\n"}, "HEAD": {IMPACT_MODULE: recorded}}
+    calls = _git_blobs(monkeypatch, revs)
 
     code, summary, _, runner = _cut(root, runner=_tagged(root), selector=FakeSelector(_selection()))
 
     assert code == 0, summary["reason"]
     _full_suite_with(summary, runner, f"impact_map_stale:{IMPACT_MODULE}")
-    assert all(IMPACT_MODULE not in paths for _, paths in calls)
+    assert all(IMPACT_MODULE not in paths for rev, paths in calls if rev == "HEAD")
 
 
 def test_a_generated_file_the_bump_rewrote_keeps_the_impact_lane_on_a_head_match(
@@ -1897,7 +1903,9 @@ def test_a_generated_file_the_bump_rewrote_keeps_the_impact_lane_on_a_head_match
     payload = json.loads(map_file.read_text(encoding="utf-8"))
     payload["digests"][generated] = impact.content_digest(before_bump)
     _write(map_file, json.dumps(payload))
-    calls = _head_blobs(monkeypatch, {generated: before_bump})
+    # Edited since the tag, so neither the bump alone nor the base's bytes can relax it.
+    revs = {IMPACT_BASE: {generated: b"at the tag\n"}, "HEAD": {generated: before_bump}}
+    calls = _git_blobs(monkeypatch, revs)
     selector = FakeSelector(_selection(changed=(IMPACT_MODULE, generated)))
 
     code, summary, _, runner = _cut(root, runner=_tagged(root), selector=selector)
@@ -1905,7 +1913,7 @@ def test_a_generated_file_the_bump_rewrote_keeps_the_impact_lane_on_a_head_match
     assert code == 0, summary["reason"]
     # The bump rewrote the file in the working tree, so only HEAD's bytes could match.
     assert (root / generated).read_bytes() != before_bump
-    assert calls == [("HEAD", (generated,))]
+    assert ("HEAD", tuple(BUMPED)) in calls
     host, wsl = _suite_targets(runner)
     assert host == wsl and RATCHET in host and "tests" not in host
     assert summary["test_selection"]["lane"] == "impact_map"
@@ -1922,7 +1930,9 @@ def test_a_generated_file_whose_head_bytes_differ_from_the_map_runs_the_whole_su
     payload = json.loads(map_file.read_text(encoding="utf-8"))
     payload["digests"][generated] = impact.content_digest(b"recorded elsewhere\n")
     _write(map_file, json.dumps(payload))
-    _head_blobs(monkeypatch, {generated: (root / generated).read_bytes()})
+    # Edited since the tag, so not the bump alone, and the map holds neither version.
+    at_head = {generated: (root / generated).read_bytes()}
+    _git_blobs(monkeypatch, {IMPACT_BASE: {generated: b"at the tag\n"}, "HEAD": at_head})
     selector = FakeSelector(_selection(changed=(IMPACT_MODULE, generated)))
 
     code, summary, _, runner = _cut(root, runner=_tagged(root), selector=selector)
@@ -1948,6 +1958,225 @@ def test_an_unchanged_mapped_file_with_other_bytes_runs_the_whole_suite(
 
     assert code == 0, summary["reason"]
     _full_suite_with(summary, runner, f"impact_map_stale_dependency:{dependency}")
+
+
+# -- the map describes the last tag, which every real release changes (NF-2026-02335) ---
+
+
+def _record(root: Path, path: str, data: bytes | None) -> None:
+    """Make the map record ``path`` with ``data``'s digest; None is an absent file's."""
+
+    _, impact = release_cut._impact_modules()
+    map_file = impact.map_directory(root) / impact.MAP_FILE_NAME
+    payload = json.loads(map_file.read_text(encoding="utf-8"))
+    payload["digests"][path] = impact.content_digest(data)
+    _write(map_file, json.dumps(payload))
+
+
+def _narrowed_with(summary: dict[str, Any], runner: FakeRunner) -> None:
+    neighbours, _ = release_cut._impact_modules()
+    host, wsl = _suite_targets(runner)
+    assert summary["test_selection"]["fallback_reason"] is None
+    assert summary["test_selection"]["lane"] == "impact_map"
+    assert host == wsl and set(host) == {IMPACT_NODE, *neighbours.INVARIANT_TESTS}
+
+
+@pytest.mark.parametrize("now", ["def alpha():\n    return 2\n", None], ids=["edited", "deleted"])
+def test_a_changed_path_the_map_records_as_the_base_tag_holds_it_narrows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: str | None
+) -> None:
+    root = _impact_repo(tmp_path)
+    at_tag = (root / IMPACT_MODULE).read_bytes()
+    if now is None:
+        (root / IMPACT_MODULE).unlink()
+    else:
+        _write(root / IMPACT_MODULE, now)
+    # The map's digest ignores line endings, so the tag's blob may differ in those.
+    crlf = at_tag.replace(b"\n", b"\r\n")
+    calls = _git_blobs(monkeypatch, {IMPACT_BASE: {IMPACT_MODULE: crlf}, "HEAD": {}})
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=FakeSelector(_selection()))
+
+    assert code == 0, summary["reason"]
+    _narrowed_with(summary, runner)
+    assert (IMPACT_BASE, (IMPACT_MODULE,)) in calls
+
+
+@pytest.mark.parametrize(
+    ("recorded", "revs"),
+    [
+        (
+            b"recorded\n",
+            {IMPACT_BASE: {IMPACT_MODULE: b"at the tag\n"}, "HEAD": {IMPACT_MODULE: b"at HEAD\n"}},
+        ),
+        (b"recorded\n", {}),
+        # No blob at the tag is no match, also for a path the map recorded as absent.
+        (None, {IMPACT_BASE: {}, "HEAD": {}}),
+    ],
+    ids=["neither_base_nor_head", "base_unreadable", "no_blob_at_base"],
+)
+def test_a_changed_path_matching_neither_base_nor_head_runs_the_whole_suite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded: bytes | None,
+    revs: dict[str, dict[str, bytes]],
+) -> None:
+    root = _impact_repo(tmp_path)
+    _record(root, IMPACT_MODULE, recorded)
+    _git_blobs(monkeypatch, revs)
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=FakeSelector(_selection()))
+
+    assert code == 0, summary["reason"]
+    _full_suite_with(summary, runner, f"impact_map_stale:{IMPACT_MODULE}")
+
+
+@pytest.mark.parametrize("generated", sorted(BUMPED))
+def test_an_unmapped_file_the_bump_rewrote_does_not_force_the_whole_suite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generated: str
+) -> None:
+    root = _impact_repo(tmp_path)
+    _git_blobs(monkeypatch, {})  # no rev is readable: being a bumped file is enough
+    selector = FakeSelector(_selection(changed=(IMPACT_MODULE, generated)))
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=selector)
+
+    assert code == 0, summary["reason"]
+    _narrowed_with(summary, runner)
+
+
+def test_files_only_the_bump_changed_do_not_force_the_whole_suite_under_an_older_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _impact_repo(tmp_path)
+    at_tag = {path: (root / path).read_bytes() for path in BUMPED}
+    # A narrowed cut records no map, so this one is a tag older than the base.
+    for path in BUMPED:
+        _record(root, path, b"recorded one tag earlier\n")
+    _git_blobs(monkeypatch, {IMPACT_BASE: at_tag, "HEAD": at_tag})
+    selector = FakeSelector(_selection(changed=(IMPACT_MODULE, *BUMPED)))
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=selector)
+
+    assert code == 0, summary["reason"]
+    _narrowed_with(summary, runner)
+
+
+@pytest.mark.parametrize("edited", [False, True], ids=["bump_alone", "edited_since_the_tag"])
+def test_only_a_bump_alone_leaves_the_version_file_out_of_the_selectors_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, edited: bool
+) -> None:
+    root = _impact_repo(tmp_path)
+    _, impact = release_cut._impact_modules()
+    version_file = release_metadata.CANONICAL_VERSION_FILE
+    at_head = (root / version_file).read_bytes()
+    at_tag = b"before a commit edited it\n" if edited else at_head
+    _record(root, version_file, at_head)
+    _git_blobs(monkeypatch, {IMPACT_BASE: {version_file: at_tag}, "HEAD": {version_file: at_head}})
+    asked: list[tuple[str, ...]] = []
+
+    def select_tests(_root: Path, _base: str, *, paths: Sequence[str] = ()) -> Any:
+        asked.append(tuple(paths))
+        return _selection(changed=(IMPACT_MODULE, *(() if paths else (version_file,))))
+
+    monkeypatch.setattr(impact, "select_tests", select_tests)
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root))
+
+    assert code == 0, summary["reason"]
+    assert asked == [() if edited else (".", f":(exclude){version_file}")]
+    # Left out of the diff, it still counts as changed and is no stale dependency.
+    _narrowed_with(summary, runner)
+
+
+@pytest.mark.parametrize("mapped", [True, False], ids=["stale", "unmapped"])
+@pytest.mark.parametrize("document", sorted(release_metadata.RELEASE_DOCUMENTS))
+def test_a_changed_release_document_does_not_force_the_whole_suite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, document: str, mapped: bool
+) -> None:
+    root = _impact_repo(tmp_path)
+    if mapped:
+        _record(root, document, b"recorded before the release notes\n")
+    _git_blobs(monkeypatch, {})
+    selector = FakeSelector(_selection(changed=(IMPACT_MODULE, document)))
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=selector)
+
+    assert code == 0, summary["reason"]
+    _narrowed_with(summary, runner)
+
+
+def test_an_unchanged_stale_release_document_is_still_a_stale_dependency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _impact_repo(tmp_path)
+    document = sorted(release_metadata.RELEASE_DOCUMENTS)[0]
+    _record(root, document, b"recorded elsewhere\n")
+    _git_blobs(monkeypatch, {})
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root), selector=FakeSelector(_selection()))
+
+    assert code == 0, summary["reason"]
+    _full_suite_with(summary, runner, f"impact_map_stale_dependency:{document}")
+
+
+def test_a_real_release_diff_narrows_past_the_bump_and_the_release_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real selector over real git: a map of the tag, then code, notes and the bump.
+
+    tests/conftest.py imports aiworkhub, whose package imports _version, so with the
+    bump's literal in its diff the selector picks every test file, the unrelated one too.
+    """
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not on PATH")
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        monkeypatch.delenv(key, raising=False)
+    root = _impact_repo(tmp_path)
+    _, impact = release_cut._impact_modules()
+    unrelated = "tests/test_unrelated.py"
+    _write(root / unrelated, "def test_unrelated():\n    pass\n")
+    _write(root / "src" / "aiworkhub" / "__init__.py", "from ._version import __version__\n")
+    _write(root / "tests" / "conftest.py", "def seat():\n    from aiworkhub import alpha\n")
+    _write(root / ".gitignore", ".aiworkhub/\n.scratch/\n")
+
+    def git(*args: str) -> None:
+        identity = ("-c", "user.name=release", "-c", "user.email=release@localhost")
+        unsigned = ("-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false")
+        settings = (*unsigned, "-c", "core.autocrlf=false")
+        argv = ["git", *identity, *settings, *args]
+        done = release_cut.run_subprocess(argv, cwd=root, timeout=120)
+        assert done.returncode == 0, done.output
+
+    git("init", "--quiet")
+    git("add", "-A")
+    git("commit", "--quiet", "-m", "the tagged release")
+    git("tag", IMPACT_BASE)
+    row = {"reads": [], "children": [], "incomplete": 0}
+    recorded = (IMPACT_MODULE, IMPACT_TEST, unrelated, "README.md", "server.json")
+    payload = {
+        "schema_id": impact.SCHEMA_ID,
+        "objects": [f"{IMPACT_MODULE}::alpha"],
+        "tests": {
+            IMPACT_NODE: {**row, "file": IMPACT_TEST, "code": [0]},
+            f"{unrelated}::test_unrelated": {**row, "file": unrelated, "code": []},
+        },
+        "digests": {path: impact.content_digest((root / path).read_bytes()) for path in recorded},
+        "import_time": [],
+        "import_reads": {},
+    }
+    _write(impact.map_directory(root) / impact.MAP_FILE_NAME, json.dumps(payload))
+    _write(root / IMPACT_MODULE, "def alpha():\n    return 2\n")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    _write(root / "README.md", f"{readme}- A faster cut.\n")
+    git("add", "-A")
+    git("commit", "--quiet", "-m", "what the release changes")
+
+    code, summary, _, runner = _cut(root, runner=_tagged(root))
+
+    assert code == 0, summary["reason"]
+    _narrowed_with(summary, runner)
 
 
 # -- a stuck test fails instead of hanging the cut (NF-2026-02297) ----------------------
