@@ -102,3 +102,54 @@ def test_auto_mine_and_propose_never_raises_on_a_forced_mining_exception(tmp_pat
     assert result["refused_by_reason"]["mining"].startswith("recipe_mining_failed:")
     assert isinstance(result["elapsed_ms"], (int, float))
     assert tool_recipes_store.list_proposals(root) == []
+
+
+def test_mining_digests_gate_an_unchanged_rerun(tmp_path):
+    """NF-2026-02366: the learning-commit background run skips a mine whose
+    input and state digests are unchanged. The input digest moves with the
+    accepted-card corpus; the state digest settles after a proposing run and
+    is NOT moved by ``put_proposal`` rewriting ``updated_at`` on an
+    ``already_proposed`` rerun."""
+    root = _repo(tmp_path)
+    _seed_cluster(root, count=3)
+    input_before = recipe_miner.mining_input_digest(root)
+    state_before = recipe_miner.mining_state_digest(root)
+
+    recipe_miner.auto_mine_and_propose(root)
+    assert recipe_miner.mining_input_digest(root) == input_before
+    state_after_propose = recipe_miner.mining_state_digest(root)
+    assert state_after_propose != state_before
+
+    again = recipe_miner.auto_mine_and_propose(root)
+    assert again["already_proposed"] != []
+    assert recipe_miner.mining_state_digest(root) == state_after_propose
+
+    _accepted_card(
+        root, task_id="card-d", runner="runner0",
+        validation=["node --check vscode-extension/d.js"],
+    )
+    assert recipe_miner.mining_input_digest(root) != input_before
+
+
+def test_learning_commit_reply_schedules_recipe_mining_off_the_reply_path(tmp_path, monkeypatch):
+    from aiworkhub import core, manager_ai_tools
+
+    root = _repo(tmp_path)
+    _seed_cluster(root, count=3)
+    monkeypatch.setattr(
+        manager_ai_tools, "_mining_kinds",
+        lambda: (("recipe_mining", recipe_miner, recipe_miner.auto_mine_and_propose),),
+    )
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    reply = manager_ai_tools.schedule_learning_mining(root)
+    assert reply["recipe_mining"]["state"] == "scheduled"
+    waited = manager_ai_tools.wait_for_learning_mining(root, timeout=60)
+    assert waited["idle"] is True
+    assert waited["recipe_mining"]["state"] == "completed"
+    assert len(waited["recipe_mining"]["result"]["proposed"]) == 1
+
+    manager_ai_tools.schedule_learning_mining(root)
+    second = manager_ai_tools.wait_for_learning_mining(root, timeout=60)
+    assert second["recipe_mining"]["state"] == "skipped_unchanged"
+    assert len(tool_recipes_store.list_proposals(root)) == 1

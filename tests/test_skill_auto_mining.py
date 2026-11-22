@@ -179,6 +179,15 @@ def manager(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _drain_learning_mining(monkeypatch):
+    """NF-2026-02366: accepted commits schedule background mining. Depending on
+    ``monkeypatch`` makes this teardown run BEFORE the manager route is undone,
+    so no mining thread outlives the test's fixtures."""
+    yield
+    assert manager_ai_tools.wait_for_learning_mining(timeout=60)["idle"]
+
+
 def _seed_cluster(manager, *, count=3):
     """Three (or more) cards whose review feedback is one rule family, each
     on its own file under a shared directory and with a complete selection
@@ -276,6 +285,14 @@ def test_confidence_is_deterministic_and_bounded():
 # ---------------------------------------------------------------------------
 
 
+def _mined(manager) -> dict:
+    """NF-2026-02366: the accept reply only schedules mining; this waits for
+    the background run and returns its skill-mining outcome."""
+    waited = manager_ai_tools.wait_for_learning_mining(manager, timeout=60)
+    assert waited["idle"] is True
+    return waited["skill_mining"]
+
+
 def test_hook_proposes_new_complete_candidates_after_accepted_commit(manager):
     _seed_cluster(manager, count=3)
 
@@ -283,7 +300,10 @@ def test_hook_proposes_new_complete_candidates_after_accepted_commit(manager):
                       idempotency_key="trigger-key-1")
 
     assert result["ok"] is True
-    mining = result["skill_mining"]
+    assert result["skill_mining"]["state"] == "scheduled"
+    outcome = _mined(manager)
+    assert outcome["state"] == "completed"
+    mining = outcome["result"]
     assert set(mining) == {
         "candidates", "proposed", "already_proposed", "refused_by_reason", "elapsed_ms",
     }
@@ -298,10 +318,11 @@ def test_hook_proposes_new_complete_candidates_after_accepted_commit(manager):
 
 def test_remining_after_a_new_member_reports_already_proposed(manager):
     _seed_cluster(manager, count=3)
-    first = _accept(manager, task_id="TRIGGER-A", request_id="req-a",
-                     idempotency_key="trigger-key-a")
-    assert len(first["skill_mining"]["proposed"]) == 1
-    identity = first["skill_mining"]["proposed"][0]
+    _accept(manager, task_id="TRIGGER-A", request_id="req-a",
+            idempotency_key="trigger-key-a")
+    first = _mined(manager)["result"]
+    assert len(first["proposed"]) == 1
+    identity = first["proposed"][0]
 
     # A 4th member joins the same rule family after the first proposal.
     seed_card(
@@ -312,27 +333,91 @@ def test_remining_after_a_new_member_reports_already_proposed(manager):
     assert len(second_report["candidates"]) == 1
     assert second_report["candidates"][0]["candidate_id"] == identity
 
-    second = _accept(manager, task_id="TRIGGER-B", request_id="req-b",
-                      idempotency_key="trigger-key-b")
-    assert second["skill_mining"]["proposed"] == []
-    assert identity in second["skill_mining"]["already_proposed"]
+    _accept(manager, task_id="TRIGGER-B", request_id="req-b",
+            idempotency_key="trigger-key-b")
+    second = _mined(manager)
+    # The new member changed the mining input digest, so the family re-mines.
+    assert second["state"] == "completed"
+    assert second["result"]["proposed"] == []
+    assert identity in second["result"]["already_proposed"]
 
     matching = [r for r in store.load_registry(manager).records() if r.identity == identity]
     assert len(matching) == 1
 
 
-def test_hook_run_twice_for_the_same_commit_proposes_nothing_new(manager):
+def test_hook_run_twice_for_the_same_commit_skips_the_unchanged_mine(manager, monkeypatch):
     _seed_cluster(manager, count=3)
 
     def _run():
         return _accept(manager, task_id="TRIGGER-C", request_id="req-c",
                         idempotency_key="trigger-key-c")
 
-    first = _run()
-    assert len(first["skill_mining"]["proposed"]) == 1
-    identity = first["skill_mining"]["proposed"][0]
+    _run()
+    first = _mined(manager)
+    assert len(first["result"]["proposed"]) == 1
+    identity = first["result"]["proposed"][0]
 
+    def _forbidden(*_args, **_kwargs):
+        pytest.fail("an unchanged mining input digest must not re-mine")
+
+    monkeypatch.setattr(skill_miner, "mine", _forbidden)
     second = _run()
     assert second["idempotent"] is True
-    assert second["skill_mining"]["proposed"] == []
-    assert identity in second["skill_mining"]["already_proposed"]
+    assert second["skill_mining"]["previous_state"] == "completed"
+    outcome = _mined(manager)
+    assert outcome["state"] == "skipped_unchanged"
+    assert outcome["result"]["proposed"] == [identity]
+
+    matching = [r for r in store.load_registry(manager).records() if r.identity == identity]
+    assert len(matching) == 1
+
+
+def test_stored_member_without_selection_context_is_named_not_blamed_on_the_store(
+    manager, monkeypatch
+):
+    """NF-2026-02366: a member card the store DOES hold but that derives no
+    selection context used to be reported ``member_cards_not_in_store``.
+    Each unresolved cause is now named, with the card ids, separately.
+    """
+    from aiworkhub import project_context
+
+    _seed_cluster(manager)
+    monkeypatch.setattr(project_context, "_skill_selection_context", lambda _card: None)
+
+    candidate = skill_miner.mine(manager)["candidates"][0]
+
+    assert candidate["draft_incomplete"] == ["member_cards_without_selection_context"]
+    resolution = candidate["member_resolution"]
+    assert set(resolution) == {skill_miner.MEMBER_NO_SELECTION_CONTEXT}
+    assert resolution[skill_miner.MEMBER_NO_SELECTION_CONTEXT]["count"] == 3
+
+
+def test_absent_members_are_counted_by_cause(manager, monkeypatch):
+    _seed_cluster(manager)
+    monkeypatch.setattr(task_store, "get_task", lambda *_args, **_kwargs: None)
+
+    candidate = skill_miner.mine(manager)["candidates"][0]
+
+    assert candidate["member_resolution"] == {
+        skill_miner.MEMBER_ABSENT: {
+            "count": 3, "card_ids": ["auto0", "auto1", "auto2"],
+        },
+    }
+
+
+def test_mining_input_digest_tracks_members_and_ignores_unrelated_accepts(manager):
+    _seed_cluster(manager, count=3)
+    before = skill_miner.mining_input_digest(manager)
+    assert skill_miner.mining_input_digest(manager) == before
+
+    # An accepted card outside the correction record is not a mining input.
+    _seed_accepted_card(manager, task_id="UNRELATED-1", request_id="req-unrelated-1")
+    assert skill_miner.mining_input_digest(manager) == before
+
+    seed_card(
+        manager, "auto3", runner="worker1", paths=["src/aiworkhub/shared_3.py"],
+        instruction=f"{RULE} seen in round 3",
+    )
+    assert skill_miner.mining_input_digest(manager) != before
+
+

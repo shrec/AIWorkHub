@@ -505,37 +505,92 @@ MAX_PROCEDURE_STEPS = 8
 MAX_AVOID_RULES = 6
 
 
+MEMBER_ABSENT = "absent"
+MEMBER_UNREADABLE = "unreadable"
+MEMBER_NO_SELECTION_CONTEXT = "no_selection_context"
+
+# NF-2026-02366: one ``draft_incomplete`` code per measured member cause, in
+# this fixed order. Before this table every unresolved member -- a card the
+# store does not hold, a card whose read raised, and a card that IS stored but
+# derives no selection context -- was reported as ``member_cards_not_in_store``,
+# so the field could not tell which of the three it was looking at.
+_MEMBER_CAUSE_CODES = (
+    (MEMBER_ABSENT, "member_cards_not_in_store"),
+    (MEMBER_UNREADABLE, "member_cards_unreadable"),
+    (MEMBER_NO_SELECTION_CONTEXT, "member_cards_without_selection_context"),
+)
+MAX_UNRESOLVED_MEMBER_IDS = 20
+
+
+def _member_resolution(
+    card: Any,
+) -> tuple[str, dict[str, Any] | None]:
+    """Classify one already-read member card: ``(cause, context)``.
+
+    ``cause`` is ``""`` when the card resolves; ``context`` is then its
+    runtime selection context. The single classifier both the draft and
+    :func:`mining_input_digest` use, so the digest covers exactly what the
+    draft reads from a card.
+    """
+    from . import project_context
+
+    if not isinstance(card, dict):
+        return MEMBER_ABSENT, None
+    try:
+        context = project_context._skill_selection_context(card)
+    except skill_registry.SkillRegistryError:
+        return MEMBER_NO_SELECTION_CONTEXT, None
+    if context is None:
+        return MEMBER_NO_SELECTION_CONTEXT, None
+    return "", context
+
+
+def _resolve_members(
+    repo: str | Path, cluster: RuleCluster
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], dict[str, list[str]]]:
+    """Read each distinct member card; return resolved members and the
+    unresolved ones keyed by their measured cause.
+
+    Read-only, through the identical two calls real-time selection uses:
+    ``task_store.get_task`` then ``project_context._skill_selection_context``.
+    """
+    from . import task_store
+
+    repo_path = Path(repo)
+    members: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    causes: dict[str, list[str]] = {}
+    for task_id in cluster.distinct_cards:
+        try:
+            card = task_store.get_task(repo_path, task_id)
+        except Exception:  # noqa: BLE001 -- an unreadable card contributes nothing
+            causes.setdefault(MEMBER_UNREADABLE, []).append(task_id)
+            continue
+        cause, context = _member_resolution(card)
+        if cause or context is None or not isinstance(card, dict):
+            causes.setdefault(cause or MEMBER_NO_SELECTION_CONTEXT, []).append(task_id)
+            continue
+        members.append((card, context))
+    return members, causes
+
+
 def _member_contexts(
     repo: str | Path, cluster: RuleCluster
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Read each distinct member card and derive its runtime selection context.
 
-    Read-only, through the identical two calls real-time selection uses:
-    ``task_store.get_task`` then ``project_context._skill_selection_context``.
     A card absent from the canonical store, or one whose context does not
     resolve (for example no declared or derivable triggers/applicability),
     contributes nothing and is simply omitted; the caller decides what too
-    few contributing members means.
+    few contributing members means. :func:`_resolve_members` also names why.
     """
-    from . import project_context, task_store
+    return _resolve_members(repo, cluster)[0]
 
-    repo_path = Path(repo)
-    members: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for task_id in cluster.distinct_cards:
-        try:
-            card = task_store.get_task(repo_path, task_id)
-        except Exception:  # noqa: BLE001 -- an unreadable card contributes nothing
-            continue
-        if not isinstance(card, dict):
-            continue
-        try:
-            context = project_context._skill_selection_context(card)
-        except skill_registry.SkillRegistryError:
-            continue
-        if context is None:
-            continue
-        members.append((card, context))
-    return members
+
+def _unresolved_codes(causes: Mapping[str, Sequence[str]]) -> tuple[str, ...]:
+    codes = tuple(code for cause, code in _MEMBER_CAUSE_CODES if causes.get(cause))
+    # Every member resolved yet fewer than MIN_LOADABLE_MEMBERS exist: say so
+    # rather than blame a store that holds every card.
+    return codes or ("member_cards_below_minimum",)
 
 
 def _modal(values: Iterable[str]) -> str:
@@ -649,7 +704,10 @@ def _bounded_unique(
 
 
 def _proposal_draft(
-    cluster: RuleCluster, identity: str, repo: str | Path | None = None
+    cluster: RuleCluster,
+    identity: str,
+    repo: str | Path | None = None,
+    causes_out: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     """Build the draft a manager (or the learning-commit auto-mining hook)
     passes to ``aiworkhub_manager_skill_propose``.
@@ -665,7 +723,9 @@ def _proposal_draft(
     before this derivation existed.
     """
     if repo is not None:
-        members = _member_contexts(repo, cluster)
+        members, causes = _resolve_members(repo, cluster)
+        if causes_out is not None:
+            causes_out.update(causes)
         if len(members) >= MIN_LOADABLE_MEMBERS:
             cards = [card for card, _context in members]
             contexts = [context for _card, context in members]
@@ -726,7 +786,7 @@ def _proposal_draft(
             "procedure_steps": [],
             "avoid_rules": [],
         }
-        return draft, ("member_cards_not_in_store",)
+        return draft, _unresolved_codes(causes)
 
     scope = skill_registry.common_path_scope(list(cluster.distinct_files))
     draft = {
@@ -766,7 +826,8 @@ def _candidate(
         sorted(cluster.representative.terms),
         [cluster.representative.anchor or cluster.representative.task_id],
     )
-    draft, incomplete = _proposal_draft(cluster, identity, repo)
+    causes: dict[str, list[str]] = {}
+    draft, incomplete = _proposal_draft(cluster, identity, repo, causes)
     warnings: list[str] = []
     if decision.distinct_actors < ADVISORY_MIN_DISTINCT_ACTORS:
         warnings.append(
@@ -805,6 +866,16 @@ def _candidate(
         "warnings": warnings,
         "proposal_draft": draft,
         "draft_incomplete": list(incomplete),
+        # NF-2026-02366: the measured cause per unresolved member card, so a
+        # ``draft_incomplete`` refusal names which cards and why, bounded.
+        "member_resolution": {
+            cause: {
+                "count": len(causes.get(cause, ())),
+                "card_ids": list(causes.get(cause, ()))[:MAX_UNRESOLVED_MEMBER_IDS],
+            }
+            for cause, _code in _MEMBER_CAUSE_CODES
+            if causes.get(cause)
+        },
         "next_action": "aiworkhub_manager_skill_propose",
     }
 
@@ -893,6 +964,70 @@ def mine(
             "activation": "manager_gated_two_distinct_actor_identities",
         },
     }
+
+
+def _canonical_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _module_source_digest() -> str:
+    """This miner's own code, so an upgraded miner never reuses an old result."""
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def mining_input_digest(repo: str | Path) -> str:
+    """Digest of everything :func:`mine` (``include_sensitivity=False``) reads.
+
+    NF-2026-02366: the correction record exactly as :func:`load_correction_record`
+    reads it, plus, for every card that record names, the member
+    classification and the card fields :func:`_proposal_draft` derives from
+    (``allowed_writes``, first-launch stage, selection context). The gate
+    constants and this module's source bytes are folded in, so neither a
+    re-tuned gate nor an upgraded miner can be served a stale result. A read
+    failure raises: an unknown digest must never skip a mine.
+    """
+    from . import task_store
+
+    rows = learning_commit_store.read_correction_record(repo, limit=MAX_CORPUS_DOCUMENTS)
+    task_ids = sorted({str(row.get("task_id") or "") for row in rows} - {""})
+    cards = task_store.get_tasks(Path(repo), task_ids) if task_ids else {}
+    members: list[list[Any]] = []
+    for task_id in task_ids:
+        card = cards.get(task_id)
+        cause, context = _member_resolution(card)
+        if cause or not isinstance(card, dict):
+            members.append([task_id, cause or MEMBER_ABSENT])
+            continue
+        members.append([
+            task_id,
+            "",
+            sorted(str(item) for item in (card.get("allowed_writes") or []) if isinstance(item, str)),
+            _member_stage(card),
+            context,
+        ])
+    return _canonical_digest({
+        "schema_id": SCHEMA_ID,
+        "source": _module_source_digest(),
+        "gate": [DEFAULT_THRESHOLD, MIN_DISTINCT_CARDS, MIN_DISTINCT_FILES, MAX_CANDIDATES],
+        "rows": sorted(_canonical_digest(row) for row in rows),
+        "members": members,
+    })
+
+
+def mining_state_digest(repo: str | Path) -> str:
+    """Digest of the skill registry state a mined candidate is compared against.
+
+    Identity, version and lifecycle only: evidence counters are not what
+    ``propose`` compares a draft with. ``strict=True`` so an unreadable store
+    raises instead of digesting as empty.
+    """
+    records = skill_registry_store.list_records(repo, strict=True)
+    return _canonical_digest(sorted(
+        [str(r.identity), str(r.version), str(getattr(r.lifecycle_state, "value", r.lifecycle_state))]
+        for r in records
+    ))
 
 
 def injectability(record: Any) -> tuple[bool, str]:

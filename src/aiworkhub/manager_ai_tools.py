@@ -1257,6 +1257,281 @@ def _auto_mine_and_propose_skills(repo: Path) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# NF-2026-02366: learning mining runs OFF the accept reply path.
+#
+# Field 0.13.9 measured skill mining at 12-120 s and recipe mining at 11-22 s
+# inside every accepted ``learning_commit``, with an identical result each
+# time. ``learning_commit`` now only schedules: one single-flight daemon thread
+# per repository runs both miners; an accept arriving while a run is in flight
+# coalesces into exactly one follow-up run. Before mining, each miner's input
+# digest (what ``mine`` reads) and state digest (the registry/proposals it is
+# compared against) are checked against the last COMPLETED run persisted under
+# ``.aiworkhub/runtime``; unchanged -> ``skipped_unchanged`` with the last
+# result, and the mine is not called. A digest that cannot be computed never
+# skips (unknown is never "unchanged"), and a failed mine is never persisted,
+# so it is retried on the next accept. Every outcome stays advisory: nothing
+# here can touch the commit's own ``ok``/``failures``.
+# ---------------------------------------------------------------------------
+
+_MINING_STATE_RELATIVE = Path(".aiworkhub") / "runtime" / "learning_mining_state.json"
+_MINING_STATE_SCHEMA_ID = "aiworkhub.learning_mining_state.v1"
+_MINING_STATE_MAX_BYTES = 1 << 20
+# Bound on remembered idle repositories; a manager process serves one.
+_MINING_MAX_SLOTS = 64
+
+
+@dataclasses.dataclass
+class _MiningSlot:
+    running: bool = False
+    pending: bool = False
+    runs: int = 0
+    last: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+_MINING_COND = threading.Condition()
+_MINING_SLOTS: dict[str, _MiningSlot] = {}
+
+
+def _mining_kinds() -> tuple[tuple[str, Any, Callable[[Path], dict[str, Any]]], ...]:
+    from . import recipe_miner, skill_miner
+
+    # Resolved per run, never bound at import, so the advisory wrappers stay
+    # the single owners of mining+proposing.
+    return (
+        ("skill_mining", skill_miner, _auto_mine_and_propose_skills),
+        ("recipe_mining", recipe_miner, recipe_miner.auto_mine_and_propose),
+    )
+
+
+def _mining_state_path(repo: Path) -> Path:
+    return Path(repo) / _MINING_STATE_RELATIVE
+
+
+def _load_mining_state(repo: Path) -> dict[str, Any]:
+    """Persisted per-kind state; absent, oversized or malformed is empty."""
+    try:
+        with _mining_state_path(repo).open("rb") as handle:
+            raw = handle.read(_MINING_STATE_MAX_BYTES + 1)
+    except OSError:
+        return {}
+    if len(raw) > _MINING_STATE_MAX_BYTES:
+        return {}
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(document, dict) or document.get("schema_id") != _MINING_STATE_SCHEMA_ID:
+        return {}
+    kinds = document.get("kinds")
+    return dict(kinds) if isinstance(kinds, dict) else {}
+
+
+def _save_mining_state(repo: Path, kinds: dict[str, Any]) -> None:
+    path = _mining_state_path(repo)
+    payload = json.dumps(
+        {"schema_id": _MINING_STATE_SCHEMA_ID, "kinds": kinds},
+        sort_keys=True, default=str,
+    ).encode("utf-8")
+    if len(payload) > _MINING_STATE_MAX_BYTES:
+        raise ValueError("learning_mining_state_too_large")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temp.write_bytes(payload)
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _mining_failure_result(kind: str, exc: BaseException) -> dict[str, Any]:
+    return {
+        "candidates": 0, "proposed": [], "already_proposed": [],
+        "refused_by_reason": {"mining": f"{kind}_failed:{type(exc).__name__}"},
+        "elapsed_ms": 0.0,
+    }
+
+
+def _run_one_mining(
+    repo: Path, kind: str, miner: Any, mine_and_propose: Callable[[Path], dict[str, Any]]
+) -> dict[str, Any]:
+    started = time.monotonic()
+    digest_error = ""
+    try:
+        input_digest = str(miner.mining_input_digest(repo))
+        state_digest = str(miner.mining_state_digest(repo))
+    except Exception as exc:  # noqa: BLE001 - an unknown digest only forces a mine
+        input_digest = state_digest = ""
+        digest_error = f"digest_failed:{type(exc).__name__}"
+    stored = _load_mining_state(repo).get(kind)
+    if (
+        input_digest
+        and isinstance(stored, dict)
+        and stored.get("input_digest") == input_digest
+        and stored.get("state_digest") == state_digest
+        and isinstance(stored.get("result"), dict)
+    ):
+        return {
+            "state": "skipped_unchanged",
+            "input_digest": input_digest,
+            "last_completed_at": stored.get("completed_at"),
+            "result": stored["result"],
+            "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+        }
+    try:
+        result = mine_and_propose(repo)
+    except Exception as exc:  # noqa: BLE001 - mining is advisory, never fatal
+        result = _mining_failure_result(kind, exc)
+    if not isinstance(result, dict):
+        result = _mining_failure_result(kind, TypeError("mining_result_not_a_mapping"))
+    failed = "mining" in (result.get("refused_by_reason") or {})
+    outcome: dict[str, Any] = {
+        "state": "failed" if failed else "completed",
+        "input_digest": input_digest,
+        "result": result,
+    }
+    if digest_error:
+        outcome["digest_error"] = digest_error
+    if not failed and input_digest:
+        try:
+            # The state digest is re-read AFTER this run's own proposals, so the
+            # next unchanged run compares against what it would actually see;
+            # the input digest stays the one this run mined.
+            post_state = str(miner.mining_state_digest(repo))
+            kinds = _load_mining_state(repo)
+            kinds[kind] = {
+                "input_digest": input_digest,
+                "state_digest": post_state,
+                "result": result,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _save_mining_state(repo, kinds)
+        except Exception as exc:  # noqa: BLE001 - unpersisted means "mine next time"
+            outcome["persist_error"] = f"persist_failed:{type(exc).__name__}"
+    outcome["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
+    return outcome
+
+
+def _run_learning_mining(repo: Path) -> dict[str, Any]:
+    outcomes: dict[str, Any] = {}
+    for kind, miner, mine_and_propose in _mining_kinds():
+        try:
+            outcomes[kind] = _run_one_mining(repo, kind, miner, mine_and_propose)
+        except Exception as exc:  # noqa: BLE001 - one kind never blocks the other
+            outcomes[kind] = {"state": "failed", "result": _mining_failure_result(kind, exc)}
+    return outcomes
+
+
+def _mining_worker(key: str, repo: Path) -> None:
+    clean = False
+    try:
+        while True:
+            outcomes = _run_learning_mining(repo)
+            with _MINING_COND:
+                slot = _MINING_SLOTS[key]
+                slot.runs += 1
+                slot.last = outcomes
+                if slot.pending:
+                    # Every accept that arrived during this run coalesces here.
+                    slot.pending = False
+                    continue
+                slot.running = False
+                clean = True
+                _MINING_COND.notify_all()
+                return
+    finally:
+        if not clean:
+            with _MINING_COND:
+                slot = _MINING_SLOTS[key]
+                slot.running = False
+                slot.pending = False
+                slot.last = {"state": "failed", "error": "mining_worker_aborted"}
+                _MINING_COND.notify_all()
+
+
+def _prune_idle_mining_slots_locked(keep: str) -> None:
+    if len(_MINING_SLOTS) < _MINING_MAX_SLOTS:
+        return
+    for key in [k for k, s in _MINING_SLOTS.items() if k != keep and not s.running]:
+        del _MINING_SLOTS[key]
+        if len(_MINING_SLOTS) < _MINING_MAX_SLOTS:
+            return
+
+
+def schedule_learning_mining(repo: Path | str) -> dict[str, Any]:
+    """Schedule skill+recipe mining for ``repo`` and return immediately.
+
+    Single-flight per repository: when a run is already in flight this only
+    marks one follow-up run (``coalesced: True``). The reply never waits for a
+    mine; the decision to skip an unchanged digest is made by the run itself
+    and is visible through :func:`wait_for_learning_mining` and in the next
+    reply's ``previous_state``.
+    """
+    repo_path = Path(repo)
+    key = str(repo_path.resolve())
+    with _MINING_COND:
+        _prune_idle_mining_slots_locked(key)
+        slot = _MINING_SLOTS.setdefault(key, _MiningSlot())
+        previous = dict(slot.last)
+        coalesced = slot.running
+        error = ""
+        if coalesced:
+            slot.pending = True
+        else:
+            slot.running = True
+            thread = threading.Thread(
+                target=_mining_worker, args=(key, repo_path),
+                name="aiworkhub-learning-mining", daemon=True,
+            )
+            try:
+                thread.start()
+            except RuntimeError as exc:
+                slot.running = False
+                error = f"mining_schedule_failed:{type(exc).__name__}"
+    replies: dict[str, Any] = {}
+    for kind in ("skill_mining", "recipe_mining"):
+        last = previous.get(kind)
+        reply: dict[str, Any] = {
+            "state": "failed" if error else "scheduled",
+            "coalesced": coalesced,
+            "previous_state": last.get("state") if isinstance(last, dict) else None,
+        }
+        if error:
+            reply["error"] = error
+        replies[kind] = reply
+    return replies
+
+
+def wait_for_learning_mining(
+    repo: Path | str | None = None, *, timeout: float | None = 60.0
+) -> dict[str, Any]:
+    """Block until mining for ``repo`` (or every repository) is idle.
+
+    For deterministic tests and diagnostics only; the accept path never calls
+    it. Returns ``idle`` (False when ``timeout`` elapsed first), the number of
+    completed runs and the last per-kind outcomes.
+    """
+    key = str(Path(repo).resolve()) if repo is not None else None
+
+    def _idle() -> bool:
+        if key is not None:
+            slot = _MINING_SLOTS.get(key)
+            return slot is None or not slot.running
+        return not any(slot.running for slot in _MINING_SLOTS.values())
+
+    with _MINING_COND:
+        idle = _MINING_COND.wait_for(_idle, timeout=timeout)
+        slot = _MINING_SLOTS.get(key) if key is not None else None
+        return {
+            "idle": bool(idle),
+            "runs": slot.runs if slot is not None else 0,
+            **(dict(slot.last) if slot is not None else {}),
+        }
+
+
 def learning_commit(
     *,
     task_id: str,
@@ -1301,7 +1576,7 @@ def learning_commit(
         task_id=task_id,
     )
     if result.get("commit_id") and result.get("outcome") == "accepted":
-        from . import manager_skill_tools, recipe_miner
+        from . import manager_skill_tools
 
         # Applicability evidence, never a claim that the procedure was invoked.
         # Retry even an idempotent learning commit: the optional projection may
@@ -1327,12 +1602,21 @@ def learning_commit(
                 "skill_evidence": evidence.get("reason") or "skill_evidence_unlinked",
             }
         context, _manager_info = _manager_context()
-        result["skill_mining"] = _auto_mine_and_propose_skills(
-            context.authority_repo if context is not None else core.repo_root()
-        )
-        result["recipe_mining"] = recipe_miner.auto_mine_and_propose(
-            context.authority_repo if context is not None else core.repo_root()
-        )
+        # NF-2026-02366: scheduled off the reply path; never awaited here, and
+        # never able to touch ``ok``/``failures`` above.
+        try:
+            mining = schedule_learning_mining(
+                context.authority_repo if context is not None else core.repo_root()
+            )
+        except Exception as exc:  # noqa: BLE001 - mining is advisory, never fatal
+            error = f"mining_schedule_failed:{type(exc).__name__}"
+            mining = {
+                kind: {"state": "failed", "coalesced": False, "previous_state": None,
+                       "error": error}
+                for kind in ("skill_mining", "recipe_mining")
+            }
+        result["skill_mining"] = mining["skill_mining"]
+        result["recipe_mining"] = mining["recipe_mining"]
     return result
 
 

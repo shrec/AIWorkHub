@@ -430,3 +430,59 @@ def auto_mine_and_propose(repo: str | Path) -> dict[str, Any]:
         "refused_by_reason": refused,
         "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
     }
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(tool_recipes.canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def mining_input_digest(repo: str | Path) -> str:
+    """Digest of the corpus :func:`mine` reads (NF-2026-02366).
+
+    Exactly the accepted-card fields :func:`mine` uses -- task id, actor,
+    acceptance time and validation commands -- plus the gate constants and
+    this module's source bytes, so neither a re-tuned gate nor an upgraded
+    miner is served a stale result. A read failure raises: an unknown digest
+    must never skip a mine.
+    """
+    cards = [
+        card for card in task_store.list_task_cards(repo, limit=MAX_CORPUS_CARDS)
+        if _is_accepted(card)
+    ]
+    corpus = sorted(
+        [
+            str(card.get("task_id") or ""),
+            _actor_identity(card),
+            str(card.get("accepted_at") or ""),
+            [str(item) for item in card.get("validation") or [] if isinstance(item, str)]
+            if isinstance(card.get("validation"), list) else [],
+        ]
+        for card in cards
+    )
+    return _digest({
+        "schema_id": SCHEMA_ID,
+        "source": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "gate": [MIN_DISTINCT_CARDS, MIN_DISTINCT_ACTORS, MAX_CANDIDATES, MAX_CORPUS_CARDS],
+        "reference": sorted(recipe.id for recipe in _reference_catalogue()),
+        "corpus": corpus,
+    })
+
+
+def mining_state_digest(repo: str | Path) -> str:
+    """Digest of the registered recipes and stored proposals a mine is
+    compared against. Timestamps are excluded: ``put_proposal`` rewrites
+    ``updated_at`` on every ``already_proposed`` call without changing what a
+    later mine would decide.
+    """
+    registered = sorted(
+        _digest(tool_recipes.recipe_payload(recipe))
+        for recipe in tool_recipes_store.load_registry(repo)
+    )
+    proposals = sorted(
+        _digest([
+            row.get("template_digest"), row.get("recipe_id"), row.get("version"),
+            row.get("status"), row.get("draft"), row.get("provenance"),
+        ])
+        for row in tool_recipes_store.list_proposals(repo)
+    )
+    return _digest({"registered": registered, "proposals": proposals})

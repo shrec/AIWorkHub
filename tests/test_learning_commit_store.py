@@ -26,6 +26,21 @@ from aiworkhub import (
 SESSION_ID = "019f5097-6dbe-7172-870a-945afc5f3bfa"
 
 
+@pytest.fixture(autouse=True)
+def _drain_learning_mining(monkeypatch):
+    """NF-2026-02366: accepted commits schedule background mining. Depending on
+    ``monkeypatch`` makes this teardown run BEFORE the manager route is undone,
+    so no mining thread outlives the test's fixtures."""
+    yield
+    assert manager_ai_tools.wait_for_learning_mining(timeout=60)["idle"]
+
+
+def _mined(root: Path) -> dict:
+    waited = manager_ai_tools.wait_for_learning_mining(root, timeout=60)
+    assert waited["idle"] is True
+    return waited
+
+
 def _manager_route(root: Path) -> dict:
     return {
         "ok": True,
@@ -215,6 +230,7 @@ def _bootstrap_skill_case(tmp_path, monkeypatch):
 def test_accepted_learning_commit_bootstraps_skill_evidence_idempotently(tmp_path, monkeypatch):
     root, task_id, request_id, store = _bootstrap_skill_case(tmp_path, monkeypatch)
     first = _commit(task_id, request_id)
+    first_mined = _mined(root)
     second = _commit(task_id, request_id)
     record = store.load_registry(root).get("bootstrap-bugfix", "1.0.0")
     assert len(record.evidence) == 1
@@ -226,14 +242,15 @@ def test_accepted_learning_commit_bootstraps_skill_evidence_idempotently(tmp_pat
     assert second["skill_evidence"]["recorded"][0]["idempotent"] is True
     assert second["commit_id"] == first["commit_id"]
     assert first["skill_evidence"]["evidence_basis"] == "adjudicated_applicable_card"
-    assert set(first["skill_mining"]) == {
-        "candidates", "proposed", "already_proposed", "refused_by_reason", "elapsed_ms",
-    }
-    assert isinstance(first["skill_mining"]["elapsed_ms"], (int, float))
-    assert set(first["recipe_mining"]) == {
-        "candidates", "proposed", "already_proposed", "refused_by_reason", "elapsed_ms",
-    }
-    assert isinstance(first["recipe_mining"]["elapsed_ms"], (int, float))
+    # NF-2026-02366: the reply only schedules; the mining outcome arrives
+    # through the background run, with the unchanged advisory result shape.
+    for kind in ("skill_mining", "recipe_mining"):
+        assert first[kind]["state"] == "scheduled"
+        assert first_mined[kind]["state"] == "completed"
+        assert set(first_mined[kind]["result"]) == {
+            "candidates", "proposed", "already_proposed", "refused_by_reason", "elapsed_ms",
+        }
+        assert isinstance(first_mined[kind]["result"]["elapsed_ms"], (int, float))
 
 
 @pytest.mark.parametrize("failure", ["exception", "refusal", "unlinked", "after_write", "unreadable"])
@@ -289,9 +306,12 @@ def test_learning_commit_survives_a_forced_skill_mining_exception(tmp_path, monk
 
     assert result["ok"] is True
     assert result.get("failures", {}) == {}
-    assert result["skill_mining"]["candidates"] == 0
-    assert result["skill_mining"]["proposed"] == []
-    assert result["skill_mining"]["refused_by_reason"]["mining"].startswith(
+    assert result["skill_mining"]["state"] == "scheduled"
+    mined = _mined(root)["skill_mining"]
+    assert mined["state"] == "failed"
+    assert mined["result"]["candidates"] == 0
+    assert mined["result"]["proposed"] == []
+    assert mined["result"]["refused_by_reason"]["mining"].startswith(
         "skill_mining_failed:"
     )
 
@@ -311,9 +331,12 @@ def test_learning_commit_survives_a_forced_recipe_mining_exception(tmp_path, mon
 
     assert result["ok"] is True
     assert result.get("failures", {}) == {}
-    assert result["recipe_mining"]["candidates"] == 0
-    assert result["recipe_mining"]["proposed"] == []
-    assert result["recipe_mining"]["refused_by_reason"]["mining"].startswith(
+    assert result["recipe_mining"]["state"] == "scheduled"
+    mined = _mined(root)["recipe_mining"]
+    assert mined["state"] == "failed"
+    assert mined["result"]["candidates"] == 0
+    assert mined["result"]["proposed"] == []
+    assert mined["result"]["refused_by_reason"]["mining"].startswith(
         "recipe_mining_failed:"
     )
 
