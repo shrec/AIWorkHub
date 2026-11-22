@@ -596,24 +596,25 @@ def _windows_invalid_handle_value() -> int:
 _WINDOWS_FILE_SHARE_READ = 0x00000001
 
 
-def _windows_handle_attributes(handle: int) -> int | None:
-    class _ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ("file_attributes", ctypes.c_uint32),
-            ("creation_time_low", ctypes.c_uint32),
-            ("creation_time_high", ctypes.c_uint32),
-            ("last_access_time_low", ctypes.c_uint32),
-            ("last_access_time_high", ctypes.c_uint32),
-            ("last_write_time_low", ctypes.c_uint32),
-            ("last_write_time_high", ctypes.c_uint32),
-            ("volume_serial_number", ctypes.c_uint32),
-            ("file_size_high", ctypes.c_uint32),
-            ("file_size_low", ctypes.c_uint32),
-            ("number_of_links", ctypes.c_uint32),
-            ("file_index_high", ctypes.c_uint32),
-            ("file_index_low", ctypes.c_uint32),
-        ]
+class _ByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("file_attributes", ctypes.c_uint32),
+        ("creation_time_low", ctypes.c_uint32),
+        ("creation_time_high", ctypes.c_uint32),
+        ("last_access_time_low", ctypes.c_uint32),
+        ("last_access_time_high", ctypes.c_uint32),
+        ("last_write_time_low", ctypes.c_uint32),
+        ("last_write_time_high", ctypes.c_uint32),
+        ("volume_serial_number", ctypes.c_uint32),
+        ("file_size_high", ctypes.c_uint32),
+        ("file_size_low", ctypes.c_uint32),
+        ("number_of_links", ctypes.c_uint32),
+        ("file_index_high", ctypes.c_uint32),
+        ("file_index_low", ctypes.c_uint32),
+    ]
 
+
+def _windows_handle_attributes(handle: int) -> int | None:
     kernel32 = _windows_kernel32()
     kernel32.GetFileInformationByHandle.argtypes = [
         ctypes.c_void_p,

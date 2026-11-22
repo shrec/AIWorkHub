@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+from ctypes import wintypes
 import errno
 import functools
 import importlib
@@ -681,6 +682,37 @@ class _WindowsMemoryStatus(ctypes.Structure):
     ]
 
 
+class _Counters(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+    ]
+
+
+class _ProcessEntry32W(ctypes.Structure):
+    _fields_ = (
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    )
+
+
 def _windows_memory_status(field: str) -> int | None:
     try:
         status = _WindowsMemoryStatus()
@@ -885,21 +917,6 @@ def process_memory_bytes() -> dict[str, int | None]:
     }
     try:
         if is_windows():
-
-            class _Counters(ctypes.Structure):
-                _fields_ = [
-                    ("cb", ctypes.c_ulong),
-                    ("PageFaultCount", ctypes.c_ulong),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                    ("PrivateUsage", ctypes.c_size_t),
-                ]
 
             kernel32 = ctypes.windll.kernel32
             get_process = kernel32.GetCurrentProcess
@@ -2775,20 +2792,6 @@ def windows_process_tree() -> dict[int, tuple[int, str]] | None:
         return None
     try:
         from ctypes import wintypes
-
-        class _ProcessEntry32W(ctypes.Structure):
-            _fields_ = (
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", wintypes.LONG),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
-            )
 
         kernel32 = _windows_dll_loader()("kernel32", use_last_error=True)
         create_snapshot = kernel32.CreateToolhelp32Snapshot

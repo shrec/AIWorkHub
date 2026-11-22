@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
+from ctypes import wintypes
 import gc
 import heapq
 import itertools
@@ -530,6 +532,26 @@ MALLINFO2_STRUCT_FIELDS = (
 MALLINFO2_FIELDS = ("arena", "hblkhd", "uordblks", "fordblks", "keepcost")
 
 
+class Mallinfo2(ctypes.Structure):
+    _fields_ = tuple((name, ctypes.c_size_t) for name in MALLINFO2_STRUCT_FIELDS)
+
+
+class ProcessMemoryCountersEx(ctypes.Structure):
+    _fields_ = (
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+    )
+
+
 class _NativeUnavailable(Exception):
     """A native probe cannot run here; the message is the named reason."""
 
@@ -588,21 +610,6 @@ def _windows_memory_counters() -> Mapping[str, int]:
         raise _NativeUnavailable("windows_only")
     import ctypes
     from ctypes import wintypes
-
-    class ProcessMemoryCountersEx(ctypes.Structure):
-        _fields_ = (
-            ("cb", wintypes.DWORD),
-            ("PageFaultCount", wintypes.DWORD),
-            ("PeakWorkingSetSize", ctypes.c_size_t),
-            ("WorkingSetSize", ctypes.c_size_t),
-            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-            ("PagefileUsage", ctypes.c_size_t),
-            ("PeakPagefileUsage", ctypes.c_size_t),
-            ("PrivateUsage", ctypes.c_size_t),
-        )
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.GetCurrentProcess.restype = wintypes.HANDLE
@@ -702,9 +709,6 @@ def _mallinfo2() -> dict[str, int]:
         function = library.mallinfo2
     except AttributeError as error:
         raise _NativeUnavailable("mallinfo2_missing") from error
-
-    class Mallinfo2(ctypes.Structure):
-        _fields_ = tuple((name, ctypes.c_size_t) for name in MALLINFO2_STRUCT_FIELDS)
 
     function.argtypes = ()
     function.restype = Mallinfo2

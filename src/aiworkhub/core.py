@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
+
 import fnmatch
 import hashlib
 import hmac
@@ -60,6 +63,14 @@ AUDIT_LOG_DEFAULT_REL = (
     / "process_logs"
     / "audit.jsonl"
 )
+
+
+class SID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+
+class TOKEN_USER(ctypes.Structure):
+    _fields_ = [("User", SID_AND_ATTRIBUTES)]
 
 _SECRET_ENV_PATTERNS = (
     "SECRET", "TOKEN", "PASSWORD", "PASSWD", "KEY", "API_KEY",
@@ -560,60 +571,16 @@ def _pid_in_same_uid_ancestor_chain(target_pid: int, *, max_depth: int) -> bool:
 
 
 def _windows_process_parent_map() -> dict[int, int] | None:
-    """Return a native Windows PID -> parent PID snapshot."""
+    """Return a native Windows PID -> parent PID snapshot.
 
-    if os.name != "nt":
+    Derived from the one uncached ``platform_io.windows_process_tree`` walk, so
+    the Toolhelp snapshot is defined in exactly one place.
+    """
+
+    tree = platform_io.windows_process_tree()
+    if tree is None:
         return None
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class PROCESSENTRY32W(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", wintypes.LONG),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        create_snapshot = kernel32.CreateToolhelp32Snapshot
-        create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
-        create_snapshot.restype = wintypes.HANDLE
-        process_first = kernel32.Process32FirstW
-        process_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
-        process_first.restype = wintypes.BOOL
-        process_next = kernel32.Process32NextW
-        process_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
-        process_next.restype = wintypes.BOOL
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = (wintypes.HANDLE,)
-        close_handle.restype = wintypes.BOOL
-
-        snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
-        if snapshot == wintypes.HANDLE(-1).value:
-            return None
-        parents: dict[int, int] = {}
-        try:
-            entry = PROCESSENTRY32W()
-            entry.dwSize = ctypes.sizeof(entry)
-            if not process_first(snapshot, ctypes.byref(entry)):
-                return None
-            while True:
-                parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
-                if not process_next(snapshot, ctypes.byref(entry)):
-                    break
-        finally:
-            close_handle(snapshot)
-        return parents
-    except (AttributeError, OSError, TypeError, ValueError):
-        return None
+    return {pid: parent_pid for pid, (parent_pid, _image) in tree.items()}
 
 
 # Several manager identity probes run within the same second of one tool call;
@@ -686,12 +653,6 @@ def _windows_process_owner_sid(pid: int) -> str | None:
     try:
         import ctypes
         from ctypes import wintypes
-
-        class SID_AND_ATTRIBUTES(ctypes.Structure):
-            _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
-
-        class TOKEN_USER(ctypes.Structure):
-            _fields_ = [("User", SID_AND_ATTRIBUTES)]
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)

@@ -20,6 +20,10 @@ class TimestampArgumentError(ValueError):
     """The caller supplied a timestamp representation the broker cannot emulate."""
 
 
+class _Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
 def decode_utimensat_timespec(raw: bytes | None) -> tuple[tuple[int, int], tuple[int, int]] | None:
     """Validate and decode one snapshotted Linux 64-bit ABI timespec pair.
 
@@ -51,9 +55,6 @@ def apply_utimensat_fd(fd: int, raw: bytes | None) -> None:
     argument = None
     pair = None
     if decoded is not None:
-        class _Timespec(ctypes.Structure):
-            _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
-
         pair = (_Timespec * 2)(*(_Timespec(*value) for value in decoded))
         argument = ctypes.cast(pair, ctypes.c_void_p)
     libc = ctypes.CDLL(None, use_errno=True)
