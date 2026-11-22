@@ -274,60 +274,74 @@ def bound_reviewer_rows(
         conn = task_store._connect(db_path, readonly=True)
     except Exception:  # noqa: BLE001 -- enumeration failure never accepts anything
         return []
+    import json as _json
+
+    # Streamed: one reviewer card's text and dict alive at a time, never every
+    # card. A card whose raw text lacks the request-id literal cannot bind to
+    # it, so SQL drops it -- only when the literal is made of characters
+    # json.dumps never escapes; any other id scans every reviewer card.
+    literal = str(parent_request_id)
+    sql = "SELECT task_id, card_json FROM tasks WHERE topic='quality_review'"
+    params: tuple[str, ...] = ()
+    if literal and all(ch.isascii() and (ch.isalnum() or ch in "_.:-") for ch in literal):
+        sql += " AND instr(card_json, ?) > 0"
+        params = (literal,)
+    bound: list[dict[str, Any]] = []
     try:
-        rows = conn.execute(
-            "SELECT task_id, card_json FROM tasks "
-            "WHERE topic='quality_review'"
-        ).fetchall()
-    except Exception:  # noqa: BLE001
-        return []
+        try:
+            cursor = conn.execute(sql, params)
+        except Exception:  # noqa: BLE001
+            return []
+        while True:
+            try:
+                row = cursor.fetchone()
+            except Exception:  # noqa: BLE001 -- a failed read enumerates nothing
+                return []
+            if row is None:
+                break
+            try:
+                card = _json.loads(row["card_json"] or "{}")
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(card, dict):
+                continue
+            terminal = card.get("terminal_review")
+            terminal = terminal if isinstance(terminal, dict) else {}
+            terminal_evidence = terminal.get("evidence")
+            terminal_evidence = terminal_evidence if isinstance(terminal_evidence, dict) else {}
+            terminal_binding = terminal_evidence.get("quality_review")
+            root_binding = card.get("quality_review")
+            if not isinstance(terminal_binding, dict):
+                terminal_binding = {}
+            if not isinstance(root_binding, dict):
+                root_binding = {}
+            if terminal_binding and root_binding and terminal_binding != root_binding:
+                # Two durable statements that disagree are not a binding.
+                continue
+            binding = terminal_binding or root_binding
+            if (
+                str(binding.get("target_task_id") or "") != str(parent_task_id)
+                or str(binding.get("target_request_id") or "") != str(parent_request_id)
+            ):
+                continue
+            task_id = str(row["task_id"] or "")
+            if not task_id:
+                continue
+            receipt = terminal_evidence.get("quality_review_receipt")
+            bound.append(
+                {
+                    "task_id": task_id,
+                    "lens": str(binding.get("lens") or ""),
+                    "packet_sha256": str(binding.get("packet_sha256") or ""),
+                    "terminal_substatus": str(terminal.get("substatus") or ""),
+                    "receipt": receipt if isinstance(receipt, dict) else None,
+                }
+            )
     finally:
         try:
             conn.close()
         except Exception:  # noqa: BLE001
             pass
-    import json as _json
-
-    bound: list[dict[str, Any]] = []
-    for row in rows:
-        try:
-            card = _json.loads(row["card_json"] or "{}")
-        except Exception:  # noqa: BLE001
-            continue
-        if not isinstance(card, dict):
-            continue
-        terminal = card.get("terminal_review")
-        terminal = terminal if isinstance(terminal, dict) else {}
-        terminal_evidence = terminal.get("evidence")
-        terminal_evidence = terminal_evidence if isinstance(terminal_evidence, dict) else {}
-        terminal_binding = terminal_evidence.get("quality_review")
-        root_binding = card.get("quality_review")
-        if not isinstance(terminal_binding, dict):
-            terminal_binding = {}
-        if not isinstance(root_binding, dict):
-            root_binding = {}
-        if terminal_binding and root_binding and terminal_binding != root_binding:
-            # Two durable statements that disagree are not a binding.
-            continue
-        binding = terminal_binding or root_binding
-        if (
-            str(binding.get("target_task_id") or "") != str(parent_task_id)
-            or str(binding.get("target_request_id") or "") != str(parent_request_id)
-        ):
-            continue
-        task_id = str(row["task_id"] or "")
-        if not task_id:
-            continue
-        receipt = terminal_evidence.get("quality_review_receipt")
-        bound.append(
-            {
-                "task_id": task_id,
-                "lens": str(binding.get("lens") or ""),
-                "packet_sha256": str(binding.get("packet_sha256") or ""),
-                "terminal_substatus": str(terminal.get("substatus") or ""),
-                "receipt": receipt if isinstance(receipt, dict) else None,
-            }
-        )
     return sorted(bound, key=lambda entry: entry["task_id"])
 
 

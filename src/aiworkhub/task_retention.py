@@ -588,13 +588,25 @@ def live_rework_references(root: Path | str, request_id: str) -> tuple[list[str]
     except (task_store.TaskStoreError, sqlite3.Error, OSError):
         return [], False
     try:
+        task_store.register_canonical_status_sql(connection)
+        finished = tuple(sorted(_FINISHED_CLEANUP_STATUSES))
+        # Streamed, with finished rows dropped in SQL. A row SQLite proves to be
+        # a JSON object whose text lacks the request-id literal cannot pin it,
+        # so its card_json is never read; every other row is parsed exactly as
+        # before, so a malformed unfinished card still fails closed.
         rows = connection.execute(
-            "SELECT task_id, status, worker_status, archived_at, card_json FROM tasks"
-        ).fetchall()
+            "SELECT task_id, unrelated, "
+            "CASE WHEN unrelated THEN NULL ELSE card_json END AS card_json FROM ("
+            "SELECT task_id, card_json, "
+            f"{task_store.card_json_unrelated_sql(connection)} AS unrelated FROM tasks "
+            f"WHERE {task_store.CANONICAL_STATUS_SQL_FUNCTION}"
+            "(status, worker_status, archived_at) NOT IN "
+            f"({', '.join('?' for _ in finished)}))",
+            (request_id, *finished),
+        )
         pins: list[str] = []
         for row in rows:
-            status = task_store.canonical_status(dict(row))
-            if status in _FINISHED_CLEANUP_STATUSES:
+            if row["unrelated"]:
                 continue
             try:
                 card = json.loads(row["card_json"] or "{}")
@@ -726,11 +738,22 @@ def live_process_holders(root: Path | str, request_id: str) -> tuple[list[str], 
     except (task_store.TaskStoreError, sqlite3.Error, OSError):
         return [], False
     try:
+        # Streamed: one card's text and dict alive at a time. A row SQLite
+        # proves to be a JSON object whose text lacks the request-id literal
+        # cannot bind it and always fell through to ``continue``, so its
+        # card_json is never read; every other row is parsed exactly as before,
+        # so a malformed live card still fails closed.
         rows = connection.execute(
-            "SELECT task_id, status, worker_status, archived_at, card_json FROM tasks"
-        ).fetchall()
+            "SELECT task_id, status, worker_status, archived_at, unrelated, "
+            "CASE WHEN unrelated THEN NULL ELSE card_json END AS card_json FROM ("
+            "SELECT task_id, status, worker_status, archived_at, card_json, "
+            f"{task_store.card_json_unrelated_sql(connection)} AS unrelated FROM tasks)",
+            (request_id,),
+        )
         holders: list[str] = []
         for row in rows:
+            if row["unrelated"]:
+                continue
             status = task_store.canonical_status(dict(row))
             worker_status = str(row["worker_status"] or "").strip().lower()
             supervisor_live = worker_status in _LIVE_SUPERVISOR_STATUSES

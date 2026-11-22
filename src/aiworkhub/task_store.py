@@ -2930,40 +2930,91 @@ def inherit_capped_rework(
 _REWORK_DELTA_DIGEST_KEYS = frozenset({"artifact_sha256", "digest"})
 _REWORK_DELTA_UNREFERENCING_STATUSES = frozenset({"finished", "archived", "superseded"})
 
+# Card-table scans stream their cursor and filter in SQL so the server never
+# holds every card's JSON text (hundreds of KB each) and its dict at once.
+CANONICAL_STATUS_SQL_FUNCTION = "aiw_canonical_status"
+
+
+def _canonical_status_sql(status: Any, worker_status: Any, archived_at: Any) -> str:
+    return canonical_status(
+        {"status": status, "worker_status": worker_status, "archived_at": archived_at}
+    )
+
+
+def register_canonical_status_sql(conn: sqlite3.Connection) -> None:
+    """Expose :func:`canonical_status` to SQL as ``aiw_canonical_status(status,
+    worker_status, archived_at)`` so a scan drops rows before their card_json
+    is ever materialised in Python -- the same predicate, never a SQL copy."""
+    conn.create_function(
+        CANONICAL_STATUS_SQL_FUNCTION, 3, _canonical_status_sql, deterministic=True
+    )
+
+
+def card_json_object_proven_sql(conn: sqlite3.Connection) -> str:
+    """SQL expression that is 1 only when SQLite proves ``card_json`` is
+    printable-ASCII, strict RFC-8259 JSON whose top level is an object: text
+    ``json.loads`` is certain to decode to a dict. 0 means "not proven", never
+    "malformed" -- callers still parse such rows exactly as before. Without
+    the JSON functions nothing is ever proven."""
+    try:
+        conn.execute("SELECT json_valid('{}'), json_type('{}')").fetchone()
+    except sqlite3.Error:
+        return "0"
+    return (
+        "(CASE WHEN typeof(card_json) <> 'text' THEN 0"
+        " WHEN card_json GLOB '*[^ -~]*' THEN 0"
+        " WHEN json_valid(card_json) = 0 THEN 0"
+        " WHEN json_type(card_json) = 'object' THEN 1 ELSE 0 END)"
+    )
+
+
+def card_json_unrelated_sql(conn: sqlite3.Connection) -> str:
+    """SQL expression (one ``?`` bound to a request-id literal) that is 1 only
+    for a row proven to be a JSON object whose raw text never contains that
+    literal, so no field of it can equal the id. Callers restrict the literal
+    to characters ``json.dumps`` never escapes."""
+    return (
+        "(CASE WHEN instr(card_json, ?) > 0 THEN 0 ELSE "
+        f"{card_json_object_proven_sql(conn)} END)"
+    )
+
 
 def referenced_rework_delta_digests(root: str | Path) -> set[str]:
     """Every sealed-delta digest a still-undecided task can still recover from."""
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path, readonly=True)
+    digests: set[str] = set()
     try:
+        register_canonical_status_sql(conn)
+        unreferencing = tuple(sorted(_REWORK_DELTA_UNREFERENCING_STATUSES))
         rows = conn.execute(
-            "SELECT status, worker_status, archived_at, card_json FROM tasks"
-        ).fetchall()
+            f"SELECT card_json FROM tasks WHERE {CANONICAL_STATUS_SQL_FUNCTION}"
+            "(status, worker_status, archived_at) NOT IN "
+            f"({', '.join('?' for _ in unreferencing)})",
+            unreferencing,
+        )
+        for row in rows:
+            try:
+                stack: list[Any] = [json.loads(str(row["card_json"] or "{}"))]
+            except json.JSONDecodeError:
+                continue
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    for key, value in node.items():
+                        if (
+                            key in _REWORK_DELTA_DIGEST_KEYS
+                            and isinstance(value, str)
+                            and len(value) == 64
+                            and all(ch in "0123456789abcdef" for ch in value)
+                        ):
+                            digests.add(value)
+                        elif isinstance(value, (dict, list)):
+                            stack.append(value)
+                elif isinstance(node, list):
+                    stack.extend(node)
     finally:
         conn.close()
-    digests: set[str] = set()
-    for row in rows:
-        if canonical_status(dict(row)) in _REWORK_DELTA_UNREFERENCING_STATUSES:
-            continue
-        try:
-            stack: list[Any] = [json.loads(str(row["card_json"] or "{}"))]
-        except json.JSONDecodeError:
-            continue
-        while stack:
-            node = stack.pop()
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if (
-                        key in _REWORK_DELTA_DIGEST_KEYS
-                        and isinstance(value, str)
-                        and len(value) == 64
-                        and all(ch in "0123456789abcdef" for ch in value)
-                    ):
-                        digests.add(value)
-                    elif isinstance(value, (dict, list)):
-                        stack.append(value)
-            elif isinstance(node, list):
-                stack.extend(node)
     return digests
 
 
@@ -3189,12 +3240,15 @@ def _rework_pinned_predecessor_request_ids(conn: sqlite3.Connection) -> set[str]
     otherwise touched, even though the predecessor's own row is archived.
     """
     pinned: set[str] = set()
+    register_canonical_status_sql(conn)
+    # Streamed and prefiltered in SQL: only active rows' card_json ever reaches
+    # Python, one row at a time (never every card at once).
     rows = conn.execute(
-        "SELECT status, worker_status, archived_at, card_json FROM tasks"
-    ).fetchall()
+        f"SELECT card_json FROM tasks WHERE {CANONICAL_STATUS_SQL_FUNCTION}"
+        "(status, worker_status, archived_at) IN (?, ?, ?, ?)",
+        ("pending", "processing", "review", "blocked"),
+    )
     for row in rows:
-        if canonical_status(dict(row)) not in {"pending", "processing", "review", "blocked"}:
-            continue
         card = _row_card(row["card_json"])
         predecessor = card.get("rework_predecessor")
         if isinstance(predecessor, dict):

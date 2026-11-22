@@ -308,50 +308,70 @@ def _protected_attempt_ids(
         conn = task_store.connect_readonly(db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         try:
+            task_store.register_canonical_status_sql(conn)
+            finished = tuple(sorted(_FINISHED_STATUSES))
+            # Still ONE unbounded read of every row (no LIMIT), but streamed:
+            # the cursor is iterated, so only one card's text and dict are alive
+            # at a time. A finished row reads nothing from its card beyond "is
+            # it a JSON object"; when SQLite proves that, its card_json never
+            # reaches Python at all.
             rows = conn.execute(
-                "SELECT task_id, status, worker_status, archived_at, card_json FROM tasks"
-            ).fetchall()
+                "SELECT task_id, status, worker_status, archived_at, dict_proven, "
+                "CASE WHEN dict_proven THEN NULL ELSE card_json END AS card_json "
+                "FROM (SELECT task_id, status, worker_status, archived_at, card_json, "
+                f"CASE WHEN {task_store.CANONICAL_STATUS_SQL_FUNCTION}"
+                "(status, worker_status, archived_at) IN "
+                f"({', '.join('?' for _ in finished)}) THEN "
+                f"{task_store.card_json_object_proven_sql(conn)} ELSE 0 END "
+                "AS dict_proven FROM tasks)",
+                finished,
+            )
+            for row in rows:
+                status = task_store.canonical_status(dict(row))
+                card_id = str(row["task_id"] or "").strip()
+                closed_by_needfix = (
+                    needfix_lineage_verified and card_id in terminal_needfix_tasks
+                )
+                card_unfinished = status not in _FINISHED_STATUSES and not closed_by_needfix
+                # Before the card_json parse: a corrupt record must not drop an open card.
+                if card_id and card_unfinished:
+                    unfinished_cards.add(card_id)
+                if row["dict_proven"]:
+                    # A proven JSON object is all a finished row ever reads.
+                    if card_id and status in _FINISHED_STATUSES:
+                        terminal_tasks.add(card_id)
+                    continue
+                try:
+                    card_json = json.loads(row["card_json"] or "{}")
+                except json.JSONDecodeError:
+                    card_json = {}
+                if not isinstance(card_json, dict):
+                    continue
+                if card_id and status in _FINISHED_STATUSES:
+                    terminal_tasks.add(card_id)
+                if status in ("processing", "review"):
+                    request_id = str(card_json.get("launch_request_id") or "").strip()
+                    if request_id and not closed_by_needfix:
+                        protected[request_id] = "live_worker"
+                if status == "blocked" and not closed_by_needfix:
+                    for blocked_request_id in _blocked_terminal_candidate_request_ids(card_json):
+                        protected.setdefault(
+                            blocked_request_id, "blocked_terminal_candidate_retained"
+                        )
+                if card_unfinished:
+                    predecessor = card_json.get("rework_predecessor")
+                    if isinstance(predecessor, dict):
+                        predecessor_id = str(predecessor.get("request_id") or "").strip()
+                        if predecessor_id and not has_verified_rework_delta(
+                            predecessor, authority_repo=repo_root
+                        ):
+                            protected.setdefault(predecessor_id, "rework_predecessor_retained")
+                            if card_id:
+                                holders = pinned_by.setdefault(predecessor_id, [])
+                                if card_id not in holders:
+                                    holders.append(card_id)
         finally:
             conn.close()
-        for row in rows:
-            status = task_store.canonical_status(dict(row))
-            card_id = str(row["task_id"] or "").strip()
-            closed_by_needfix = (
-                needfix_lineage_verified and card_id in terminal_needfix_tasks
-            )
-            card_unfinished = status not in _FINISHED_STATUSES and not closed_by_needfix
-            # Before the card_json parse: a corrupt record must not drop an open card.
-            if card_id and card_unfinished:
-                unfinished_cards.add(card_id)
-            try:
-                card_json = json.loads(row["card_json"] or "{}")
-            except json.JSONDecodeError:
-                card_json = {}
-            if not isinstance(card_json, dict):
-                continue
-            if card_id and status in _FINISHED_STATUSES:
-                terminal_tasks.add(card_id)
-            if status in ("processing", "review"):
-                request_id = str(card_json.get("launch_request_id") or "").strip()
-                if request_id and not closed_by_needfix:
-                    protected[request_id] = "live_worker"
-            if status == "blocked" and not closed_by_needfix:
-                for blocked_request_id in _blocked_terminal_candidate_request_ids(card_json):
-                    protected.setdefault(
-                        blocked_request_id, "blocked_terminal_candidate_retained"
-                    )
-            if card_unfinished:
-                predecessor = card_json.get("rework_predecessor")
-                if isinstance(predecessor, dict):
-                    predecessor_id = str(predecessor.get("request_id") or "").strip()
-                    if predecessor_id and not has_verified_rework_delta(
-                        predecessor, authority_repo=repo_root
-                    ):
-                        protected.setdefault(predecessor_id, "rework_predecessor_retained")
-                        if card_id:
-                            holders = pinned_by.setdefault(predecessor_id, [])
-                            if card_id not in holders:
-                                holders.append(card_id)
     except (task_store.TaskStoreError, sqlite3.Error, OSError):
         return {}, False, {}, set(), set()
     for holders in pinned_by.values():
