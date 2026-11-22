@@ -8687,6 +8687,46 @@ async function progressReceiptChecks() {
   assert(path.resolve(base).startsWith(path.resolve(os.tmpdir())+path.sep));
   fs.rmSync(base,{recursive:true,force:true});
 }
+// Model-name lookup: selection results must stay identical while the per-call
+// lookup stops re-normalizing the whole supported/alias table.
+function selectionLookupCheck() {
+  const select = internals.selectVscodeLanguageModel;
+  const model = (id, extra = {}) => ({ id, vendor: "glm", ...extra });
+  const glm = model("glm-5.2");
+  const deepseek = model("deepseek-v4-pro");
+  const sonnet = model("claude-sonnet-4.6", { vendor: "anthropic" });
+  const pool = [deepseek, glm, sonnet];
+  assert.strictEqual(select(pool, "glm-5.2"), glm);
+  assert.strictEqual(select(pool, "glm52"), glm);
+  assert.strictEqual(select(pool, "glm-52"), glm);
+  assert.strictEqual(select(pool, "GLM 5.2"), glm);
+  assert.strictEqual(select(pool, "deepseek-v4pro"), deepseek);
+  assert.strictEqual(select(pool, "DeepSeek_V4_Pro"), deepseek);
+  assert.strictEqual(select(pool, "sonnet-4-6"), sonnet);
+  assert.strictEqual(select(pool, "claude-sonnet-46"), sonnet);
+  const exactWins = select([model("zz-alt", { family: "glm-5.2" }), glm], "glm-5.2");
+  assert.strictEqual(exactWins, glm, "stable provider id outranks a display family");
+  const acme = model("acme-x1.beta");
+  assert.strictEqual(select([acme], "acme-x1.beta"), acme, "unknown name passing the regex");
+  assert.strictEqual(select([acme], "acme-x1"), null, "unknown name without a model is not selected");
+  assert.strictEqual(select([model("bad name!")], "bad name!"), null, "name failing the regex is refused");
+  assert.strictEqual(select(pool, ""), null);
+  assert.strictEqual(select(pool, "unknown-model"), null);
+  assert.strictEqual(select([model("glm-5.2", { vendor: "copilotcli" })], "glm-5.2"), null);
+  const originalReplace = RegExp.prototype[Symbol.replace];
+  let replaceCalls = 0;
+  RegExp.prototype[Symbol.replace] = function countReplace(...args) {
+    replaceCalls += 1;
+    return originalReplace.apply(this, args);
+  };
+  try {
+    assert.strictEqual(select([], "no-such-model"), null);
+  } finally {
+    RegExp.prototype[Symbol.replace] = originalReplace;
+  }
+  assert.ok(replaceCalls <= 2, `lookup ran ${replaceCalls} regex replacements; only the request may be normalized`);
+}
+selectionLookupCheck();
 main().then(() => {
   console.log("GLM VS Code LM bridge: ok");
 }).catch((err) => {

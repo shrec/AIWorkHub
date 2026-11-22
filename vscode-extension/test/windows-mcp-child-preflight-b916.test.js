@@ -17,12 +17,14 @@ const childProcess = require("node:child_process");
 
 // ── Mock vscode before extension.js loads ────────────────────────────────
 const Module = require("module");
+// Per-test pythonPath seen by the mocked vscode configuration; "" keeps the default.
+let configuredPythonPath = "";
 const origLoad = Module._load;
 Module._load = function (request, parent, isMain) {
   if (request === "vscode") {
     return {
       workspace: {
-        getConfiguration: () => ({ get: () => "" }),
+        getConfiguration: () => ({ get: () => configuredPythonPath }),
         workspaceFolders: [],
       },
       window: {
@@ -307,6 +309,97 @@ test("Windows launch preflight yields the extension-host event loop", async () =
     childProcess.execFile = originalExecFile;
     childProcess.spawnSync = originalSpawnSync;
     Object.defineProperty(process, "platform", { value: originalPlatform });
+  }
+});
+
+test("concurrent Windows launch resolutions share one in-flight preflight", async () => {
+  const originalPlatform = process.platform;
+  const originalExecFile = childProcess.execFile;
+  const spawned = [];
+  Object.defineProperty(process, "platform", { value: "win32" });
+  childProcess.execFile = (command, _args, _options, callback) => {
+    spawned.push(command);
+    setImmediate(() => callback(null, "", ""));
+  };
+  try {
+    const root = "C:\\shared-launch-b916";
+    const [first, second] = await Promise.all([
+      findPythonCommandForLaunch(root),
+      findPythonCommandForLaunch(root),
+    ]);
+    assert.deepEqual(spawned, ["py"]);
+    assert.equal(first.command, "py");
+    assert.deepEqual(second, first);
+  } finally {
+    childProcess.execFile = originalExecFile;
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+  }
+});
+
+test("settled Windows launch resolution is not cached, including after failure", async () => {
+  const originalPlatform = process.platform;
+  const originalExecFile = childProcess.execFile;
+  const spawned = [];
+  let outcome = "fail";
+  Object.defineProperty(process, "platform", { value: "win32" });
+  childProcess.execFile = (command, _args, _options, callback) => {
+    spawned.push(command);
+    setImmediate(() => {
+      if (outcome === "fail") callback(new Error("spawn py ENOENT"), "", "");
+      else callback(null, "", "");
+    });
+  };
+  try {
+    const root = "C:\\settled-launch-b916";
+    const failed = await findPythonCommandForLaunch(root);
+    assert.equal(spawned.length, 2, "py and python both spawn when both fail");
+    assert.equal(failed.command, "py");
+    assert.ok(failed.preflightDiagnostic, "failure keeps its diagnostic");
+    outcome = "ok";
+    const recovered = await findPythonCommandForLaunch(root);
+    assert.equal(spawned.length, 3, "a call after failure spawns again");
+    assert.equal(recovered.preflightDiagnostic, null);
+    await findPythonCommandForLaunch(root);
+    assert.equal(spawned.length, 4, "a call after success spawns again");
+  } finally {
+    childProcess.execFile = originalExecFile;
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+  }
+});
+
+test("different Windows launch roots or pythonPath values do not share a preflight", async () => {
+  const originalPlatform = process.platform;
+  const originalExecFile = childProcess.execFile;
+  const spawned = [];
+  const tmp = createTempRoot();
+  const pyA = path.join(tmp.root, "a-python.exe");
+  const pyB = path.join(tmp.root, "b-python.exe");
+  writePythonStub(pyA, 0);
+  writePythonStub(pyB, 0);
+  Object.defineProperty(process, "platform", { value: "win32" });
+  childProcess.execFile = (command, _args, _options, callback) => {
+    spawned.push(command);
+    setImmediate(() => callback(null, "", ""));
+  };
+  try {
+    await Promise.all([
+      findPythonCommandForLaunch("C:\\root-left-b916"),
+      findPythonCommandForLaunch("C:\\root-right-b916"),
+    ]);
+    assert.equal(spawned.length, 2, "different roots never share a preflight");
+    configuredPythonPath = pyA;
+    const pendingA = findPythonCommandForLaunch("C:\\same-root-b916");
+    configuredPythonPath = pyB;
+    const pendingB = findPythonCommandForLaunch("C:\\same-root-b916");
+    const [resolvedA, resolvedB] = await Promise.all([pendingA, pendingB]);
+    assert.equal(resolvedA.command, pyA);
+    assert.equal(resolvedB.command, pyB);
+    assert.deepEqual(spawned.slice(2), [pyA, pyB]);
+  } finally {
+    configuredPythonPath = "";
+    childProcess.execFile = originalExecFile;
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+    tmp.rm();
   }
 });
 

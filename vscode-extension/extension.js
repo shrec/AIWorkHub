@@ -1437,11 +1437,28 @@ function findPythonCommand(root, options = {}) {
   return { command: "python3", argsPrefix: [] };
 }
 
+// One in-flight preflight per (root, configured pythonPath). The entry is
+// removed when its promise settles, on success and on failure, so this shares
+// concurrent work only and never caches a result.
+const _inFlightWindowsLaunchPreflights = new Map();
+
 async function findPythonCommandForLaunch(root) {
   if (process.platform !== "win32") {
     return findPythonCommand(root);
   }
   const configured = vscode.workspace.getConfiguration("aiworkhub").get("pythonPath");
+  const pythonPathKey = typeof configured === "string" ? configured.trim() : "";
+  const key = JSON.stringify([root, pythonPathKey]);
+  const inFlight = _inFlightWindowsLaunchPreflights.get(key);
+  if (inFlight) return inFlight;
+  const pending = resolveWindowsPythonCommandForLaunch(root, configured).finally(() => {
+    _inFlightWindowsLaunchPreflights.delete(key);
+  });
+  _inFlightWindowsLaunchPreflights.set(key, pending);
+  return pending;
+}
+
+async function resolveWindowsPythonCommandForLaunch(root, configured) {
   const candidates = [
     typeof configured === "string" && configured.trim() ? configured.trim() : null,
     path.join(root, ".venv", "Scripts", "python.exe"),
@@ -3796,6 +3813,19 @@ function normalizedVscodeLmModelName(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
+// Built once from the deep-frozen supported names and aliases. Normalized key ->
+// canonical name, in supported-model order; a key is set only if absent, so the
+// first supported entry to claim it wins, as the former per-call find() did.
+const VSCODE_LM_CANONICAL_BY_NORMALIZED = new Map();
+for (const name of VSCODE_LM_SUPPORTED_MODELS) {
+  for (const key of [name, ...(VSCODE_LM_MODEL_ALIASES[name] || [])]) {
+    const normalizedKey = normalizedVscodeLmModelName(key);
+    if (!VSCODE_LM_CANONICAL_BY_NORMALIZED.has(normalizedKey)) {
+      VSCODE_LM_CANONICAL_BY_NORMALIZED.set(normalizedKey, name);
+    }
+  }
+}
+
 // Discovery is the ONLY source of the callable model catalog. Given the raw
 // vscode.lm.selectChatModels result, exclude the measured non-callable
 // providers (isCallableVscodeLmProvider) and surface every remaining model
@@ -3822,10 +3852,7 @@ function vscodeLmDiscoverCallableNames(models) {
 
 function canonicalVscodeLmModelName(value) {
   const normalized = normalizedVscodeLmModelName(value);
-  const known = VSCODE_LM_SUPPORTED_MODELS.find((name) =>
-    normalizedVscodeLmModelName(name) === normalized ||
-    (VSCODE_LM_MODEL_ALIASES[name] || []).some((alias) => normalizedVscodeLmModelName(alias) === normalized)
-  );
+  const known = VSCODE_LM_CANONICAL_BY_NORMALIZED.get(normalized);
   if (known) return known;
   const raw = String(value || "").trim();
   return VSCODE_LM_REQUESTED_MODEL_RE.test(raw) ? raw : "";
