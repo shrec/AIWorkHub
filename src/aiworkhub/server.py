@@ -5342,7 +5342,15 @@ def aiworkhub_task_reject_review(
     ``relaunch`` (default false, and the reply is then unchanged) launches the
     card's retry after the reject landed and returns the launch reply under
     ``relaunch``. A failed or raising launch never undoes the reject: ``ok``
-    stays true and the failure is reported under ``relaunch``.
+    stays true and the failure is reported under ``relaunch``.  At the reject
+    depth cap (NF-2026-02368) the refused launch is followed in the same call
+    by the capped continuation ``aiworkhub_task_supersede(continue_capped=true)``
+    performs, with the stored reject reason as the successor's feedback, and
+    the successor ``<task_id>-c<N>`` is launched with the same adapter:
+    ``relaunch`` then carries ``continued_capped`` {predecessor_task_id,
+    successor_task_id, delta_digest} plus the successor's launch reply (``ok``
+    true only when it launched).  A refused continuation reports ``ok`` false,
+    the refusal under ``error`` and ``next_action`` naming that supersede call.
 
     Args:
         task_id: Id of the reviewed task card to reject.
@@ -5362,7 +5370,7 @@ def aiworkhub_task_reject_review(
         extra_evidence_ids: Additional evidence ids to cite with the lesson; only used together with lesson_candidate.
         no_new_lesson_reason: Instead of a lesson, record why none is owed: duplicate_of_recorded_lesson, no_generalizable_cause, mechanical_change_only, evidence_insufficient or decision_not_about_code; refused together with lesson_candidate.
         request_id: Optional identity assertion: the review request you are rejecting. It must equal the card's current review request, else the call is refused with request_id_mismatch (or request_id_unverifiable when the card names none) and nothing changes; omit to skip the check.
-        relaunch: Set true to launch the rework worker for this card in the same call, after the reject has landed (the same launch aiworkhub_agent_launch_task would do with the card's own runner and topic); only with to=pending (else refused with relaunch_requires_pending) and not with failure_category base_drift or validation_environment, which start their own automatic validation replay (refused with relaunch_conflicts_with_automatic_replay). Default false.
+        relaunch: Set true to launch the rework worker for this card in the same call, after the reject has landed (the same launch aiworkhub_agent_launch_task would do with the card's own runner and topic); only with to=pending (else refused with relaunch_requires_pending) and not with failure_category base_drift or validation_environment, which start their own automatic validation replay (refused with relaunch_conflicts_with_automatic_replay). At the reject depth cap the card is continued as aiworkhub_task_supersede(continue_capped=true) would, reusing this reason as the successor's feedback, and the successor is launched; relaunch then carries continued_capped {predecessor_task_id, successor_task_id, delta_digest}, or next_action naming that supersede call when the continuation is refused. Default false.
         relaunch_adapter_id: Adapter for the relaunch; empty (default) derives it from the card's runner. Only used with relaunch=true.
     """
 
@@ -5459,18 +5467,93 @@ def aiworkhub_task_reject_review(
     return receipt
 
 
-def _relaunch_after_reject(task_id: str, *, adapter_id: str) -> dict[str, Any]:
-    """Launch the rejected card's retry; never raises, never undoes the reject."""
+def _relaunch_launch_reply(task_id: str, adapter_id: str | None) -> dict[str, Any]:
+    """One ``_launch_task_internal`` call as a ``relaunch`` reply; never raises."""
 
     try:
-        launched = _launch_task_internal(
-            task_id=task_id, adapter_id=str(adapter_id or "").strip() or None
-        )
+        launched = _launch_task_internal(task_id=task_id, adapter_id=adapter_id)
     except Exception as exc:  # noqa: BLE001 - the committed reject must still be reported
         return {"ok": False, "error": f"relaunch_raised:{type(exc).__name__}"}
     if not isinstance(launched, dict):
         return {"ok": False, "error": "relaunch_reply_invalid"}
     return {**launched, "ok": launched.get("ok") is True}
+
+
+def _reject_depth_cap_refusal(launched: Mapping[str, Any]) -> str:
+    """The launcher's reject-depth-cap refusal in a refused launch reply, else ``""``."""
+
+    from . import launch_replay_guard
+
+    if launched.get("ok") is True:
+        return ""
+    for key in ("blocked_reason", "error", "stderr"):
+        value = launched.get(key)
+        if isinstance(value, str) and value.startswith(
+            launch_replay_guard.REJECT_DEPTH_CAP_REACHED_REASON
+        ):
+            return value
+    return ""
+
+
+def _continue_capped_after_reject(task_id: str, *, adapter_id: str | None) -> dict[str, Any]:
+    """NF-2026-02368: continue a reject-depth-capped card and launch its successor.
+
+    The same continuation ``aiworkhub_task_supersede(continue_capped=true)`` runs,
+    with an empty reason: the successor's feedback is the reject reason the
+    card already stores, so nothing is retyped.  A refused continuation names
+    the exact follow-up call; nothing here raises or undoes the reject.
+    """
+
+    next_action = f"aiworkhub_task_supersede(task_id={task_id}, continue_capped=true)"
+    try:
+        outcome = core.continue_capped_task(task_id=task_id, reason="", by="")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "next_action": next_action}
+    except Exception as exc:  # noqa: BLE001 - the committed reject must still be reported
+        return {
+            "ok": False,
+            "error": f"continuation_raised:{type(exc).__name__}",
+            "next_action": next_action,
+        }
+    continuation = outcome.get("continuation") if isinstance(outcome, dict) else None
+    if (
+        not isinstance(outcome, dict)
+        or outcome.get("ok") is not True
+        or not isinstance(continuation, Mapping)
+        or not str(continuation.get("successor_task_id") or "").strip()
+    ):
+        error = (
+            str(outcome.get("error") or outcome.get("stderr") or "")
+            if isinstance(outcome, dict)
+            else ""
+        )
+        return {
+            "ok": False,
+            "error": error or "continuation_failed",
+            "next_action": next_action,
+        }
+    successor = str(continuation["successor_task_id"]).strip()
+    continued = {
+        "predecessor_task_id": task_id,
+        "successor_task_id": successor,
+        "delta_digest": str(continuation.get("delta_digest") or ""),
+    }
+    # A failed successor launch still reports the continuation that landed.
+    return {**_relaunch_launch_reply(successor, adapter_id), "continued_capped": continued}
+
+
+def _relaunch_after_reject(task_id: str, *, adapter_id: str) -> dict[str, Any]:
+    """Launch the rejected card's retry; never raises, never undoes the reject.
+
+    At the reject depth cap the launch is refused; the card is then continued
+    as a capped successor and that successor is launched (NF-2026-02368).
+    """
+
+    adapter = str(adapter_id or "").strip() or None
+    launched = _relaunch_launch_reply(task_id, adapter)
+    if not _reject_depth_cap_refusal(launched):
+        return launched
+    return _continue_capped_after_reject(task_id, adapter_id=adapter)
 
 
 def _refresh_receipt_status(
