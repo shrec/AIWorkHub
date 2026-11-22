@@ -330,6 +330,87 @@ def _persistent_cache_path(repo_root: Path) -> Path:
     return repo_root / ".aiworkhub" / "runtime" / "cache" / "claude_code_usage_v1.json"
 
 
+_GUARD_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _call_to_json(call: _CallSnapshot) -> list[Any]:
+    return list(call)
+
+
+def _call_from_json(raw: Any) -> _CallSnapshot | None:
+    if not isinstance(raw, list) or len(raw) != 5:
+        return None
+    if not all(type(value) is int for value in raw[:4]) or not isinstance(raw[4], str):
+        return None
+    return (raw[0], raw[1], raw[2], raw[3], raw[4])
+
+
+def _state_to_json(state: _ParseState) -> dict[str, Any]:
+    # calls_by_id is a list of pairs, not an object: sort_keys would reorder the
+    # message ids, and their insertion order is what a cold parse produces.
+    return {
+        "offset": state.offset,
+        "guard": state.guard.hex(),
+        "calls_by_id": [
+            [message_id, _call_to_json(call)] for message_id, call in state.calls_by_id.items()
+        ],
+        "anonymous_calls": [_call_to_json(call) for call in state.anonymous_calls],
+        "malformed_lines": state.malformed_lines,
+        "first_at": state.first_at,
+        "last_at": state.last_at,
+    }
+
+
+def _state_from_json(raw: Any, size: int) -> _ParseState | None:
+    """Validate a persisted resume state. None drops only the state, never the usage."""
+
+    if not isinstance(raw, dict):
+        return None
+    offset = raw.get("offset")
+    guard = raw.get("guard")
+    malformed = raw.get("malformed_lines")
+    first_at = raw.get("first_at")
+    last_at = raw.get("last_at")
+    rows = raw.get("calls_by_id")
+    anonymous = raw.get("anonymous_calls")
+    if type(offset) is not int or not 0 < offset <= size:
+        return None
+    if not isinstance(guard, str) or _GUARD_HEX_RE.fullmatch(guard) is None:
+        return None
+    if type(malformed) is not int or malformed < 0:
+        return None
+    if not isinstance(first_at, str) or not isinstance(last_at, str):
+        return None
+    if not isinstance(rows, list) or not isinstance(anonymous, list):
+        return None
+    calls_by_id: dict[str, _CallSnapshot] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 2:
+            return None
+        message_id, raw_call = row
+        call = _call_from_json(raw_call)
+        if not isinstance(message_id, str) or not message_id or message_id in calls_by_id:
+            return None
+        if call is None:
+            return None
+        calls_by_id[message_id] = call
+    anonymous_calls: list[_CallSnapshot] = []
+    for raw_call in anonymous:
+        call = _call_from_json(raw_call)
+        if call is None:
+            return None
+        anonymous_calls.append(call)
+    return _ParseState(
+        offset,
+        bytes.fromhex(guard),
+        calls_by_id,
+        anonymous_calls,
+        malformed,
+        first_at,
+        last_at,
+    )
+
+
 def _entry_to_json(entry: _CacheEntry) -> dict[str, Any]:
     payload: dict[str, Any] = {"size": entry.size, "mtime_ns": entry.mtime_ns}
     for name in _USAGE_INT_FIELDS:
@@ -337,6 +418,10 @@ def _entry_to_json(entry: _CacheEntry) -> dict[str, Any]:
     payload["models"] = list(entry.usage.models)
     for name in _USAGE_STR_FIELDS:
         payload[name] = getattr(entry.usage, name)
+    if entry.state is not None:
+        # Optional key: readers that predate it ignore it, and an entry without
+        # it stays valid for a stat hit, so the cache version is unchanged.
+        payload["state"] = _state_to_json(entry.state)
     return payload
 
 
@@ -357,7 +442,8 @@ def _entry_from_json(raw: Any) -> _CacheEntry | None:
         models=tuple(models),
         **strs,
     )
-    return _CacheEntry(ints["size"], ints["mtime_ns"], usage)
+    state = _state_from_json(raw.get("state"), ints["size"])
+    return _CacheEntry(ints["size"], ints["mtime_ns"], usage, state)
 
 
 def _load_persistent_cache(cache_path: Path) -> dict[str, _CacheEntry]:
@@ -426,8 +512,13 @@ def _parse_files(paths: list[Path], cache_path: Path | None = None) -> dict[Path
         entry = _FILE_CACHE.get(key)
         if entry is None or not _entry_matches(entry, stat_result):
             previous = entry.state if entry is not None else None
-            entry = persisted.get(key)
-            if entry is None or not _entry_matches(entry, stat_result):
+            persisted_entry = persisted.get(key)
+            if persisted_entry is not None and _entry_matches(persisted_entry, stat_result):
+                # Stat hit: the persisted entry restores its resume state as well.
+                entry = persisted_entry
+            else:
+                if previous is None and persisted_entry is not None:
+                    previous = persisted_entry.state
                 parsed = _parse_transcript_file(path, previous)
                 if parsed is None:
                     # Open failed (e.g. transiently locked): report zero for
@@ -436,11 +527,12 @@ def _parse_files(paths: list[Path], cache_path: Path | None = None) -> dict[Path
                     result[path] = _EMPTY_FILE_USAGE
                     continue
                 usage, state = parsed
-                age_seconds = time.time() - stat_result.st_mtime_ns / 1e9
-                retained = state if age_seconds < _STATE_RETAIN_MAX_AGE_SECONDS else None
-                entry = _CacheEntry(
-                    stat_result.st_size, stat_result.st_mtime_ns, usage, retained
-                )
+                entry = _CacheEntry(stat_result.st_size, stat_result.st_mtime_ns, usage, state)
+        age_seconds = time.time() - stat_result.st_mtime_ns / 1e9
+        if entry.state is not None and age_seconds >= _STATE_RETAIN_MAX_AGE_SECONDS:
+            # Resume state is kept only for recently written files, both in memory
+            # and on disk, so an old entry never carries it into a later write.
+            entry = _CacheEntry(entry.size, entry.mtime_ns, entry.usage)
         _FILE_CACHE[key] = entry
         _FILE_CACHE.move_to_end(key)
         current[key] = entry

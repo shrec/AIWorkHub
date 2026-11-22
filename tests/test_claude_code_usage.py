@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -721,3 +722,424 @@ def test_collect_memo_never_keeps_a_transiently_locked_zero(monkeypatch, tmp_pat
     monkeypatch.setattr(claude_code_usage, "_parse_transcript_file", real_parser)
     readable = claude_code_usage.collect_claude_code_usage(repo_root)
     assert readable["totals"]["main"]["api_calls"] == 1
+
+
+def _memory_key(name: str) -> str:
+    keys = [key for key in claude_code_usage._FILE_CACHE if key.endswith(name)]
+    assert len(keys) == 1
+    return keys[0]
+
+
+def _memory_entry(name: str):
+    return claude_code_usage._FILE_CACHE[_memory_key(name)]
+
+
+def _persisted_document(repo_root: Path) -> dict:
+    cache_path = claude_code_usage._persistent_cache_path(repo_root)
+    return json.loads(cache_path.read_text(encoding="utf-8"))
+
+
+def _persisted_key(document: dict, name: str) -> str:
+    keys = [key for key in document["entries"] if key.endswith(name)]
+    assert len(keys) == 1
+    return keys[0]
+
+
+def _persisted_entry(repo_root: Path, name: str) -> dict:
+    document = _persisted_document(repo_root)
+    return document["entries"][_persisted_key(document, name)]
+
+
+class _AgedClock:
+    """Stands in for the time module so every file looks ``seconds`` older."""
+
+    def __init__(self, seconds: float) -> None:
+        self._seconds = seconds
+
+    def time(self) -> float:
+        return time.time() + self._seconds
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+def _anonymous_line(input_tokens: int) -> str:
+    return json.dumps({
+        "type": "assistant",
+        "timestamp": "2026-09-23T00:00:00.000Z",
+        "message": {
+            "model": "claude-sonnet-5",
+            "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+        },
+    })
+
+
+def _write_sequence(path: Path, count: int) -> None:
+    path.write_text(
+        "".join(_usage_line(f"msg_{i}", input_tokens=i + 1) + "\n" for i in range(count)),
+        encoding="utf-8",
+    )
+
+
+def test_restart_then_growth_resumes_from_persisted_state(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    transcript.write_text(
+        _usage_line("msg_1", input_tokens=10, output_tokens=1)
+        + "\n{not json\n"
+        + _anonymous_line(7)
+        + "\n"
+        + _usage_line("msg_2", input_tokens=20, output_tokens=2, timestamp="2026-09-21T23:00:00.000Z")
+        + "\n",
+        encoding="utf-8",
+    )
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+    assert _persisted_entry(repo_root, "session-a.jsonl").get("state") is not None
+
+    # Simulated process restart: no in-process cache, no section memo.
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage._COLLECT_MEMO.clear()
+    appended = (
+        _usage_line("msg_1", input_tokens=10, output_tokens=50)
+        + "\n"
+        + _anonymous_line(3)
+        + "\n"
+        + _usage_line("msg_3", input_tokens=30, output_tokens=3)
+        + "\n"
+    )
+    _append(transcript, appended)
+    tails_before = claude_code_usage.CACHE_STATS["tail_parses"]
+    fulls_before = claude_code_usage.CACHE_STATS["full_parses"]
+    bytes_before = claude_code_usage.CACHE_STATS["tail_bytes_read"]
+
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert claude_code_usage.CACHE_STATS["tail_parses"] == tails_before + 1
+    assert claude_code_usage.CACHE_STATS["full_parses"] == fulls_before
+    assert claude_code_usage.CACHE_STATS["tail_bytes_read"] - bytes_before == len(
+        appended.encode("utf-8")
+    )
+    assert second["totals"]["main"]["api_calls"] == 5
+    assert second["totals"]["main"]["malformed_lines"] == 1
+    assert second == _fresh_totals(repo_root)
+
+
+def test_stat_hit_after_restart_restores_state_for_later_growth(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    _write_sequence(transcript, 4)
+    claude_code_usage._FILE_CACHE.clear()
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage._COLLECT_MEMO.clear()
+    parsed = _parse_recorder(monkeypatch)
+    restored = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert parsed == []
+    assert restored == first
+    assert _memory_entry("session-a.jsonl").state is not None
+
+    _append(transcript, _usage_line("msg_4", input_tokens=50) + "\n")
+    tails_before = claude_code_usage.CACHE_STATS["tail_parses"]
+    fulls_before = claude_code_usage.CACHE_STATS["full_parses"]
+    grown = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert parsed == [transcript]
+    assert claude_code_usage.CACHE_STATS["tail_parses"] == tails_before + 1
+    assert claude_code_usage.CACHE_STATS["full_parses"] == fulls_before
+    assert grown == _fresh_totals(repo_root)
+
+
+def test_in_memory_entry_without_state_uses_persisted_state_as_previous(
+    monkeypatch, tmp_path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    _write_sequence(transcript, 4)
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+
+    key = _memory_key("session-a.jsonl")
+    memory = claude_code_usage._FILE_CACHE[key]
+    claude_code_usage._FILE_CACHE[key] = claude_code_usage._CacheEntry(
+        memory.size, memory.mtime_ns, memory.usage
+    )
+    _append(transcript, _usage_line("msg_4", input_tokens=50) + "\n")
+    tails_before = claude_code_usage.CACHE_STATS["tail_parses"]
+    fulls_before = claude_code_usage.CACHE_STATS["full_parses"]
+
+    grown = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert claude_code_usage.CACHE_STATS["tail_parses"] == tails_before + 1
+    assert claude_code_usage.CACHE_STATS["full_parses"] == fulls_before
+    assert grown == _fresh_totals(repo_root)
+
+
+def test_old_file_is_persisted_without_state_and_still_hits_by_stat(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_sequence(project_dir / "session-a.jsonl", 2)
+    monkeypatch.setattr(claude_code_usage, "time", _AgedClock(7 * 3600))
+    claude_code_usage._FILE_CACHE.clear()
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert "state" not in _persisted_entry(repo_root, "session-a.jsonl")
+
+    claude_code_usage._FILE_CACHE.clear()
+    parsed = _parse_recorder(monkeypatch)
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert parsed == []
+    assert second == first
+
+
+def test_persisted_state_of_an_old_file_is_not_restored_into_memory(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_sequence(project_dir / "session-a.jsonl", 2)
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+    assert _persisted_entry(repo_root, "session-a.jsonl").get("state") is not None
+
+    monkeypatch.setattr(claude_code_usage, "time", _AgedClock(7 * 3600))
+    claude_code_usage._FILE_CACHE.clear()
+    parsed = _parse_recorder(monkeypatch)
+    result = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert parsed == []
+    assert result["totals"]["main"]["api_calls"] == 2
+    assert _memory_entry("session-a.jsonl").state is None
+
+
+def test_cache_written_without_state_key_hits_by_stat_then_full_parses_on_growth(
+    monkeypatch, tmp_path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    _write_sequence(project_dir / "session-a.jsonl", 3)
+    _write_sequence(project_dir / "session-b.jsonl", 2)
+    claude_code_usage._FILE_CACHE.clear()
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    # Shape written by the shipped code: entries carry no "state" key.
+    cache_path = claude_code_usage._persistent_cache_path(repo_root)
+    document = _persisted_document(repo_root)
+    for entry in document["entries"].values():
+        entry.pop("state", None)
+    cache_path.write_text(json.dumps(document), encoding="utf-8")
+    assert _persisted_document(repo_root)["version"] == 1
+
+    claude_code_usage._FILE_CACHE.clear()
+    parsed = _parse_recorder(monkeypatch)
+    restored = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert parsed == []
+    assert restored == first
+
+    _append(project_dir / "session-a.jsonl", _usage_line("msg_new", input_tokens=9) + "\n")
+    parsed.clear()
+    grown = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert parsed == [project_dir / "session-a.jsonl"]
+    assert grown == _fresh_totals(repo_root)
+
+
+_BAD_STATE_FIELDS = [
+    ("state", "not-an-object"),
+    ("offset", True),
+    ("offset", 0),
+    ("offset", -1),
+    ("offset", 1.0),
+    ("offset", "5"),
+    ("offset", 10**9),
+    ("guard", "ab"),
+    ("guard", "A" * 64),
+    ("guard", "g" * 64),
+    ("guard", 5),
+    ("malformed_lines", -1),
+    ("malformed_lines", True),
+    ("malformed_lines", "1"),
+    ("malformed_lines", 1.5),
+    ("first_at", None),
+    ("last_at", 3),
+    ("calls_by_id", None),
+    ("calls_by_id", "x"),
+    ("calls_by_id", [["a"]]),
+    ("calls_by_id", [["", [1, 2, 3, 4, "m"]]]),
+    ("calls_by_id", [["a", [1, 2, 3, 4, "m"]], ["a", [1, 2, 3, 4, "m"]]]),
+    ("calls_by_id", [[7, [1, 2, 3, 4, "m"]]]),
+    ("calls_by_id", [["a", [True, 2, 3, 4, "m"]]]),
+    ("calls_by_id", [["a", [1.0, 2, 3, 4, "m"]]]),
+    ("calls_by_id", [["a", [1, 2, 3, 4]]]),
+    ("calls_by_id", [["a", [1, 2, 3, 4, "m", 9]]]),
+    ("anonymous_calls", None),
+    ("anonymous_calls", [[1, 2, 3]]),
+    ("anonymous_calls", [[True, 2, 3, 4, "m"]]),
+    ("anonymous_calls", "x"),
+]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    _BAD_STATE_FIELDS,
+    ids=[f"{field}-{index}" for index, (field, _value) in enumerate(_BAD_STATE_FIELDS)],
+)
+def test_invalid_persisted_state_drops_only_that_state(
+    monkeypatch, tmp_path, field, value
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    stable = project_dir / "session-stable.jsonl"
+    grown = project_dir / "session-grown.jsonl"
+    _write_sequence(stable, 3)
+    _write_sequence(grown, 3)
+    claude_code_usage._FILE_CACHE.clear()
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    cache_path = claude_code_usage._persistent_cache_path(repo_root)
+    document = _persisted_document(repo_root)
+    entry = document["entries"][_persisted_key(document, "session-grown.jsonl")]
+    if field == "state":
+        entry["state"] = value
+    else:
+        entry["state"][field] = value
+    cache_path.write_text(json.dumps(document), encoding="utf-8")
+
+    # Stat hits for both files: the bad state never costs usage or other entries.
+    claude_code_usage._FILE_CACHE.clear()
+    parsed = _parse_recorder(monkeypatch)
+    restored = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert parsed == []
+    assert restored == first
+
+    # Growth of the file with the bad state: one full parse, totals equal cold.
+    _append(grown, _usage_line("msg_new", input_tokens=99) + "\n")
+    tails_before = claude_code_usage.CACHE_STATS["tail_parses"]
+    fulls_before = claude_code_usage.CACHE_STATS["full_parses"]
+    parsed.clear()
+    result = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert parsed == [grown]
+    assert claude_code_usage.CACHE_STATS["full_parses"] == fulls_before + 1
+    assert claude_code_usage.CACHE_STATS["tail_parses"] == tails_before
+    assert result == _fresh_totals(repo_root)
+
+
+def test_truncation_or_prefix_rewrite_after_restart_falls_back_to_full_parse(
+    monkeypatch, tmp_path
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    _write_sequence(transcript, 4)
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+
+    rewrites = [
+        (_usage_line("msg_0", input_tokens=5) + "\n", 1, 5),
+        ("".join(_usage_line(f"other_{i}", input_tokens=9) + "\n" for i in range(6)), 6, 54),
+    ]
+    for content, api_calls, input_tokens in rewrites:
+        transcript.write_text(content, encoding="utf-8")
+        claude_code_usage._FILE_CACHE.clear()
+        tails_before = claude_code_usage.CACHE_STATS["tail_parses"]
+        fulls_before = claude_code_usage.CACHE_STATS["full_parses"]
+        result = claude_code_usage.collect_claude_code_usage(repo_root)
+        assert claude_code_usage.CACHE_STATS["full_parses"] == fulls_before + 1
+        assert claude_code_usage.CACHE_STATS["tail_parses"] == tails_before
+        assert result["totals"]["main"]["api_calls"] == api_calls
+        assert result["totals"]["main"]["input_tokens"] == input_tokens
+    assert result == _fresh_totals(repo_root)
+
+
+def test_partial_line_completed_after_restart_is_counted_once(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    whole = _usage_line("msg_2", input_tokens=20, output_tokens=2)
+    transcript.write_text(
+        _usage_line("msg_1", input_tokens=10) + "\n" + whole[:40], encoding="utf-8"
+    )
+    claude_code_usage._FILE_CACHE.clear()
+    first = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert first["totals"]["main"]["malformed_lines"] == 1
+    assert first["totals"]["main"]["api_calls"] == 1
+
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage._COLLECT_MEMO.clear()
+    assert claude_code_usage.collect_claude_code_usage(repo_root) == first
+
+    _append(transcript, whole[40:] + "\n")
+    seen = _line_counter(monkeypatch)
+    tails_before = claude_code_usage.CACHE_STATS["tail_parses"]
+    fulls_before = claude_code_usage.CACHE_STATS["full_parses"]
+    second = claude_code_usage.collect_claude_code_usage(repo_root)
+
+    assert seen == [(whole + "\n").encode("utf-8")]
+    assert claude_code_usage.CACHE_STATS["tail_parses"] == tails_before + 1
+    assert claude_code_usage.CACHE_STATS["full_parses"] == fulls_before
+    assert second["totals"]["main"]["malformed_lines"] == 0
+    assert second["totals"]["main"]["api_calls"] == 2
+    assert second == _fresh_totals(repo_root)
+
+
+def test_persisted_state_holds_no_message_content(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    marker = "PRIVATE-CONTENT-MARKER-7f3a"
+    transcript = project_dir / "session-a.jsonl"
+    transcript.write_text(
+        _usage_line("msg_1", input_tokens=10, text=marker)
+        + "\n"
+        + '{"type":"assistant","message":{"id":"msg_partial","content":"'
+        + marker,
+        encoding="utf-8",
+    )
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+
+    cache_text = claude_code_usage._persistent_cache_path(repo_root).read_text(encoding="utf-8")
+    assert marker in transcript.read_text(encoding="utf-8")
+    assert marker not in cache_text
+    assert "msg_partial" not in cache_text
+    assert _persisted_entry(repo_root, "session-a.jsonl").get("state") is not None
+
+
+def test_message_id_order_survives_persistence(monkeypatch, tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    project_dir = _setup_project(monkeypatch, tmp_path, repo_root)
+    transcript = project_dir / "session-a.jsonl"
+    transcript.write_text(
+        _usage_line("msg_z", input_tokens=1)
+        + "\n"
+        + _usage_line("msg_a", input_tokens=2)
+        + "\n"
+        + _usage_line("msg_m", input_tokens=3)
+        + "\n",
+        encoding="utf-8",
+    )
+    order = ["msg_z", "msg_a", "msg_m"]
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+    persisted_ids = [row[0] for row in _persisted_entry(repo_root, "session-a.jsonl")["state"]["calls_by_id"]]
+    assert persisted_ids == order
+
+    claude_code_usage._FILE_CACHE.clear()
+    claude_code_usage._COLLECT_MEMO.clear()
+    claude_code_usage.collect_claude_code_usage(repo_root)
+    assert list(_memory_entry("session-a.jsonl").state.calls_by_id) == order
+
+    # A rewrite of an existing id keeps its first position, as a cold parse does.
+    _append(transcript, _usage_line("msg_z", input_tokens=1, output_tokens=40) + "\n")
+    claude_code_usage._FILE_CACHE.clear()
+    grown = claude_code_usage.collect_claude_code_usage(repo_root)
+    assert list(_memory_entry("session-a.jsonl").state.calls_by_id) == order
+    assert grown == _fresh_totals(repo_root)
