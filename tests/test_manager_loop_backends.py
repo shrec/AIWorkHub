@@ -1404,9 +1404,10 @@ def test_codex_seat_env_keeps_codex_home_and_embeds_seat_token_in_toml(tmp_path,
         assert seat_token_file.stat().st_mode & 0o777 == 0o600
 
 
-def test_claude_seat_env_returns_exactly_the_two_seat_keys_reusing_one_token(tmp_path):
+def test_claude_seat_env_returns_the_two_seat_keys_and_the_manager_surface_reusing_one_token(tmp_path):
     from pathlib import Path
 
+    from aiworkhub import server
     from aiworkhub.manager_loop_backends import provision_manager_seat_env
 
     first = provision_manager_seat_env(
@@ -1415,10 +1416,13 @@ def test_claude_seat_env_returns_exactly_the_two_seat_keys_reusing_one_token(tmp
         python_executable="python",
         package_import_root="src",
     )
+    # NF-2026-02352: the seat pins the manager MCP profile instead of inheriting one.
     assert set(first) == {
         "AIWORKHUB_MANAGER_SEAT_BACKEND",
         "AIWORKHUB_MANAGER_SEAT_TOKEN",
+        server.MCP_SURFACE_ENV,
     }
+    assert first[server.MCP_SURFACE_ENV] == server.MCP_SURFACE_MANAGER
     assert first["AIWORKHUB_MANAGER_SEAT_BACKEND"] == "claude_cli"
     second = provision_manager_seat_env(
         tmp_path,

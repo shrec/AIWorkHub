@@ -1339,7 +1339,11 @@ def provision_manager_seat_env(
     every later provision call, so the env token and the file always agree.
     ``claude_cli`` needs no config file: it loads the project's ``.mcp.json``
     ``AIWorkHub`` server with ``cwd=repo``, and Claude passes its environment
-    into that stdio server, so it returns exactly those two seat keys.
+    into that stdio server, so it returns those two seat keys plus the pinned
+    MCP surface. NF-2026-02352: every seat pins ``AIWORKHUB_MCP_SURFACE`` to
+    the manager profile (server's own constants), so a seat spawned from the
+    dashboard child (surface ``dashboard``, merged in by ``_spawn_cli``) never
+    inherits the webview-only profile.
     ``codex_cli`` gets an isolated ``CODEX_HOME`` holding a manager
     ``config.toml`` (0600). ``opencode_cli`` gets the manager config through
     its config-content env (project config disabled). The embedded server env
@@ -1348,11 +1352,16 @@ def provision_manager_seat_env(
     it flows from the launching gated child through process env inheritance,
     and a forged token fails closed against the 0600 seat token file.
     """
+    # Imported lazily: server is the owner of the surface vocabulary and is
+    # already loaded in the dashboard child that runs the manager loop.
+    from . import server as _server
+
     if backend_id not in MANAGER_BACKEND_IDS:
         raise ManagerLoopError(f"manager_backend_unsupported:{backend_id}")
     root = Path(repo).resolve()
     seat_dir = root / ".aiworkhub" / "runtime" / MANAGER_SEAT_RUNTIME_DIRNAME
     token = _read_or_mint_manager_seat_token(seat_dir / f"seat-token-{backend_id}")
+    surface = {_server.MCP_SURFACE_ENV: _server.MCP_SURFACE_MANAGER}
     server_env = {
         "AIWORKHUB_REPO": str(root),
         "AIWORKHUB_REPO_ROOT": str(root),
@@ -1360,11 +1369,13 @@ def provision_manager_seat_env(
         "PYTHONPATH": str(package_import_root),
         "AIWORKHUB_MANAGER_SEAT_BACKEND": backend_id,
         "AIWORKHUB_MANAGER_SEAT_TOKEN": token,
+        **surface,
     }
     if backend_id == "claude_cli":
         return {
             "AIWORKHUB_MANAGER_SEAT_BACKEND": backend_id,
             "AIWORKHUB_MANAGER_SEAT_TOKEN": token,
+            **surface,
         }
     if backend_id == "codex_cli":
         codex_home = seat_dir / "codex-home"

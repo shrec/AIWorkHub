@@ -2263,6 +2263,7 @@ def _manager_seat_mcp_environment(environment: Mapping[str, str]) -> dict[str, s
             "AIWORKHUB_ALLOW_WRITES",
             "AIWORKHUB_ALLOW_LAUNCH",
             "AIWORKHUB_MCP_STDIO_BACKEND",
+            "AIWORKHUB_MCP_SURFACE",  # NF-2026-02352 pinned manager profile
             "AIWORKHUB_MANAGER_SEAT_BACKEND",
             "AIWORKHUB_MANAGER_SEAT_TOKEN",  # NF-2026-01383 seat identity
             "PYTHONPATH",
