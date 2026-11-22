@@ -1871,23 +1871,36 @@ def review_queue() -> dict[str, Any]:
         )
 
     try:
+        # NF-2026-02358: list every review card; one awaiting its receipt is marked waiting.
         rows = [
             row
             for row in task_store.list_review_queue_cards(repo_root(), limit=5000)
             if _review_substatus(row) != "finalize_failed"
-            and (
-                task_store.manager_ready_marker(row) is not None
-                or _review_substatus(row) != "review_ready"
-            )
         ][:500]
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
-    lines = [f"=== Codex Review Queue ({len(rows)}) ==="]
+
+    def _waiting_marker(row: Mapping[str, Any]) -> str:
+        if _review_substatus(row) != "review_ready":
+            return ""
+        return "" if task_store.manager_ready_marker(row) is not None else " (waiting_reviewers)"
+
+    lines = [f"=== {_review_queue_title()} ({len(rows)}) ==="]
     lines.extend(
         f"  [{r.get('topic') or '?'}] [{r.get('runner') or '?'}] {r.get('task_id') or ''}"
+        f"{_waiting_marker(r)}"
         for r in rows
     )
     return _canonical_result(ok=True, returncode=0, stdout="\n".join(lines), command=command)
+
+
+def _review_queue_title() -> str:
+    """``<Provider> Review Queue`` for the current manager, else a neutral title."""
+    try:
+        provider = str(_current_chat_provider() or "").strip()
+    except Exception:  # noqa: BLE001 - an unresolvable manager keeps the neutral title
+        provider = ""
+    return f"{provider.capitalize()} Review Queue" if provider else "Review Queue"
 
 
 def list_tasks(status: str = "pending", topic: str | None = None, limit: int = 80) -> dict[str, Any]:
@@ -4179,8 +4192,8 @@ def create_time_runner_route_warnings(runner: str) -> list[str]:
 
     * the folded runner resolves to no canonical workforce row and no catalog
       launch identity;
-    * the folded runner's family constrains adapters to a tuple that the
-      canonical workforce table can pin no model for.
+    * and launch's own derivation (``launch_adapter_candidates``) yields no adapter,
+      i.e. launch would refuse it; the bare ``claude`` runner never warns (NF-2026-02360).
     """
     from . import process_launcher as _launcher_routes
     from . import workforce_catalog as _catalog
@@ -4198,19 +4211,14 @@ def create_time_runner_route_warnings(runner: str) -> list[str]:
         return []
     if identity in table_runners or identity in catalog_runners:
         return []
+    # NF-2026-02360: warn only when launch's own adapter derivation would refuse.
+    adapters, _from_catalog = _catalog.launch_adapter_candidates(repo_root(), identity)
+    if adapters:
+        return []
     warnings = [
         f"workforce_route_absent:runner={identity}:"
         "no canonical workforce row and no catalog launch identity"
     ]
-    adapters = _launcher_routes.adapter_identity_tuple(identity)
-    if adapters and not any(
-        (identity, adapter) in _launcher_routes._CANONICAL_WORKFORCE
-        for adapter in adapters
-    ):
-        warnings.append(
-            f"workforce_model_unpinnable:runner={identity}:"
-            f"adapters={'|'.join(adapters)}"
-        )
     return warnings
 
 

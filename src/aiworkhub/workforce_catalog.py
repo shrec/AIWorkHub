@@ -1138,6 +1138,23 @@ def catalog_launch_identities(
     return identities
 
 
+def launch_adapter_candidates(repo: Path | str, runner: str) -> tuple[tuple[str, ...], bool]:
+    """``(adapters, from_catalog)`` for an unpinned runner; empty means launch refuses it (NF-2026-02360)."""
+    from .process_launcher import adapter_identity_tuple
+
+    candidates = adapter_identity_tuple(runner)
+    if candidates:
+        return candidates, False
+    try:
+        identities = catalog_launch_identities(Path(repo))
+    except Exception:  # noqa: BLE001 - an unreadable catalog pins no adapter
+        identities = {}
+    worker = identities.get(runner) if isinstance(identities, Mapping) else None
+    route_adapter = worker.get("route_adapter_id") if isinstance(worker, Mapping) else ""
+    route_adapter = str(route_adapter or "").strip()
+    return ((route_adapter,), True) if route_adapter else ((), False)
+
+
 def catalog_declares_route(repo_root: Path | str, adapter_id: str, model: str) -> bool:
     """Whether the configured catalog declares this exact (adapter, model).
 

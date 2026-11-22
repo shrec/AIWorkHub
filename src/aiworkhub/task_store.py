@@ -2043,7 +2043,15 @@ _REVIEW_QUEUE_SQL = (
     "CASE json_type(card_json, '$.terminal_review') "
     "WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' "
     "ELSE json_quote(json_extract(card_json, '$.terminal_review')) END "
-    "ELSE NULL END AS terminal_review_json "
+    "ELSE NULL END AS terminal_review_json, "
+    "CASE WHEN json_valid(card_json) "
+    "AND json_type(card_json, '$.manager_ready_receipt') = 'object' "
+    "THEN json_extract(card_json, '$.manager_ready_receipt') "
+    "ELSE NULL END AS manager_ready_receipt_json, "
+    "CASE WHEN json_valid(card_json) "
+    "AND json_type(card_json, '$.claim_epoch') IN ('integer', 'text') "
+    "THEN json_extract(card_json, '$.claim_epoch') "
+    "ELSE NULL END AS claim_epoch "
     "FROM tasks WHERE (lower(status) IN ({placeholders}) OR lower(worker_status) IN ({placeholders})) "
     "AND trim(COALESCE(archived_at, ''), char(9)||char(10)||char(11)||char(12)||char(13)||char(32)) = '' "
     "AND lower(status) NOT IN ('finished', 'completed', 'stale_already_done') "
@@ -2102,8 +2110,10 @@ def list_review_queue_cards(root: str | Path, *, limit: int = 500) -> list[dict[
     guarded by ``json_valid`` for the same fail-closed reason as
     ``terminal_substatus``/``terminal_review`` below.
 
-    Only ``topic``, ``terminal_substatus`` and ``terminal_review`` -- the
-    ``card_json`` fields ``core.review_queue`` reads -- are projected out via
+    Only ``topic``, ``terminal_substatus``, ``terminal_review``,
+    ``manager_ready_receipt`` and ``claim_epoch`` -- the ``card_json`` fields
+    ``core.review_queue`` and ``manager_ready_marker`` read (NF-2026-02358:
+    without the last two every marker check failed) -- are projected out via
     ``json_extract``, guarded by ``json_valid`` so one malformed selected
     row's ``card_json`` degrades to null extras instead of raising and
     failing the whole query. ``terminal_review`` additionally goes through
@@ -2128,19 +2138,26 @@ def list_review_queue_cards(root: str | Path, *, limit: int = 500) -> list[dict[
     cards: list[dict[str, Any]] = []
     for row in rows:
         card = dict(row)
-        raw_terminal_review = card.pop("terminal_review_json", None)
-        terminal_review: Any = None
-        if raw_terminal_review is not None:
-            try:
-                terminal_review = json.loads(raw_terminal_review)
-            except (TypeError, json.JSONDecodeError):
-                terminal_review = None
-        card["terminal_review"] = terminal_review
+        card["terminal_review"] = _decode_projected_json(card.pop("terminal_review_json", None))
+        # ``manager_ready_marker`` reads these two (NF-2026-02358).
+        card["manager_ready_receipt"] = _decode_projected_json(
+            card.pop("manager_ready_receipt_json", None)
+        )
         card["status"] = canonical_status(card)
         if card["status"] != "review":
             continue
         cards.append(card)
     return cards
+
+
+def _decode_projected_json(raw: Any) -> Any:
+    """Decode one ``json_extract`` projection; anything undecodable reads as None."""
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
 
 
 # Terminal event names that carry a provider route outcome in their evidence.

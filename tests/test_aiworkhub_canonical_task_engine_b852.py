@@ -1448,7 +1448,7 @@ def test_run_taskctl_compat_dispatcher_no_aitools_or_subprocess(writable_repo):
 
     queue = core.run_taskctl(["review-queue"])
     assert queue.returncode == 0
-    assert "=== Codex Review Queue (1) ===" in queue.stdout
+    assert "Review Queue (1) ===" in queue.stdout
     assert "  [coding] [claude_coding] TASK_RUN_COMPAT" in queue.stdout
     assert "AITools" not in " ".join(queue.command)
 

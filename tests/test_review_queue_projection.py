@@ -47,6 +47,9 @@ def repo(tmp_path, monkeypatch):
     root = _init_repo(tmp_path)
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.delenv("AIWORKHUB_ALLOW_WRITES", raising=False)
+    # NF-2026-02358: the header names the current manager provider; pin it so
+    # the ``Codex Review Queue`` header these tests assert is deterministic.
+    monkeypatch.setattr(core, "_current_chat_provider", lambda card=None: "codex")
     yield root
 
 

@@ -129,6 +129,7 @@ from .launch_zero_delta import (
     changed_allowed_write_paths,
     evaluate_zero_delta_tripwire,
     split_lifecycle_tail,
+    stated_lifecycle_tail,
     zero_delta_elapsed_share,
     zero_delta_notice_after_seconds,
 )
@@ -3207,18 +3208,11 @@ def derive_launch_identity(
     adapter_candidates = adapter_identity_tuple(resolved_runner)
     adapter_rejections: list[str] = []
     catalog_adapter_fallback = False
-    if not resolved_adapter and not adapter_candidates:
-        try:
-            from . import workforce_catalog
-
-            identities = workforce_catalog.catalog_launch_identities(repo)
-        except Exception:  # noqa: BLE001 - an unreadable catalog pins no adapter
-            identities = {}
-        worker = identities.get(resolved_runner)
-        route_adapter = str((worker or {}).get("route_adapter_id") or "").strip() if worker is not None else ""
-        if route_adapter:
-            adapter_candidates = (route_adapter,)
-            catalog_adapter_fallback = True
+    if not resolved_adapter:
+        from . import workforce_catalog  # local import: cycle-safe (core -> launcher)
+        adapter_candidates, catalog_adapter_fallback = (
+            workforce_catalog.launch_adapter_candidates(repo, resolved_runner)
+        )
     if not resolved_adapter:
         if not adapter_candidates:
             raise LaunchRejected(
@@ -12203,7 +12197,8 @@ class ProcessManager:
         # stable request identity from the full request lineage while keeping
         # the final row authoritative for state/disposition.
         lineage = self._event_identity(events)
-        latest = {**lineage, **split_lifecycle_tail(events)[0]}
+        # NF-2026-02358: a stateless trailing row never nulls the state.
+        latest = {**lineage, **stated_lifecycle_tail(events)[0]}
         # Restore the lineage's error/retention_error over an overlay row.
         latest.update({key: lineage[key] for key in ("error", "retention_error") if key in lineage})
         if (
@@ -12239,7 +12234,7 @@ class ProcessManager:
                     latest["reconciliation_deferred"] = "request_lock_busy"
                 events = self._request_events(request_id)
                 lineage = self._event_identity(events)
-                latest = {**lineage, **split_lifecycle_tail(events)[0], **{
+                latest = {**lineage, **stated_lifecycle_tail(events)[0], **{
                     key: value
                     for key, value in latest.items()
                     if key == "reconciliation_deferred"
@@ -12271,11 +12266,15 @@ class ProcessManager:
                 card = _parse_card(self._show_task(task_id), task_id)
             except Exception as exc:
                 card_read = f"read_failed:{type(exc).__name__}"  # not absent
+        state = str(latest.get("state") or "").strip()
+        if not state:
+            # No lifecycle row has a state: derive it from the card, never null.
+            state = core._lifecycle_state(card) if card else "unknown"
         return {
             "ok": True,
             "request_id": request_id,
             "task_id": task_id,
-            "state": latest.get("state"),
+            "state": state,
             "process_alive": process_alive,
             "exit_code": code,
             "pid": latest.get("pid"),

@@ -45,13 +45,49 @@ def split_lifecycle_tail(
     lifecycle: dict[str, Any] = {}
     advisory: dict[str, Any] | None = None
     for event in events:
-        if str(event.get("event_type") or "") in ORCHESTRATOR_ADVISORY_EVENT_TYPES:
-            continue
-        if str(event.get("event_kind") or "") == RUNTIME_NOTICE_EVENT_KIND:
+        kind = _tail_row_kind(event)
+        if kind == "advisory":
             advisory = event
-        else:
+        elif kind == "lifecycle":
             lifecycle = event
     return lifecycle, advisory
+
+
+def _tail_row_kind(event: dict[str, Any]) -> str:
+    """``skip`` (orchestrator advisory), ``advisory`` (runtime notice) or ``lifecycle``."""
+
+    if str(event.get("event_type") or "") in ORCHESTRATOR_ADVISORY_EVENT_TYPES:
+        return "skip"
+    if str(event.get("event_kind") or "") == RUNTIME_NOTICE_EVENT_KIND:
+        return "advisory"
+    return "lifecycle"
+
+
+def stated_lifecycle_tail(
+    events: Iterable[dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    """``split_lifecycle_tail``'s lifecycle row, with a state whenever one exists.
+
+    NF-2026-02358: a lifecycle tail can end in a row that carries no ``state``
+    (a small delta row), and a status reader that took ``state`` from it
+    reported ``null``. The tail row stays authoritative for every other field;
+    only a missing/blank ``state`` is filled from the LAST lifecycle row that
+    has one. Returns ``(row, source)`` where source is ``lifecycle_tail``,
+    ``last_stated_lifecycle_row`` or ``absent`` (no lifecycle row has a state;
+    the caller must derive one from elsewhere, never report null).
+    """
+
+    rows = list(events)
+    tail, _advisory = split_lifecycle_tail(rows)
+    if str(tail.get("state") or "").strip():
+        return tail, "lifecycle_tail"
+    for event in reversed(rows):
+        if _tail_row_kind(event) != "lifecycle":
+            continue
+        state = str(event.get("state") or "").strip()
+        if state:
+            return {**tail, "state": state}, "last_stated_lifecycle_row"
+    return tail, "absent"
 
 
 def zero_delta_elapsed_share() -> float:
