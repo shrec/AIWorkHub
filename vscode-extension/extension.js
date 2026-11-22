@@ -11625,6 +11625,45 @@ async function callFullSnapshot(view, client, timeoutMs) {
   return entry.request;
 }
 
+// One full-snapshot paint shared by pushSnapshotOnce, pushSnapshotNoRetry and
+// the late reply of either, on time or late. It posts only while the view is
+// still bound to `client` and the request is the latest one. `authoritative`
+// applies to an on-time reply only; a late reply never forces it. Returns true
+// when posted; the caller converges background services after a true return,
+// never before.
+function paintFullSnapshot(view, client, payload, options) {
+  const { requestSeq, authoritative = false } = options;
+  if (!payload || !view.stillBoundTo(client)) return false;
+  if (!authoritative && requestSeq !== view.snapshotRequestSeq) return false;
+  view.postMessage({
+    type: OUTBOUND_TYPES.snapshot,
+    payload: sanitizeWebviewPayload({
+      ...payload,
+      system_logs: systemLogSnapshot(),
+      ...runtimeRetentionSnapshotFields(),
+    }),
+  });
+  view.fullSnapshotPainted = true;
+  return true;
+}
+
+// NF-2026-02349: follow a timed-out request's late reply in the background, the
+// same way pushSnapshotOnce awaits it, without holding up the caller.
+function paintLateSnapshotReply(view, client, err, requestSeq, options) {
+  const lateReply = lateSnapshotReply(err);
+  if (!lateReply) return;
+  lateReply.then(
+    (payload) => {
+      debugTrace("snapshot.late.received", { request_seq: requestSeq });
+      // A late reply always obeys the latest-request rule: any newer request joined the same flight and paints it itself.
+      if (paintFullSnapshot(view, client, payload, { requestSeq })
+        && options.convergeBackgroundServices) {
+        client._convergeBackgroundServices();
+      }
+    },
+  ).catch((lateErr) => debugTrace("snapshot.late.error", { request_seq: requestSeq, ...debugErrorFields(lateErr) }));
+}
+
 async function pushSnapshotOnce(view) {
   // The optional second argument is test-only dependency injection. Keep the
   // public host call shape stable: production always resolves the repo-bound
@@ -11744,16 +11783,7 @@ async function pushSnapshotOnce(view) {
     attempt: attempt + 1,
     payload_present: Boolean(payload),
   });
-  if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
-    view.postMessage({
-      type: OUTBOUND_TYPES.snapshot,
-      payload: sanitizeWebviewPayload({
-        ...payload,
-        system_logs: systemLogSnapshot(),
-        ...runtimeRetentionSnapshotFields(),
-      }),
-    });
-    view.fullSnapshotPainted = true;
+  if (paintFullSnapshot(view, client, payload, { requestSeq })) {
     // The storage state is now visible. Only now may slower background
     // services use this serialized MCP transport.
     client._convergeBackgroundServices();
@@ -11767,21 +11797,13 @@ async function pushSnapshotNoRetry(view, options = {}) {
   const requestSeq = ++view.snapshotRequestSeq;
   const authoritative = options.authoritative === true;
   const convergeBackgroundServices = options.convergeBackgroundServices !== false;
+  let client = null;
   try {
-    const client = options.client || getDashboardClient();
+    client = options.client || getDashboardClient();
     view.bindClient(client);
     refreshCoordinatorRouteBeforeSnapshot();
     const payload = await callFullSnapshot(view, client, MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS);
-    if (payload && view.stillBoundTo(client) && (authoritative || requestSeq === view.snapshotRequestSeq)) {
-      view.postMessage({
-        type: OUTBOUND_TYPES.snapshot,
-        payload: sanitizeWebviewPayload({
-          ...payload,
-          system_logs: systemLogSnapshot(),
-          ...runtimeRetentionSnapshotFields(),
-        }),
-      });
-      view.fullSnapshotPainted = true;
+    if (paintFullSnapshot(view, client, payload, { requestSeq, authoritative })) {
       if (convergeBackgroundServices) client._convergeBackgroundServices();
       return { posted: true, payload };
     } else if (!payload && (authoritative || requestSeq === view.snapshotRequestSeq)) {
@@ -11795,6 +11817,9 @@ async function pushSnapshotNoRetry(view, options = {}) {
         reason,
       });
     }
+    // NF-2026-02349: the timed-out request is still pending in the reader. Its
+    // late reply paints in the background; this call has already returned.
+    if (client) paintLateSnapshotReply(view, client, err, requestSeq, { convergeBackgroundServices });
   }
   return { posted: false, payload: null };
 }
