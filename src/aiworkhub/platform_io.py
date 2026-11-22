@@ -1476,11 +1476,15 @@ def terminate_process_tree(
         taskkill = windows_system_taskkill_path()
         if taskkill is not None:
             graceful_ran = True
+            # taskkill prints a SUCCESS line per killed process; an inherited stdout
+            # would corrupt a JSON-lines parent such as the dashboard reader.
             try:
                 run(
                     [taskkill, "/PID", str(identity), "/T"],
                     check=False,
                     shell=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     timeout=timeout,
                 )
             except (subprocess.TimeoutExpired, OSError):
@@ -1495,6 +1499,8 @@ def terminate_process_tree(
                         [taskkill, "/F", "/PID", str(identity), "/T"],
                         check=False,
                         shell=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
                         timeout=timeout,
                     )
                 except (subprocess.TimeoutExpired, OSError):

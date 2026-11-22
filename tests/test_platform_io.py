@@ -1940,6 +1940,8 @@ def test_posix_process_tree_zero_timeout_escalates_without_sleeping():
 
 
 _SYSTEM_TASKKILL = r"C:\Windows\System32\taskkill.exe"
+# taskkill SUCCESS lines must never reach an inherited stdout (dashboard reader JSON lines).
+_TASKKILL_QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 
 
 class _FakeClock:
@@ -1978,7 +1980,7 @@ def test_windows_process_tree_uses_graceful_taskkill_tree_command(system_taskkil
     assert calls == [
         (
             [system_taskkill, "/PID", "42", "/T"],
-            {"check": False, "shell": False, "timeout": 2.5},
+            {"check": False, "shell": False, "timeout": 2.5, **_TASKKILL_QUIET},
         )
     ]
 
@@ -2007,11 +2009,11 @@ def test_windows_process_tree_forces_survivor_after_grace_period(system_taskkill
     assert calls == [
         (
             [system_taskkill, "/PID", "42", "/T"],
-            {"check": False, "shell": False, "timeout": 0.1},
+            {"check": False, "shell": False, "timeout": 0.1, **_TASKKILL_QUIET},
         ),
         (
             [system_taskkill, "/F", "/PID", "42", "/T"],
-            {"check": False, "shell": False, "timeout": 0.1},
+            {"check": False, "shell": False, "timeout": 0.1, **_TASKKILL_QUIET},
         ),
     ]
 
@@ -2342,7 +2344,7 @@ def test_windows_module_import_and_process_branches_do_not_require_killpg(monkey
     assert calls == [
         (
             [_SYSTEM_TASKKILL, "/PID", "42", "/T"],
-            {"check": False, "shell": False, "timeout": 1.5},
+            {"check": False, "shell": False, "timeout": 1.5, **_TASKKILL_QUIET},
         )
     ]
     assert not imported.probe_process_group(42, platform_name="linux")
