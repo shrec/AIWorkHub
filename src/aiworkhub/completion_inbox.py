@@ -1311,6 +1311,116 @@ def _packet_decision(packet: dict[str, Any], preview: dict[str, Any]) -> dict[st
     }
 
 
+# NF-2026-02361: the one decision field review_packet may shrink, named under
+# ``truncation.compacted_sections`` when it does.
+_DECISION_COMPACTED_SECTION = "decision.dispose_calls"
+
+
+def _packet_compact_decision(packet: dict[str, Any], max_bytes: int) -> bool:
+    """Fold ``decision.dispose_calls`` so an over-bound packet can honour max_bytes.
+
+    The accept and reject argument dicts are never touched. The per-finding
+    calls become ``{count, finding_ids, omitted_finding_id_count, template}``:
+    ``template`` is the dispose argument dict without ``finding_id`` (its
+    ``reviewer_request_id`` is blank when the findings span several reviewers;
+    ``reviewer_request_ids`` then lists them all and ``finding_reviewer_index[i]``
+    is the position of finding_ids[i]'s reviewer in it). ``finding_ids`` keeps
+    the call order and, only if the packet still exceeds the bound, is cut to
+    the longest prefix that fits (the index with it), the rest counted.
+    Returns whether it compacted.
+    """
+    decision = packet.get("decision")
+    if not isinstance(decision, dict):
+        return False
+    calls = decision.get("dispose_calls")
+    if not isinstance(calls, list) or not calls:
+        return False
+    arguments = [
+        call["arguments"]
+        for call in calls
+        if isinstance(call, dict) and isinstance(call.get("arguments"), dict)
+    ]
+    finding_ids = [str(args.get("finding_id") or "") for args in arguments]
+    finding_reviewers = [str(args.get("reviewer_request_id") or "") for args in arguments]
+    reviewer_ids = list(dict.fromkeys(finding_reviewers))
+    template = {
+        key: value
+        for key, value in (arguments[0] if arguments else {}).items()
+        if key != "finding_id"
+    }
+    reviewer_index: list[int] | None = None
+    if len(reviewer_ids) > 1:
+        template["reviewer_request_id"] = ""
+        position = {reviewer: i for i, reviewer in enumerate(reviewer_ids)}
+        reviewer_index = [position[reviewer] for reviewer in finding_reviewers]
+    folded: dict[str, Any] = {
+        "compacted": True,
+        "tool": _DECISION_DISPOSE_TOOL,
+        "count": len(finding_ids),
+        "finding_ids": finding_ids,
+        "omitted_finding_id_count": 0,
+        "template": template,
+        # Whole, never row-capped: finding_reviewer_index points into it.
+        "reviewer_request_ids": reviewer_ids,
+    }
+
+    def keep(prefix: int) -> None:
+        folded["finding_ids"] = finding_ids[:prefix]
+        folded["omitted_finding_id_count"] = len(finding_ids) - prefix
+        if reviewer_index is not None:
+            folded["finding_reviewer_index"] = reviewer_index[:prefix]
+
+    keep(len(finding_ids))
+    decision["dispose_calls"] = folded
+    truncation = packet.setdefault("truncation", {})
+    compacted = truncation.setdefault("compacted_sections", [])
+    if _DECISION_COMPACTED_SECTION not in compacted:
+        compacted.append(_DECISION_COMPACTED_SECTION)
+    if _packet_finalized_bytes(packet) <= max_bytes:
+        return True
+    # Largest kept prefix that fits; bounded at log2(count) encodes.
+    low, high = 0, len(finding_ids)
+    while low < high:
+        middle = (low + high + 1) // 2
+        keep(middle)
+        if _packet_finalized_bytes(packet) <= max_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    keep(low)
+    return True
+
+
+def _packet_finalized_bytes(packet: dict[str, Any]) -> int:
+    """Bytes of ``packet`` once review_packet adds its own size trailer.
+
+    ``encoded_bytes`` and ``truncation.within_bound`` are appended after the
+    measurement; compaction budgets for them (with the longer ``false``) so the
+    returned packet itself, not just its pre-trailer body, honours the bound.
+    """
+    truncation = packet.get("truncation")
+    finalized = {
+        **packet,
+        "encoded_bytes": _packet_encoded_bytes(packet),
+        "truncation": {
+            **(truncation if isinstance(truncation, dict) else {}),
+            "within_bound": False,
+        },
+    }
+    return _packet_encoded_bytes(finalized)
+
+
+def _packet_citation_drift_row(row: dict[str, Any]) -> dict[str, Any]:
+    """One bounded citation-drift row of the packet's ``gates`` section."""
+    return {
+        "doc": _packet_text(row.get("doc"), 300),
+        "doc_line": row.get("doc_line"),
+        "citation": _packet_text(row.get("citation"), 300),
+        "replacement": _packet_text(row.get("replacement"), 300),
+        "status": _packet_text(row.get("status"), 40),
+    }
+
+
 def _packet_preview_lenses(per_lens: Any, reviewer_reports: Any) -> list[dict[str, Any]] | None:
     """Lens rows from accept_preview's live ``per_lens``, or None to keep the verdict's.
 
@@ -1433,6 +1543,17 @@ def _review_packet_sections(
         for row in validation_rows
         if isinstance(row.get("pytest_outcomes"), dict)
     )
+    # NF-2026-02370: re-partitioned by the card's own allowed_writes, so a gate
+    # recorded before the split was stored still surfaces only actionable rows.
+    from aiworkhub import quality_evidence
+
+    drift_in_scope, drift_outside_scope = quality_evidence.partition_citation_drift_by_scope(
+        _packet_rows(gate.get("review_ready_citation_drift")), card.get("allowed_writes")
+    )
+    drift_outside_scope = (
+        drift_outside_scope
+        + _packet_rows(gate.get("review_ready_citation_drift_outside_scope"))
+    )[:_PACKET_MAX_ROWS]
     packet.update(
         {
             "task_id": str(task_id or identity.get("task_id") or card.get("task_id") or ""),
@@ -1497,15 +1618,19 @@ def _review_packet_sections(
                     )
                 ],
                 "citation_drift": [
-                    {
-                        "doc": _packet_text(row.get("doc"), 300),
-                        "doc_line": row.get("doc_line"),
-                        "citation": _packet_text(row.get("citation"), 300),
-                        "replacement": _packet_text(row.get("replacement"), 300),
-                        "status": _packet_text(row.get("status"), 40),
-                    }
-                    for row in _packet_rows(gate.get("review_ready_citation_drift"))
+                    _packet_citation_drift_row(row) for row in drift_in_scope
                 ],
+                # NF-2026-02370: drift in a doc outside allowed_writes, which
+                # the worker cannot fix; present only when there is any.
+                **(
+                    {
+                        "citation_drift_outside_scope": [
+                            _packet_citation_drift_row(row) for row in drift_outside_scope
+                        ]
+                    }
+                    if drift_outside_scope
+                    else {}
+                ),
                 "behavioral_gate": gate.get("behavioral_gate"),
             },
             "validation_skipped_total": validation_skipped_total,
@@ -1630,6 +1755,12 @@ def review_packet(
             break
         if _packet_drop(packet, section):
             packet["truncation"]["dropped_sections"].append(section)
+    # NF-2026-02361: still over the bound with every evidence section gone, the
+    # decision is COMPACTED, never dropped: accept/reject stay whole and only
+    # the per-finding dispose calls fold. A packet that already fits never
+    # reaches this, so it stays byte-identical.
+    if _packet_finalized_bytes(packet) > int(max_bytes):
+        _packet_compact_decision(packet, int(max_bytes))
     packet["encoded_bytes"] = _packet_encoded_bytes(packet)
     packet["truncation"]["within_bound"] = packet["encoded_bytes"] <= int(max_bytes)
     return packet

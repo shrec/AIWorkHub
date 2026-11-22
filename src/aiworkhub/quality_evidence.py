@@ -3859,7 +3859,14 @@ def run_review_ready_quality_gate(
         for check in destructive_checks
         if check.status == STATUS_FAILED
     ]
-    gate["review_ready_citation_drift"] = citation_drift_rows
+    # NF-2026-02370: a citing doc outside the card's allowed_writes is drift the
+    # worker cannot fix; it is recorded apart and never counted as actionable.
+    in_scope_rows, outside_scope_rows = partition_citation_drift_by_scope(
+        citation_drift_rows,
+        (card or {}).get("allowed_writes") if isinstance(card, Mapping) else None,
+    )
+    gate["review_ready_citation_drift"] = in_scope_rows
+    gate["review_ready_citation_drift_outside_scope"] = outside_scope_rows
     return gate
 
 
@@ -4197,6 +4204,43 @@ def run_citation_drift_checks(
                     if len(rows) >= CITATION_DRIFT_MAX_ROWS:
                         return rows
     return rows
+
+
+def partition_citation_drift_by_scope(
+    rows: Iterable[Mapping[str, Any]],
+    allowed_writes: Iterable[str] | str | None,
+) -> tuple[list[Any], list[Any]]:
+    """Split citation-drift rows into ``(in_scope, outside_scope)`` (NF-2026-02370).
+
+    A row is outside scope when its citing file (``doc``) does not match the
+    card's ``allowed_writes`` under the same anchored matcher the worker write
+    gate uses (:func:`worker_workspace._matches`): the worker cannot edit it, so
+    it is not actionable drift. Fail closed toward "in scope": no declared scope,
+    a row without a ``doc`` path, or a path/pattern the matcher refuses keeps
+    the row in scope exactly as before, so nothing is ever hidden by an
+    unreadable scope. Row order is preserved within each side.
+    """
+    if isinstance(allowed_writes, str):
+        allowed_writes = [allowed_writes]
+    patterns = [
+        value for value in (allowed_writes or ()) if isinstance(value, str) and value.strip()
+    ]
+    if not patterns:
+        return list(rows), []
+    from . import worker_workspace
+
+    in_scope: list[Any] = []
+    outside_scope: list[Any] = []
+    for row in rows:
+        doc = row.get("doc") if isinstance(row, Mapping) else None
+        inside = True
+        if isinstance(doc, str) and doc.strip():
+            try:
+                inside = worker_workspace._matches(doc, patterns)
+            except worker_workspace.WorkspaceError:
+                inside = True
+        (in_scope if inside else outside_scope).append(row)
+    return in_scope, outside_scope
 
 
 # ---------------------------------------------------------------------------
