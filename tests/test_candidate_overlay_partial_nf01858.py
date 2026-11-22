@@ -253,3 +253,159 @@ def test_symlink_still_aborts_the_whole_build(fixture):
             fixture.repo / "partition_symlink.sqlite",
         )
     assert str(caught.value) == "quality_review_candidate_path_symlink:src/link.cpp"
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-02363: ``unable to open database file`` from the manager overlay.
+# Identified cause: a sweep run by ANOTHER query's build (any manager process)
+# removed this request's dir -- overlay, pin, in-flight tmp -- once the request
+# left review_ready, while this query was building or about to open it.
+# ---------------------------------------------------------------------------
+
+_LEASE = manager_ai_tools._CANDIDATE_OVERLAY_LEASE_PREFIX
+
+
+def _cache_dir(fixture) -> Path:
+    return fixture.repo / manager_ai_tools._CANDIDATE_OVERLAY_DIR / REQUEST_ID
+
+
+def _accept_request(fixture) -> None:
+    """The manager accepted the review: the request is no longer review_ready."""
+    fixture.card = {**fixture.card, "status": "done", "terminal_substatus": "accepted"}
+
+
+def test_sweep_keeps_a_leased_dir_of_a_finished_request(fixture, monkeypatch):
+    root = fixture.repo / manager_ai_tools._CANDIDATE_OVERLAY_DIR
+    other = root / ("e" * 32)
+    other.mkdir(parents=True)
+    (other / "overlay_0000000000000000.sqlite").write_bytes(b"x")
+    lease = other / f"{_LEASE}1.abcd"
+    lease.write_bytes(b"")
+    finished = SimpleNamespace(_request_events=lambda _rid: [], _show_task=lambda _tid: {})
+
+    assert manager_ai_tools._sweep_candidate_overlays(root, REQUEST_ID, manager=finished) == 0
+    assert other.is_dir()
+
+    # A lease past the stale bound (a crashed holder) no longer protects it.
+    monkeypatch.setattr(manager_ai_tools, "_CANDIDATE_OVERLAY_LEASE_STALE_SECONDS", -1.0)
+    assert manager_ai_tools._sweep_candidate_overlays(root, REQUEST_ID, manager=finished) == 1
+    assert not other.exists()
+
+
+def _spy_rmtree(monkeypatch) -> list[str]:
+    import shutil
+
+    removed: list[str] = []
+    original = shutil.rmtree
+
+    def rmtree(path, *args, **kwargs):
+        removed.append(Path(path).name)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    return removed
+
+
+def test_concurrent_sweep_during_the_query_cannot_remove_its_overlay(fixture, monkeypatch):
+    fixture.fail_header = False
+    original = manager_ai_tools.worker_tools.source_graph_query
+    seen: dict = {}
+    rmtree_calls = _spy_rmtree(monkeypatch)
+
+    def racing(ctx, **kwargs):
+        cache_dir = ctx.source_graph_binding_override.db_path.parent
+        seen["leases"] = [p.name for p in cache_dir.iterdir() if p.name.startswith(_LEASE)]
+        _accept_request(fixture)
+        # Another candidate's build, in another manager process, sweeps now.
+        seen["removed"] = manager_ai_tools._sweep_candidate_overlays(
+            cache_dir.parent, "f" * 32,
+        )
+        seen["db_survived"] = ctx.source_graph_binding_override.db_path.is_file()
+        return original(ctx, **kwargs)
+
+    monkeypatch.setattr(manager_ai_tools.worker_tools, "source_graph_query", racing)
+    result = _query("body", HDR_MARKER)
+
+    # The finished-but-leased dir was never even handed to rmtree.
+    assert rmtree_calls == []
+    assert seen["removed"] == 0
+    assert seen["db_survived"] is True
+    assert len(seen["leases"]) == 1
+    assert result["ok"] is True, result
+    assert HDR_MARKER in json.dumps(result)
+    # The lease is released with the reply; the dir is sweepable again.
+    assert not [p for p in _cache_dir(fixture).iterdir() if p.name.startswith(_LEASE)]
+    assert manager_ai_tools._sweep_candidate_overlays(
+        _cache_dir(fixture).parent, "f" * 32,
+    ) == 1
+    assert rmtree_calls == [REQUEST_ID]
+
+
+def test_unleased_sweep_would_hand_the_live_dir_to_rmtree(fixture, monkeypatch):
+    """The pre-fix behaviour, pinned: without the lease the sweep removes it."""
+    fixture.fail_header = False
+    original = manager_ai_tools.worker_tools.source_graph_query
+    rmtree_calls = _spy_rmtree(monkeypatch)
+    monkeypatch.setattr(manager_ai_tools, "_overlay_dir_leased", lambda _path: False)
+
+    def racing(ctx, **kwargs):
+        _accept_request(fixture)
+        manager_ai_tools._sweep_candidate_overlays(
+            ctx.source_graph_binding_override.db_path.parent.parent, "f" * 32,
+        )
+        return original(ctx, **kwargs)
+
+    monkeypatch.setattr(manager_ai_tools.worker_tools, "source_graph_query", racing)
+    _query("body", HDR_MARKER)
+    assert rmtree_calls == [REQUEST_ID]
+
+
+def test_query_time_sqlite_error_is_named_with_its_message(fixture, monkeypatch):
+    import sqlite3
+
+    fixture.fail_header = False
+
+    def vanished(ctx, **kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(manager_ai_tools.worker_tools, "source_graph_query", vanished)
+    result = _query("body", HDR_MARKER)
+
+    assert result["ok"] is False
+    assert result["error"] == "candidate_overlay_unavailable"
+    assert result["reason"] == "candidate_overlay_build_failed:query:-:OperationalError"
+    assert result["message"] == "unable to open database file"
+    assert not [p for p in _cache_dir(fixture).iterdir() if p.name.startswith(_LEASE)]
+
+
+def test_bare_sqlite_reason_from_the_engine_is_never_the_reason(fixture, monkeypatch):
+    fixture.fail_header = False
+    monkeypatch.setattr(
+        manager_ai_tools.worker_tools, "source_graph_query",
+        lambda ctx, **kwargs: {"ok": False, "reason": "unable to open database file"},
+    )
+    result = _query("body", HDR_MARKER)
+
+    assert result["reason"] == "candidate_overlay_build_failed:query:-:OperationalError"
+    assert result["message"] == "unable to open database file"
+
+
+def test_open_failure_names_step_class_and_sqlite_message(fixture, monkeypatch):
+    import sqlite3
+
+    fixture.fail_header = False
+    original = source_graph.connect
+
+    def connect(path, *args, **kwargs):
+        if Path(path).name.startswith("overlay_") and kwargs.get("read_only"):
+            raise sqlite3.OperationalError("unable to open database file")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(source_graph, "connect", connect)
+    result = _query("body", HDR_MARKER)
+
+    assert result["ok"] is False
+    assert result["error"] == "candidate_overlay_unavailable"
+    assert result["reason"] == "candidate_overlay_build_failed:open:-:OperationalError"
+    assert result["message"] == "unable to open database file"
+    assert not [p for p in _cache_dir(fixture).iterdir() if p.name.startswith(_LEASE)]

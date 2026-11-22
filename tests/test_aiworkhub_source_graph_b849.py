@@ -6966,18 +6966,36 @@ def test_zero_hit_cascade_broadens_to_the_declared_targets(tmp_path):
 
 
 def test_target_not_allowed_names_the_allowed_targets(tmp_path):
-    """A refusal that does not name the valid set only buys a blind retry."""
+    """A refusal that does not name the valid set only buys a blind retry.
+
+    Since NF-2026-02363 the refusal is kept only for an EXCLUDED path (private
+    repository state, outside the repo, card deny_read): it names why, plus the
+    focus list.  An ordinary undeclared repository path is a permitted read.
+    """
     repo = _cascade_repo(tmp_path, "target_refusal")
     ctx = _cascade_ctx(repo, tmp_path, targets=("pkg/service.py",))
 
     refused = w.source_graph_query(
-        ctx, mode="focus", query="alpha_handler", budget=8, target="other/far.py",
+        ctx, mode="focus", query="alpha_handler", budget=8,
+        target=".aiworkhub/runtime/far.py",
     )
     assert refused["ok"] is False
     assert refused["reason"] == "target_not_allowed"
-    assert refused["requested_target"] == "other/far.py"
+    assert refused["excluded_reason"] == "private_repository_path"
+    assert refused["requested_target"] == ".aiworkhub/runtime/far.py"
     assert refused["allowed_targets"] == ["pkg/service.py"]
     assert "allowed_targets" in refused["valid_next_call"]
+
+    outside = w.source_graph_query(
+        ctx, mode="focus", query="alpha_handler", budget=8, target="../far.py",
+    )
+    assert outside["reason"] == "target_not_allowed"
+    assert outside["excluded_reason"] == "path_outside_repo"
+
+    undeclared = w.source_graph_query(
+        ctx, mode="focus", query="alpha_handler", budget=8, target="other/far.py",
+    )
+    assert undeclared["ok"] is True, undeclared
 
 
 def test_stale_rows_are_answered_from_an_inline_re_extraction(tmp_path):

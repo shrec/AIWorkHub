@@ -374,12 +374,15 @@ def test_load_context_from_env_preserves_exact_valid_string_identity(tmp_path: P
 
 
 def test_source_graph_query_rejects_target_outside_declared_allowlist(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # NF-2026-02363: an undeclared repository path is a permitted read now; the
+    # refusal (and its policy-violation ledger row) is kept for EXCLUDED paths.
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
-    result = w.source_graph_query(ctx, mode="focus", query="anything", target="tools/unrelated/other_repo.py")
+    result = w.source_graph_query(ctx, mode="focus", query="anything", target=".git/config")
     assert result["ok"] is False
     assert result["reason"] == "target_not_allowed"
+    assert result["excluded_reason"] == "private_repository_path"
     verification = w.verify_audit_ledger(
         ctx.audit_ledger_path, ctx.audit_hmac_key_path,
         task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic,

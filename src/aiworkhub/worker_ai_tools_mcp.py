@@ -3383,46 +3383,242 @@ def _selector_match_in_scope(file_path: str, targets: Any) -> bool:
     return semantic_edit.path_is_allowed(file_path, targets)
 
 
-def _enforce_selector_allowlist(
-    ctx: WorkerToolContext, tool: str, payload: Any, targets: Any,
-) -> tuple[dict[str, Any] | None, Any]:
-    """Constrain a resolved symbol selector to the file allowlist.
+_MAX_CARD_READ_DENIALS_CACHE_ENTRIES = 8
+_CARD_READ_DENIALS_CACHE: dict[tuple[str, int, int], tuple[str, ...]] = {}
+_CARD_READ_DENIALS_LOCK = threading.Lock()
 
-    Returns ``(violation, payload)``.  When every resolved match lies outside
-    the allowlist the symbol is refused BY NAME -- the caller learns the symbol
-    exists and is out of scope, never an empty ``no such symbol`` result.  When
-    only some matches are out of scope, those rows are dropped and the rest are
-    returned.  The unrestricted "no target allowlist configured" grant is applied
-    once here (nothing to enforce), mirroring the ``target_not_allowed`` gate; the
-    per-match decision then defers wholly to ``_selector_match_in_scope`` so an
-    unattributable match is refused by name rather than kept (the fail-open path
-    this boundary used to take while its sibling fallback dropped it).
+
+def _card_read_denials(ctx: WorkerToolContext) -> tuple[str, ...] | None:
+    """The card's ``deny_read`` / ``forbidden`` path globs, from the sealed packet.
+
+    ``()`` when no contract packet is bound (nothing declared to deny); ``None``
+    when one is bound but unreadable, so the caller fails closed.  Only a
+    successful read is memoized (keyed by the packet's path, mtime and size,
+    bounded); an error state is re-checked on every call.  ``forbidden`` may
+    carry prose, so only a whitespace-free entry is taken as a path glob.
+    """
+
+    path = ctx.contract_packet_path
+    if path is None:
+        return ()
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    with _CARD_READ_DENIALS_LOCK:
+        cached = _CARD_READ_DENIALS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        packet = _contract_packet(ctx)
+    except WorkerToolError:
+        return None
+    sources: list[Mapping[str, Any]] = [packet]
+    card = packet.get("card")
+    if isinstance(card, Mapping):
+        sources.append(card)
+    globs: list[str] = []
+    for source in sources:
+        for key_name in ("deny_read", "forbidden"):
+            value = source.get(key_name)
+            for item in value if isinstance(value, list) else ():
+                text = item.strip().replace("\\", "/").strip("/") if isinstance(item, str) else ""
+                if text and not any(ch.isspace() for ch in text) and text not in globs:
+                    globs.append(text)
+    denials = tuple(globs)
+    with _CARD_READ_DENIALS_LOCK:
+        _CARD_READ_DENIALS_CACHE[key] = denials
+        while len(_CARD_READ_DENIALS_CACHE) > _MAX_CARD_READ_DENIALS_CACHE_ENTRIES:
+            _CARD_READ_DENIALS_CACHE.pop(next(iter(_CARD_READ_DENIALS_CACHE)))
+    return denials
+
+
+def _source_graph_read_refusal(ctx: WorkerToolContext, path: str) -> str | None:
+    """Why a Source Graph READ of ``path`` is refused, or ``None`` when allowed.
+
+    READ authority is every repository file the index/overlay can serve
+    (NF-2026-02363) except: a path outside the repository, private repository
+    state (``worker_workspace._is_private_repository_path`` -- ``.git/**``,
+    ``.aiworkhub/**`` and every dot-prefixed component, the same predicate that
+    keeps those bytes out of the worktree) and the card's ``deny_read`` /
+    ``forbidden`` globs.  ``source_graph_targets`` is the focus list, not this
+    gate; writes stay bounded by ``allowed_writes`` in the semantic editor.
+    """
+
+    from . import linux_read_roots
+    from . import platform_io
+    from . import worker_workspace
+
+    # The outside-repo test runs on the RAW normalized text: stripping the
+    # leading "/" first would turn "/etc/passwd" or "//srv/share" (UNC) into
+    # an innocent-looking relative path.
+    raw = _normalize_source_graph_target(path)
+    if not raw:
+        return None
+    if (
+        raw.startswith("/") or re.match(r"[A-Za-z]:", raw)
+        or ".." in PurePosixPath(raw).parts or "\x00" in raw
+    ):
+        return "path_outside_repo"
+    text = raw.strip("/")
+    if not text:
+        return None
+    # NTFS is case-insensitive: "SECRET/a.py" and ".GIT/config" name the same
+    # bytes as "secret/a.py" and ".git/config", so both the path and every
+    # deny glob are compared casefolded there.  Win32 also drops a trailing
+    # dot/space of a component ("secret./a.py") and opens an 8.3 short name
+    # ("SECRE~1/a.py") as its long directory: the first is normalized away,
+    # the second cannot be mapped without the disk, so it is refused.
+    fold = platform_io.is_windows()
+    compared = text
+    if fold:
+        parts = [part.rstrip(". ") for part in text.split("/")]
+        if any(re.search(r"~\d", part) for part in parts):
+            return "path_short_name_alias"
+        compared = "/".join(parts).casefold()
+    pure = PurePosixPath(compared)
+    if worker_workspace._is_private_repository_path(compared):
+        return "private_repository_path"
+    denials = _card_read_denials(ctx)
+    if denials is None:
+        declared = {_normalize_source_graph_target(t) for t in ctx.source_graph_targets}
+        return None if text in declared else "card_read_scope_unreadable"
+    prefixes = ["/".join(pure.parts[:depth]) for depth in range(1, len(pure.parts) + 1)]
+    for glob in denials:
+        try:
+            pattern = linux_read_roots.glob_regex(glob.casefold() if fold else glob)
+            if fold:
+                pattern = re.compile(pattern.pattern, pattern.flags | re.IGNORECASE)
+        except re.error:
+            return f"card_deny_read_invalid:{glob}"[:160]
+        if any(pattern.fullmatch(prefix) for prefix in prefixes):
+            return f"card_deny_read:{glob}"[:160]
+    return None
+
+
+# Payload keys whose bare-string entries are repository paths (a string in any
+# other list -- query tokens, reasons -- is never a path and passes through).
+_READ_GATE_PATH_LIST_KEYS = frozenset({"candidate_files", "relevant_files"})
+
+
+def _apply_source_graph_read_gate(
+    ctx: WorkerToolContext, payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """Drop every row of ``payload`` whose file is an excluded READ path.
+
+    The single post-filter of the worker ``source_graph`` handler: a dict row
+    carrying a ``_SOURCE_GRAPH_FILE_KEYS`` path (a match, a context or slice
+    neighborhood row, a fallback row) or a ``candidate_files`` entry is removed
+    when :func:`_source_graph_read_refusal` names a reason for that path.  The
+    worker's own ``overlay`` metadata is left as-is.  Returns the filtered
+    payload and the exact number of rows dropped.  One refusal is computed per
+    distinct path.
+    """
+
+    refusals: dict[str, str | None] = {}
+    dropped = 0
+
+    def refused(path: str) -> bool:
+        if path not in refusals:
+            refusals[path] = _source_graph_read_refusal(ctx, path)
+        return refusals[path] is not None
+
+    def walk(value: Any, path_list: bool) -> Any:
+        nonlocal dropped
+        if isinstance(value, list):
+            kept: list[Any] = []
+            for item in value:
+                if isinstance(item, str):
+                    if path_list and item and refused(item):
+                        dropped += 1
+                        continue
+                    kept.append(item)
+                    continue
+                filtered = walk(item, False)
+                if filtered is _READ_GATE_DROPPED:
+                    dropped += 1
+                    continue
+                kept.append(filtered)
+            return kept
+        if isinstance(value, dict):
+            # Every file key of the row is checked: an edge row names a caller
+            # and a callee file, and either one being excluded drops the row.
+            for key in _SOURCE_GRAPH_FILE_KEYS:
+                file_value = value.get(key)
+                if isinstance(file_value, str) and file_value and refused(file_value):
+                    return _READ_GATE_DROPPED
+            kept_dict: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "overlay" or not isinstance(item, (list, dict)):
+                    kept_dict[key] = item
+                    continue
+                filtered = walk(item, key in _READ_GATE_PATH_LIST_KEYS)
+                if filtered is _READ_GATE_DROPPED:
+                    dropped += 1
+                    continue
+                kept_dict[key] = filtered
+            return kept_dict
+        return value
+
+    filtered_payload = walk(dict(payload), False)
+    if filtered_payload is _READ_GATE_DROPPED:
+        # The whole reply describes one excluded file: answer an empty result.
+        return {
+            "mode": payload.get("mode"), "query": payload.get("query"),
+            "matches": [], "candidate_files": [],
+        }, 1
+    return filtered_payload, dropped
+
+
+_READ_GATE_DROPPED = object()
+
+
+def _enforce_selector_allowlist(
+    ctx: WorkerToolContext, tool: str, payload: Any, targets: Any = None,
+) -> tuple[dict[str, Any] | None, Any]:
+    """Constrain a resolved symbol selector to the READ gate.
+
+    Returns ``(violation, payload)``.  A match is in scope when it carries an
+    attributable ``file_path`` that ``_source_graph_read_refusal`` allows.  When
+    every resolved match is out of scope the symbol is refused BY NAME with the
+    exclusion reason -- the caller learns the symbol exists and why it is out of
+    scope, never an empty ``no such symbol`` result.  When only some matches are
+    out of scope, those rows are dropped and the rest are returned.  An
+    unattributable match is refused, never kept.  ``targets`` is legacy: only an
+    explicitly empty allowlist still grants pass-through (nothing to enforce).
     """
 
     if not isinstance(payload, dict):
         return None, payload
-    if not targets:
+    if targets is not None and not targets:
         return None, payload
     matches = payload.get("matches")
     if not isinstance(matches, list) or not matches:
         return None, payload
     in_scope: list[Any] = []
-    out_of_scope: list[dict[str, Any]] = []
+    out_of_scope: list[tuple[dict[str, Any], str]] = []
     for match in matches:
         file_path = (
             str(match.get("file_path") or match.get("file") or "")
             if isinstance(match, dict) else ""
         )
-        if _selector_match_in_scope(file_path, targets):
+        excluded = (
+            _source_graph_read_refusal(ctx, file_path) if file_path
+            else "unattributable_match"
+        )
+        if excluded is None:
             in_scope.append(match)
         else:
-            out_of_scope.append(match)
+            out_of_scope.append((match if isinstance(match, dict) else {}, excluded))
     if not in_scope:
-        first = out_of_scope[0]
+        first, excluded = out_of_scope[0]
         name = str(first.get("qualname") or first.get("name") or "")
         file_path = str(first.get("file_path") or first.get("file") or "")
         reason = f"symbol_out_of_scope:{name or file_path}@{file_path}"
-        return _violation(ctx, tool, reason[:160]), payload
+        return _violation(
+            ctx, tool, reason[:160], excluded_reason=excluded,
+        ), payload
     if len(in_scope) == len(matches):
         return None, payload
     scoped = dict(payload)
@@ -3445,9 +3641,10 @@ def _declared_input_file_payload(
     Source Graph deliberately indexes structure, so a declared JSON/JSONL/XML
     input can be a valid task authority while producing no semantic entity.
     This fallback is intentionally narrower than arbitrary file access: the
-    caller has already passed the exact coordinator allowlist check, the path
-    must equal the ``file`` query, stay beneath the immutable worker root, and
-    contain no symlink component.  It never performs discovery or globbing.
+    caller has already passed the READ gate (``_source_graph_read_refusal``),
+    the path must equal the ``file`` query, stay beneath the immutable worker
+    root, and contain no symlink component.  It never performs discovery or
+    globbing.
     """
 
     from . import source_graph as _source_graph_mod
@@ -3660,6 +3857,11 @@ class _ReworkOverlayView:
     authorized_sources: Mapping[str, str] = field(default_factory=dict)
     authorized_digests: Mapping[str, str] = field(default_factory=dict)
     repair_evidence: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    # The worker's own live delta beneath allowed_writes (NF-2026-02363) and the
+    # live paths past the overlay limits (named up to a bound, counted exactly).
+    live_paths: frozenset[str] = frozenset()
+    live_overflow: tuple[str, ...] = ()
+    live_overflow_count: int = 0
 
 
 class _ReworkOverlayObservation(NamedTuple):
@@ -3841,37 +4043,199 @@ def _rework_overlay_view_cache_key(
     ).encode("utf-8")).hexdigest()
 
 
+_LIVE_OVERLAY_PACKET: Mapping[str, Any] = {"canonical_digest": "worker_live_overlay"}
+# How many unserved live paths a reply names.  The count is exact except after
+# a ``scan_limit`` stop: that one entry stands for every file left unexamined.
+_LIVE_OVERLAY_NAMED_OVERFLOW = 20
+# How many files beneath ``allowed_writes`` one live-overlay walk examines
+# (changed or not); hitting it is reported as ``scan_limit:<n>:<pattern>``.
+_LIVE_OVERLAY_SCAN_LIMIT = 4096
+
+
+def _live_overlay_enabled(ctx: WorkerToolContext) -> bool:
+    """A worker with its own isolated worktree and paths it may write.
+
+    A context whose worktree IS the indexed repository (the manager, local
+    tools) has no delta the canonical index cannot already see.
+    """
+
+    if not ctx.allowed_writes or ctx.source_graph_binding_override is not None:
+        return False
+    try:
+        return ctx.repo.resolve() != ctx.authority_repo.resolve()
+    except OSError:
+        return False
+
+
+def _observe_live_worktree_files(
+    ctx: WorkerToolContext,
+    canonical_db_path: Path,
+    exclude: frozenset[str],
+) -> tuple[tuple[_ReworkOverlayObservation, ...], dict[str, str], tuple[str, ...], int]:
+    """The worker's CURRENT changed/untracked files beneath ``allowed_writes``.
+
+    Returns ``(observations, canonical_hashes, named_unserved, unserved_count)``.
+    Every regular, non-private file an ``allowed_writes`` entry names (exact
+    path, directory or glob) whose bytes differ from the canonical index row --
+    or that has none, i.e. a file the worker just created -- becomes an
+    ``authorized_overlay`` observation keyed by its content sha256, so an edit
+    moves the view cache key.  Bounded by ``MAX_REWORK_OVERLAY_FILES`` files and
+    ``MAX_REWORK_OVERLAY_PACKET_BYTES`` changed bytes; a path past either limit
+    or unreadable is counted and named (``live_overflow``), never silently
+    dropped.  ``exclude`` (rework packet paths) keeps packet admission the sole
+    authority for those.  A deletion is not shadowed: a sparse worktree cannot
+    tell a deleted file from one never materialized.
+    """
+
+    from . import worker_workspace
+
+    root = ctx.repo.resolve()
+    candidates: dict[str, Path] = {}
+    named: list[str] = []
+    unserved = 0
+    scan_limited = False
+
+    def _unserved(relative: str) -> None:
+        nonlocal unserved
+        unserved += 1
+        if len(named) < _LIVE_OVERLAY_NAMED_OVERFLOW:
+            named.append(relative)
+
+    # 1. Collect the candidate paths.  The walk has its OWN bound
+    # (``_LIVE_OVERLAY_SCAN_LIMIT``), independent of the overlay file cap, so a
+    # directory entry full of unchanged files cannot crowd out a new one; when
+    # the walk bound is hit the reply names it instead of implying completeness.
+    patterns = sorted({
+        _normalize_source_graph_target(str(item)).strip("/")
+        for item in ctx.allowed_writes
+    })
+    for pattern in patterns:
+        if scan_limited:
+            break
+        pure = PurePosixPath(pattern)
+        if (
+            not pattern or pure.is_absolute() or ".." in pure.parts
+            or worker_workspace._is_private_repository_path(pattern)
+        ):
+            continue
+        try:
+            if any(ch in pattern for ch in "*?["):
+                matches: Any = root.glob(pattern)
+            else:
+                exact = root / Path(*pure.parts)
+                if exact.is_symlink():
+                    continue
+                matches = (
+                    exact.rglob("*") if exact.is_dir()
+                    else ([exact] if exact.is_file() else [])
+                )
+            for match in matches:
+                try:
+                    relative = match.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                if (
+                    relative in exclude or relative in candidates
+                    or worker_workspace._is_private_repository_path(relative)
+                    or match.is_symlink() or not match.is_file()
+                ):
+                    continue
+                if len(candidates) >= _LIVE_OVERLAY_SCAN_LIMIT:
+                    scan_limited = True
+                    _unserved(f"scan_limit:{_LIVE_OVERLAY_SCAN_LIMIT}:{pattern}")
+                    break
+                candidates[relative] = match
+        except OSError:
+            _unserved(pattern)
+    if not candidates:
+        return (), {}, tuple(named), unserved
+
+    # 2. Hash against the canonical rows; 3. cap only CHANGED or NEW files.
+    canonical_hashes = _rework_overlay_canonical_hashes(canonical_db_path, candidates)
+    observations: list[_ReworkOverlayObservation] = []
+    total = 0
+    for relative in sorted(candidates):
+        try:
+            resolved = candidates[relative].resolve(strict=True)
+            if not resolved.is_relative_to(root) or not resolved.is_file():
+                _unserved(relative)
+                continue
+            data = resolved.read_bytes()
+        except (OSError, RuntimeError):
+            _unserved(relative)
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        if canonical_hashes.get(relative) == digest:
+            continue
+        if (
+            len(observations) >= MAX_REWORK_OVERLAY_FILES
+            or total + len(data) > MAX_REWORK_OVERLAY_PACKET_BYTES
+        ):
+            _unserved(relative)
+            continue
+        total += len(data)
+        observations.append(_ReworkOverlayObservation(
+            relative, resolved, False, digest, None, data, digest,
+            "authorized_overlay",
+        ))
+    return tuple(observations), canonical_hashes, tuple(named), unserved
+
+
 def _prepare_rework_overlay_view(
     ctx: WorkerToolContext,
     canonical_db_path: Path,
     *,
     build_revision: str,
 ) -> _ReworkOverlayView | None:
-    """Extract packet-bound files from sealed bytes or digest-bound hashes.
+    """Extract packet-bound files plus the worker's live worktree delta.
 
-    Admission runs on every call; the extracted view is reused from
+    Packet entries come from sealed bytes or digest-bound hashes; on top of
+    them (or alone, for a first-launch worker) every changed/untracked file
+    beneath ``allowed_writes`` (``_observe_live_worktree_files``).  Admission
+    runs on every call; the extracted view is reused from
     ``_REWORK_OVERLAY_VIEW_CACHE`` only while every keyed input is unchanged.
     """
 
     packet = ctx.rework_overlay_packet
-    if packet is None:
+    live = _live_overlay_enabled(ctx)
+    if packet is None and not live:
         return None
 
-    entries = _build_rework_overlay_map(packet)
-    if not entries:
-        return _ReworkOverlayView({}, frozenset(), str(packet["canonical_digest"]))
-
-    canonical_hashes = _rework_overlay_canonical_hashes(canonical_db_path, entries)
-    observations = _observe_rework_overlay_entries(ctx, entries, canonical_hashes)
+    entries = _build_rework_overlay_map(packet) if packet is not None else {}
+    canonical_hashes = (
+        _rework_overlay_canonical_hashes(canonical_db_path, entries) if entries else {}
+    )
+    observations: tuple[_ReworkOverlayObservation, ...] = (
+        _observe_rework_overlay_entries(ctx, entries, canonical_hashes)
+        if entries else ()
+    )
+    live_observations, live_hashes, named, unserved = (
+        _observe_live_worktree_files(ctx, canonical_db_path, frozenset(entries))
+        if live else ((), {}, (), 0)
+    )
+    if not live_observations and not unserved:
+        if packet is None:
+            return None
+        if not entries:
+            return _ReworkOverlayView({}, frozenset(), str(packet["canonical_digest"]))
+    canonical_hashes = {**canonical_hashes, **live_hashes}
+    observations = (*observations, *live_observations)
+    keyed_packet: Mapping[str, Any] = (
+        packet if packet is not None and not live
+        else {"packet": packet, "live_unserved": [unserved, list(named)]}
+    )
     key = _rework_overlay_view_cache_key(
-        ctx, packet, canonical_db_path, canonical_hashes, observations,
+        ctx, keyed_packet, canonical_db_path, canonical_hashes, observations,
         build_revision,
     )
     cached = _rework_overlay_view_cache_get(key)
     if cached is not None:
         return cached
     view = _build_rework_overlay_view(
-        ctx, packet, observations, canonical_hashes, build_revision=build_revision,
+        ctx, packet if packet is not None else _LIVE_OVERLAY_PACKET,
+        observations, canonical_hashes, build_revision=build_revision,
+        live_paths=frozenset(item.relative for item in live_observations),
+        live_overflow=named, live_overflow_count=unserved,
     )
     # The build re-reads each file from disk, so a write racing it would be
     # cached under the pre-write hash; store only when every file still matches.
@@ -3898,6 +4262,9 @@ def _build_rework_overlay_view(
     canonical_hashes: Mapping[str, str],
     *,
     build_revision: str,
+    live_paths: frozenset[str] = frozenset(),
+    live_overflow: tuple[str, ...] = (),
+    live_overflow_count: int = 0,
 ) -> _ReworkOverlayView:
     from . import source_graph_ast as _source_graph_ast
 
@@ -3945,9 +4312,14 @@ def _build_rework_overlay_view(
             repo_root, item.resolved, build_revision=build_revision,
         )
         if extraction.status not in _REWORK_OVERLAY_EVIDENCE_ONLY:
-            raise WorkerToolError(
-                f"rework_overlay_extract_failed:{relative}:{extraction.status}"
-            )
+            if relative not in live_paths:
+                raise WorkerToolError(
+                    f"rework_overlay_extract_failed:{relative}:{extraction.status}"
+                )
+            # A live file mid-edit must not refuse every query: it is served
+            # digest-bound (named in ``digest_bound_paths``), never dropped.
+            digest_refs[relative] = observed_hash
+            continue
         if extraction.status == _REWORK_OVERLAY_DIGEST_ONLY_STATUS:
             digest_refs[relative] = observed_hash
             continue
@@ -3962,8 +4334,13 @@ def _build_rework_overlay_view(
             continue
         changed[relative] = extraction
 
+    snapshot: dict[str, Any] = {
+        "packet": packet["canonical_digest"], "files": snapshot_rows,
+    }
+    if live_overflow_count:
+        snapshot["live_overflow"] = [live_overflow_count, list(live_overflow)]
     snapshot_sha256 = hashlib.sha256(json.dumps(
-        {"packet": packet["canonical_digest"], "files": snapshot_rows},
+        snapshot,
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -3971,7 +4348,7 @@ def _build_rework_overlay_view(
     return _ReworkOverlayView(
         changed, frozenset(deleted), snapshot_sha256,
         sealed_sources, digest_refs, authorized_sources, authorized_digests,
-        repair_evidence,
+        repair_evidence, live_paths, live_overflow, live_overflow_count,
     )
 
 
@@ -4113,6 +4490,7 @@ def _merge_rework_overlay_payload(
     if view is None or (
         not view.changed and not view.deleted and not view.digest_refs
         and not view.authorized_digests and not view.repair_evidence
+        and not view.live_overflow_count
     ):
         return payload, False
     shadowed = frozenset((
@@ -4213,11 +4591,13 @@ def _merge_rework_overlay_payload(
                 continue
             if mode in {"body", "function", "class"} and not exact:
                 continue
-            if mode in {"focus", "symbols"} and not all(
+            # ``slice`` names a symbol too: an overlay-only symbol (a file the
+            # worker just created) must resolve there as well (NF-2026-02363).
+            if mode in {"focus", "symbols", "slice"} and not all(
                 token in haystack for token in query_tokens
             ):
                 continue
-            if mode not in {"body", "function", "class", "focus", "symbols"}:
+            if mode not in {"body", "function", "class", "focus", "symbols", "slice"}:
                 continue
             start = max(0, int(entity.line_start) - 1)
             end = max(start, int(entity.line_end))
@@ -4321,6 +4701,19 @@ def _merge_rework_overlay_payload(
             for path, evidence in sorted(view.repair_evidence.items())
         },
     }
+    if view.live_paths or view.live_overflow_count:
+        # The worker's own current delta beneath allowed_writes (NF-2026-02363);
+        # anything past the overlay file/byte limits is named, never dropped.
+        if ctx.rework_overlay_packet is None:
+            merged["overlay"]["authority_source"] = "worker_live_overlay"
+        merged["overlay"]["live_worktree_paths"] = sorted(view.live_paths)
+        if view.live_overflow_count:
+            merged["overlay"]["live_overflow"] = {
+                "count": view.live_overflow_count,
+                "paths": list(view.live_overflow),
+                "max_files": MAX_REWORK_OVERLAY_FILES,
+                "max_bytes": MAX_REWORK_OVERLAY_PACKET_BYTES,
+            }
     if mode in {"body", "function", "class"}:
         merged["freshness"] = "worktree_overlay" if overlay_matches else "no_match"
     return merged, True
@@ -6024,19 +6417,21 @@ def source_graph_query(
         normalized_allowed = {
             _normalize_source_graph_target(t): t for t in ctx.source_graph_targets
         }
-        if ctx.source_graph_targets and normalized_target not in normalized_allowed:
-            # Name the allowed set so the caller does not guess another
-            # target (144 blind retries in the measured window).  Both sides
-            # are normalized (backslash -> '/', trailing :START-END or :LINE
-            # suffix stripped) so target=src/x.py:10-20 is accepted when
-            # src/x.py is a declared target.
+        # READ authority is every repository path except the excluded set
+        # (NF-2026-02363); ``source_graph_targets`` is the focus list only.
+        # Both sides are normalized (backslash -> '/', trailing :START-END or
+        # :LINE suffix stripped) so target=src/x.py:10-20 maps to src/x.py.
+        excluded_reason = _source_graph_read_refusal(ctx, normalized_target)
+        if excluded_reason is not None:
             return _violation(
                 ctx, tool, "target_not_allowed",
                 requested_target=bounded_target,
+                excluded_reason=excluded_reason,
                 allowed_targets=list(ctx.source_graph_targets),
                 valid_next_call=(
-                    "Pass one of allowed_targets as target, or omit target for "
-                    "the unscoped query."
+                    "This target is an excluded path (excluded_reason). Pass any "
+                    "other repository path, one of allowed_targets, or omit "
+                    "target for the unscoped query."
                 ),
             )
         scope = normalized_allowed.get(normalized_target, bounded_target)
@@ -6060,7 +6455,19 @@ def source_graph_query(
     try:
         if ctx.rework_overlay_packet is None:
             binding = _resolve_source_graph_db(ctx)
-            overlay_view = None
+            # A first-launch worker composes its own live worktree delta over
+            # the canonical index (NF-2026-02363); a packet-bound, candidate or
+            # manager-override binding already IS the request's view.
+            overlay_view = (
+                _prepare_rework_overlay_view(
+                    ctx,
+                    binding.db_path,
+                    build_revision=_source_graph_mod.BUILD_REVISION,
+                )
+                if binding.authority_source == "canonical"
+                and ctx.source_graph_binding_override is None
+                else None
+            )
         else:
             candidate_binding = _candidate_source_graph_binding(ctx)
             binding = candidate_binding or _canonical_source_graph_binding(ctx)
@@ -6298,7 +6705,16 @@ def source_graph_query(
     if (
         mode == "file"
         and scope is not None
-        and _json_hit_count(payload) == 0
+        and (
+            _json_hit_count(payload) == 0
+            # A live file the AST cannot index (JSON, a mid-edit parse) is
+            # digest-bound in the view; its exact worktree bytes are the read.
+            or (
+                overlay_view is not None
+                and scope in overlay_view.live_paths
+                and scope in overlay_view.digest_refs
+            )
+        )
     ):
         exact_payload = _declared_input_file_payload(
             ctx, scope, _source_graph_mod.parse_file_line_range(bounded_query),
@@ -6318,14 +6734,12 @@ def source_graph_query(
         # response filter -- a file path never starts with a qualname, so the
         # prefix filter would drop every resolved symbol.  ``slice`` returns its
         # resolved dependency neighborhood verbatim (already validated against
-        # the immutable task allowlist above).  A resolved body/function symbol
-        # must still honour the file allowlist: one whose file is out of scope is
-        # refused BY NAME so the caller learns it exists and is out of scope,
+        # the read gate above).  A resolved body/function symbol must still
+        # honour the read gate: one whose file is an excluded path is refused
+        # BY NAME so the caller learns it exists and why it is out of scope,
         # never an empty result that reads as "no such symbol".
         if mode in SOURCE_GRAPH_SYMBOL_SELECTOR_MODES:
-            refusal, payload = _enforce_selector_allowlist(
-                ctx, tool, payload, ctx.source_graph_targets,
-            )
+            refusal, payload = _enforce_selector_allowlist(ctx, tool, payload)
             if refusal is not None:
                 return refusal
         if isinstance(payload, dict):
@@ -6360,9 +6774,10 @@ def source_graph_query(
                 )
         # An exact body symbol can legitimately live in a second coordinator-
         # declared target even when the model carried forward a narrower
-        # orientation target.  Preserve the security boundary: broaden only
-        # to an exact result whose file is still covered by the immutable
-        # task-scoped target allowlist, never to arbitrary repository files.
+        # orientation target.  The declared focus list still decides WHERE to
+        # broaden (it is ordering, not the read gate any more, NF-2026-02363),
+        # and the read gate still refuses excluded paths, so a broadened row is
+        # never one the worker could not have read by naming it.
         if mode == "body" and _json_hit_count(payload) == 0:
             matches = (
                 unscoped_payload.get("matches")
@@ -6374,10 +6789,11 @@ def source_graph_query(
                 if not isinstance(match, dict):
                     continue
                 file_path = str(match.get("file_path") or match.get("file") or "")
-                # Same statement as the enforcement gate: an unattributable match
-                # is out of scope, never broadened in.  Both boundaries read
-                # ``_selector_match_in_scope`` so they cannot diverge again.
-                if _selector_match_in_scope(file_path, ctx.source_graph_targets):
+                # An unattributable match is never broadened in: both
+                # predicates refuse an empty path.
+                if _selector_match_in_scope(
+                    file_path, ctx.source_graph_targets,
+                ) and _source_graph_read_refusal(ctx, file_path) is None:
                     permitted_matches.append(match)
             if permitted_matches:
                 bounded_matches = permitted_matches[:budget]
@@ -6445,6 +6861,14 @@ def source_graph_query(
     if isinstance(payload, dict) and payload and not overlay_applied:
         _source_graph_phase("inline_refresh")
         refreshed_files = _inline_refresh_stale_rows(_source_graph_mod, query_repo, payload)
+
+    # One READ-gate pass over the final payload, every mode alike: unscoped
+    # body/bodygrep/focus/file rows, fallback rows and slice neighborhoods from
+    # an excluded path (deny_read, private state, outside the repo) never leave.
+    if isinstance(payload, dict) and payload:
+        payload, read_gate_filtered = _apply_source_graph_read_gate(ctx, payload)
+        if read_gate_filtered:
+            payload["read_gate_filtered"] = read_gate_filtered
 
     hit_payload = (
         {key: value for key, value in payload.items() if key != "overlay"}

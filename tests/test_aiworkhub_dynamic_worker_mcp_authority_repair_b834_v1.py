@@ -552,15 +552,25 @@ def test_target_scope_is_applied_before_large_payload_truncation(
 def test_target_outside_declared_allowlist_is_rejected_before_any_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    # NF-2026-02363: the refusal is kept only for an EXCLUDED path (private
+    # repository state here); it still happens before any engine call.
     _mute_chmod(monkeypatch)
     authority = _authority_repo(tmp_path)
     ctx = _ctx(
         repo=authority, authority_repo=authority, home=tmp_path / "home",
         targets=("AITools",),
     )
-    result = w.source_graph_query(ctx, mode="focus", query="q", target="tools/unrelated")
+
+    def _no_engine_call(*_args, **_kwargs):
+        raise AssertionError("an excluded target must be refused before any call")
+
+    monkeypatch.setattr(source_graph_mod, "focus", _no_engine_call)
+    result = w.source_graph_query(
+        ctx, mode="focus", query="q", target=".aiworkhub/runtime/unrelated",
+    )
     assert result["ok"] is False
     assert result["reason"] == "target_not_allowed"
+    assert result["excluded_reason"] == "private_repository_path"
 
 
 def test_exact_declared_jsonl_falls_back_to_bounded_workspace_file(

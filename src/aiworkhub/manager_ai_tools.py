@@ -125,9 +125,11 @@ def _write_invoke(
 
 
 class _CandidateOverlayError(Exception):
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, message: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
+        # The underlying (e.g. sqlite) message, bounded; never the reason.
+        self.message = str(message)[:240]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -241,13 +243,61 @@ def _candidate_request_finished(manager: Any, request_id: str) -> bool:
     )
 
 
+# Identified cause of the manager's ``unable to open database file`` (NF-2026-02363,
+# traced through the code paths; pinned by the regression tests):
+# the sweep below ran from one query's build (any manager process -- each MCP
+# server has its own in-process build lock) while another query had already
+# resolved its candidate and was building, or about to open, that request's
+# overlay.  A request that left review_ready in between (accepted/reworked right
+# after the review) was "finished", so its dir -- overlay, pin and in-flight
+# ``.tmp`` -- was removed underneath the other query's sqlite open/connect.  A
+# query now holds a lease file in its request dir from before the build until
+# its reply, and the sweep never removes a leased dir.  A lease older than the
+# stale bound (a crashed holder) no longer protects the dir.
+_CANDIDATE_OVERLAY_LEASE_PREFIX = ".lease."
+_CANDIDATE_OVERLAY_LEASE_STALE_SECONDS = 3600.0
+# sqlite's own open/IO failure texts, matched case-insensitively at the start of
+# a reply reason so a bare engine message is never handed back as the reason.
+_SQLITE_OPEN_FAILURE_MESSAGES = (
+    "unable to open database file",
+    "database is locked",
+    "disk i/o error",
+    "file is not a database",
+    "database disk image is malformed",
+)
+
+
+def _overlay_dir_leased(path: str) -> bool:
+    """True while a live query holds a lease in this request dir.
+
+    Fail closed for deletion: an unreadable dir or lease counts as leased.
+    """
+
+    now = time.time()
+    try:
+        with os.scandir(path) as scan:
+            for entry in scan:
+                if not entry.name.startswith(_CANDIDATE_OVERLAY_LEASE_PREFIX):
+                    continue
+                try:
+                    age = now - entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    return True
+                if age < _CANDIDATE_OVERLAY_LEASE_STALE_SECONDS:
+                    return True
+    except OSError:
+        return True
+    return False
+
+
 def _sweep_candidate_overlays(
     overlay_root: Path, keep_request_id: str, *, manager: Any = None
 ) -> int:
     """Remove request dirs of finished requests; return how many were removed.
 
-    Best effort and never raises: a failed lookup keeps the dir, symlinks are
-    never followed, and an OSError during removal is retried on the next sweep.
+    Best effort and never raises: a failed lookup keeps the dir, a leased dir
+    (a query building or reading it right now) is kept, symlinks are never
+    followed, and an OSError during removal is retried on the next sweep.
     ``manager`` defaults to ``process_launcher.default_manager()``.
     """
 
@@ -269,6 +319,8 @@ def _sweep_candidate_overlays(
                 continue
             if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                 continue
+            if _overlay_dir_leased(entry.path):
+                continue
             if not _candidate_request_finished(manager, entry.name):
                 continue
             shutil.rmtree(entry.path)
@@ -276,6 +328,20 @@ def _sweep_candidate_overlays(
         except Exception:
             continue
     return removed
+
+
+def _candidate_overlay_unavailable(
+    exc: _CandidateOverlayError, request_id: str,
+) -> dict[str, Any]:
+    reply: dict[str, Any] = {
+        "ok": False,
+        "error": "candidate_overlay_unavailable",
+        "reason": exc.reason,
+        "request_id": request_id,
+    }
+    if exc.message:
+        reply["message"] = exc.message
+    return reply
 
 
 _CANDIDATE_OVERLAY_PARTIAL_LIMIT = 20
@@ -348,8 +414,93 @@ def _prune_superseded_overlays(cache_dir: Path, db_path: Path) -> None:
         return
 
 
+class _CandidateOverlayBuildStepError(Exception):
+    """A build failure tagged with the step that raised it (cause chained)."""
+
+    def __init__(self, step: str) -> None:
+        super().__init__(step)
+        self.step = step
+
+
+def _build_candidate_overlay(
+    root: Path,
+    cache_dir: Path,
+    candidate: _ReviewCandidate,
+    changed_paths: list[dict[str, str]],
+    db_path: Path,
+    snapshot_digest: str,
+    base_db_path: Path,
+) -> None:
+    """Build, seal and atomically publish one candidate overlay partition.
+
+    Runs under ``_SOURCE_GRAPH_DB_OVERRIDE_LOCK`` with the caller's lease held
+    in ``cache_dir``; a failure is re-raised as
+    :class:`_CandidateOverlayBuildStepError` naming the step.
+    """
+
+    from . import source_graph
+    from . import source_graph_partition
+
+    _sweep_candidate_overlays(root / _CANDIDATE_OVERLAY_DIR, candidate.request_id)
+    temporary = cache_dir / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
+    partial_path = _overlay_partial_path(db_path)
+    partial_tmp = temporary.with_name(temporary.name + ".partial")
+    step = "build_partition"
+    try:
+        report = source_graph_partition.build_partition(
+            candidate.path,
+            changed_paths,
+            temporary,
+            base_db_path=base_db_path,
+        )
+        step = "write_snapshot_digest"
+        worker_tools._write_rework_overlay_snapshot_digest(temporary, snapshot_digest)
+        step = "publish"
+        if report.failed_files:
+            partial_tmp.write_text(
+                json.dumps(list(report.failed_files), ensure_ascii=True, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(partial_tmp, partial_path)
+        else:
+            partial_path.unlink(missing_ok=True)
+        os.replace(temporary, db_path)
+    except (
+        source_graph_partition.PartitionError,
+        source_graph.SourceGraphError,
+        OSError,
+        sqlite3.Error,
+    ) as exc:
+        raise _CandidateOverlayBuildStepError(step) from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+        partial_tmp.unlink(missing_ok=True)
+    _prune_superseded_overlays(cache_dir, db_path)
+
+
+def _verify_overlay_opens(db_path: Path) -> None:
+    """Open the published overlay read-only exactly as a query will.
+
+    ``source_graph.connect`` attaches the pinned base for a composed overlay, so
+    a missing database, a removed pin or a torn file surfaces here, under the
+    build lock and with a step name, instead of as a bare sqlite error from
+    inside the later query.
+    """
+
+    from . import source_graph
+
+    conn = source_graph.connect(db_path, read_only=True)
+    try:
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+    finally:
+        conn.close()
+
+
 def _candidate_overlay_binding(
-    ctx: worker_tools.WorkerToolContext, request_id: str
+    ctx: worker_tools.WorkerToolContext,
+    request_id: str,
+    *,
+    leases: list[Path] | None = None,
 ) -> worker_tools.AuthorityBinding:
     """Composed read-only Source Graph view of a review_ready candidate.
 
@@ -357,6 +508,13 @@ def _candidate_overlay_binding(
     canonical index opened read-only (never copied or written), cached beside
     the manager runtime state, and rebuilt only when the sealed candidate
     snapshot changes.
+
+    ``leases``, when given, receives a lease file created in the request dir
+    under the build lock; the caller removes it once its query is done, and
+    ``_sweep_candidate_overlays`` never removes a leased dir.  The overlay is
+    then opened read-only under the lock (step ``open``): a cached overlay that
+    no longer opens is rebuilt once, a fresh one that does not open is refused
+    as ``candidate_overlay_build_failed:open:...`` with the sqlite message.
     """
 
     from . import source_graph
@@ -395,58 +553,63 @@ def _candidate_overlay_binding(
     try:
         with worker_tools._SOURCE_GRAPH_DB_OVERRIDE_LOCK:
             cache_dir.mkdir(parents=True, exist_ok=True)
+            if leases is not None:
+                step = "lease"
+                lease = cache_dir / (
+                    f"{_CANDIDATE_OVERLAY_LEASE_PREFIX}{os.getpid()}."
+                    f"{secrets.token_hex(8)}"
+                )
+                try:
+                    lease.write_bytes(b"")
+                except FileNotFoundError:
+                    # Swept between mkdir and the lease: recreate it once.
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    lease.write_bytes(b"")
+                leases.append(lease)
             if db_path.is_symlink():
                 raise _CandidateOverlayError("candidate_overlay_cache_symlink")
-            ready = (
-                db_path.is_file()
-                and db_path.stat().st_size > 0
-                and worker_tools._rework_overlay_snapshot_digest(db_path)
-                == snapshot_digest
-            )
-            if not ready:
-                _sweep_candidate_overlays(
-                    root / _CANDIDATE_OVERLAY_DIR, candidate.request_id
+            for attempt in range(2):
+                step = "prepare"
+                ready = (
+                    db_path.is_file()
+                    and db_path.stat().st_size > 0
+                    and worker_tools._rework_overlay_snapshot_digest(db_path)
+                    == snapshot_digest
                 )
-                temporary = cache_dir / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
-                partial_path = _overlay_partial_path(db_path)
-                partial_tmp = temporary.with_name(temporary.name + ".partial")
+                if not ready:
+                    _build_candidate_overlay(
+                        root, cache_dir, candidate, changed_paths, db_path,
+                        snapshot_digest, canonical.db_path,
+                    )
+                step = "open"
                 try:
-                    step = "build_partition"
-                    report = source_graph_partition.build_partition(
-                        candidate.path,
-                        changed_paths,
-                        temporary,
-                        base_db_path=canonical.db_path,
-                    )
-                    step = "write_snapshot_digest"
-                    worker_tools._write_rework_overlay_snapshot_digest(
-                        temporary, snapshot_digest
-                    )
-                    step = "publish"
-                    if report.failed_files:
-                        partial_tmp.write_text(
-                            json.dumps(
-                                list(report.failed_files),
-                                ensure_ascii=True,
-                                sort_keys=True,
-                            ),
-                            encoding="utf-8",
-                        )
-                        os.replace(partial_tmp, partial_path)
-                    else:
-                        partial_path.unlink(missing_ok=True)
-                    os.replace(temporary, db_path)
-                finally:
-                    temporary.unlink(missing_ok=True)
-                    partial_tmp.unlink(missing_ok=True)
-                _prune_superseded_overlays(cache_dir, db_path)
+                    _verify_overlay_opens(db_path)
+                    break
+                except (
+                    source_graph_partition.PartitionError,
+                    source_graph.SourceGraphError,
+                    OSError,
+                    sqlite3.Error,
+                ):
+                    if not ready or attempt:
+                        raise
+                    # A cached overlay that no longer opens (its pin or bytes
+                    # removed underneath it) is rebuilt once, never served.
+                    db_path.unlink(missing_ok=True)
+    except _CandidateOverlayBuildStepError as exc:
+        cause = exc.__cause__ if exc.__cause__ is not None else exc
+        raise _CandidateOverlayError(
+            _build_failed_reason(exc.step, cause), message=str(cause),
+        ) from cause
     except (
         source_graph_partition.PartitionError,
         source_graph.SourceGraphError,
         OSError,
         sqlite3.Error,
     ) as exc:
-        raise _CandidateOverlayError(_build_failed_reason(step, exc)) from exc
+        raise _CandidateOverlayError(
+            _build_failed_reason(step, exc), message=str(exc),
+        ) from exc
     return worker_tools.AuthorityBinding(
         db_path=db_path,
         authority_source="candidate_overlay",
@@ -483,33 +646,61 @@ def source_graph_query(
         target, request_id = wanted, None
 
     def call(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
-        if request_id is not None:
-            wanted = str(request_id).strip()
+        if request_id is None:
+            return worker_tools.source_graph_query(
+                ctx, mode=mode, query=query, budget=budget,
+                target=target, cursor=cursor,
+                continuation_cursor=continuation_cursor,
+                bundle_type=bundle_type, workflow_stage=workflow_stage,
+                compact_replay=compact_replay,
+            )
+        from . import source_graph_partition
+
+        wanted = str(request_id).strip()
+        # The lease keeps a concurrent sweep (another manager process building
+        # another candidate) from removing this request dir while it is being
+        # built, verified or read -- the measured ``unable to open database
+        # file`` cause (NF-2026-02363).  Released however the query ends.
+        leases: list[Path] = []
+        try:
             try:
                 if not wanted:
                     raise _CandidateOverlayError("request_id_required")
-                binding = _candidate_overlay_binding(ctx, wanted)
+                binding = _candidate_overlay_binding(ctx, wanted, leases=leases)
             except _CandidateOverlayError as exc:
-                return {
-                    "ok": False,
-                    "error": "candidate_overlay_unavailable",
-                    "reason": exc.reason,
-                    "request_id": wanted,
-                }
+                return _candidate_overlay_unavailable(exc, wanted)
             ctx = dataclasses.replace(ctx, source_graph_binding_override=binding)
             partial = _read_overlay_partial(binding.db_path)
-        else:
-            partial = None
-        reply = worker_tools.source_graph_query(
-            ctx, mode=mode, query=query, budget=budget,
-            target=target, cursor=cursor,
-            continuation_cursor=continuation_cursor,
-            bundle_type=bundle_type, workflow_stage=workflow_stage,
-            compact_replay=compact_replay,
-        )
-        if partial is not None and isinstance(reply, dict):
-            reply = {**reply, "candidate_overlay_partial": partial}
-        return reply
+            try:
+                reply = worker_tools.source_graph_query(
+                    ctx, mode=mode, query=query, budget=budget,
+                    target=target, cursor=cursor,
+                    continuation_cursor=continuation_cursor,
+                    bundle_type=bundle_type, workflow_stage=workflow_stage,
+                    compact_replay=compact_replay,
+                )
+            except (
+                source_graph_partition.PartitionError, OSError, sqlite3.Error,
+            ) as exc:
+                return _candidate_overlay_unavailable(_CandidateOverlayError(
+                    _build_failed_reason("query", exc), message=str(exc),
+                ), wanted)
+            reason = str(reply.get("reason") or "") if isinstance(reply, dict) else ""
+            if reason and reply.get("ok") is False and reason.casefold().startswith(
+                _SQLITE_OPEN_FAILURE_MESSAGES
+            ):
+                # A bare sqlite message from the engine names neither the step
+                # nor the class; never hand it to the caller as the reason.
+                return _candidate_overlay_unavailable(_CandidateOverlayError(
+                    "candidate_overlay_build_failed:query:-:OperationalError",
+                    message=reason,
+                ), wanted)
+            if partial is not None and isinstance(reply, dict):
+                reply = {**reply, "candidate_overlay_partial": partial}
+            return reply
+        finally:
+            for lease in leases:
+                lease.unlink(missing_ok=True)
 
     return _invoke(call, target=target)
 
