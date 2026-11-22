@@ -59,6 +59,10 @@ PRIOR_FINDINGS_SCHEMA_ID = "aiworkhub.quality_review_prior_findings.v1"
 # limit: the newest reports first, and the count of what was dropped is kept.
 MAX_PRIOR_REPORTS_PER_LENS = 8
 MAX_PRIOR_FINDINGS_PER_LENS = 40
+# The counts above still allow 3 lenses x 40 findings x ~2.4 KB (~290 KB), over
+# the packet cap, so the serialized section is bounded too (NF-2026-02353):
+# the oldest, least relevant finding rows are dropped and counted in ``omitted``.
+MAX_PRIOR_REVIEW_BYTES = 32 * 1024
 # The two MECHANICAL statuses.  Both are computed from bytes -- a sha256
 # comparison against the reviewed predecessor -- and neither is a judgment
 # about whether the finding was addressed.  There is deliberately no third
@@ -3516,7 +3520,7 @@ def _prior_findings_rows(
     omitted = value.get("omitted")
     if not isinstance(omitted, int) or isinstance(omitted, bool) or omitted < 0:
         raise ReviewerEvidenceError("invalid_prior_findings")
-    return {
+    section = {
         "schema_id": PRIOR_FINDINGS_SCHEMA_ID,
         "notice": PRIOR_FINDINGS_NOTICE,
         "basis": "changed_path_hashes",
@@ -3525,6 +3529,95 @@ def _prior_findings_rows(
         "complete": omitted == 0,
         "omitted": omitted,
     }
+    return _bound_prior_review_bytes(section)
+
+
+def _prior_review_drop_order(
+    lenses: Mapping[str, Mapping[str, Any]],
+) -> list[tuple[str, int]]:
+    """Return every finding as ``(lens, index)`` in the order it may be dropped.
+
+    lines_changed before lines_unchanged, non-actionable before actionable;
+    within one class the END of each lens list (the oldest) goes first,
+    round-robin across lenses in sorted lens order.  Deterministic by design.
+    """
+
+    order: list[tuple[str, int]] = []
+    for unchanged in (False, True):
+        for actionable in (False, True):
+            per_lens = {
+                lens: [
+                    index
+                    for index in range(len(lenses[lens]["findings"]) - 1, -1, -1)
+                    if (lenses[lens]["findings"][index]["status"] == "lines_unchanged")
+                    == unchanged
+                    and bool(lenses[lens]["findings"][index]["actionable"]) == actionable
+                ]
+                for lens in sorted(lenses)
+            }
+            depth = max((len(indexes) for indexes in per_lens.values()), default=0)
+            for position in range(depth):
+                for lens in sorted(per_lens):
+                    if position < len(per_lens[lens]):
+                        order.append((lens, per_lens[lens][position]))
+    return order
+
+
+def _prior_review_without(
+    section: Mapping[str, Any], dropped: set[tuple[str, int]]
+) -> dict[str, Any]:
+    lenses: dict[str, dict[str, Any]] = {}
+    for lens, rows in section["lenses"].items():
+        findings = [
+            row
+            for index, row in enumerate(rows["findings"])
+            if (lens, index) not in dropped
+        ]
+        lenses[lens] = {
+            "reports": rows["reports"],
+            "findings": findings,
+            "unchanged_line_findings": sum(
+                1 for row in findings if row["status"] == "lines_unchanged"
+            ),
+        }
+    omitted = int(section["omitted"]) + len(dropped)
+    return {
+        **section,
+        "lenses": lenses,
+        "complete": omitted == 0,
+        "omitted": omitted,
+    }
+
+
+def _bound_prior_review_bytes(section: dict[str, Any]) -> dict[str, Any]:
+    """Drop finding rows until the section fits ``MAX_PRIOR_REVIEW_BYTES`` (NF-2026-02353).
+
+    The per-lens COUNT caps alone let a long rework history reach ~290 KB, above
+    the packet cap, so a card was refused for its history rather than for its
+    candidate.  A section already within budget is returned unchanged (byte
+    identical).  Report rows are never dropped; every dropped finding is counted
+    in ``omitted`` so ``complete`` turns False.
+    """
+
+    if len(_canonical_bytes(section)) <= MAX_PRIOR_REVIEW_BYTES:
+        return section
+    order = _prior_review_drop_order(section["lenses"])
+    # Each finding row serializes to far more bytes than ``omitted`` can gain in
+    # digits, so the size strictly falls as the dropped prefix grows: the
+    # smallest fitting prefix is found by bisection, not one dump per row.
+    low, high = 1, len(order)
+    best = _prior_review_without(section, set(order))
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _prior_review_without(section, set(order[:middle]))
+        if len(_canonical_bytes(candidate)) <= MAX_PRIOR_REVIEW_BYTES:
+            best = candidate
+            high = middle - 1
+        else:
+            low = middle + 1
+    # With every finding dropped the reports alone remain; they are bounded by
+    # MAX_PRIOR_REPORTS_PER_LENS and the packet cap still applies downstream.
+    return best
 
 
 def _source_evidence_rows(
