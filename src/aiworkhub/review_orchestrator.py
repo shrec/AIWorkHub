@@ -824,6 +824,87 @@ def reviewer_recovery_dispatch(
     }
 
 
+# --- same-route relaunch (NF-2026-02359) --------------------------------
+#
+# During a provider account/session switch every auto reviewer on the switched
+# adapter died terminal_failure while the WORKERS on it recovered through
+# transient_retry. The reviewer path only ever bought a DISTINCT route, and with
+# the indicted adapter excluded there was none left, so the lens waited forever.
+#
+# The classification is the canonical one the worker path is placed by: the
+# typed disposition's ``failure_class`` (``transient``) and the adapter-scoped
+# credential predicate (a login that a reset clears). The budget is the existing
+# one -- the very predicates that authorise the distinct-route retry -- so a
+# same-route successor is one more attempt inside ``_MAX_ROUTE_ATTEMPTS``, never
+# past it. A distinct route is still preferred: the same route is the fallback
+# the planner takes only when no other is selectable. Anything else -- a defect,
+# an unknown cause, a capacity or account hold -- keeps today's behaviour.
+_SAME_ROUTE_RETRY_MARKER = ":same_route_retry"
+
+
+def reviewer_same_route_retry_allowed(disposition: Any, *, attempts_made: int) -> bool:
+    """Whether a reviewer that ran and died may be relaunched on its own route."""
+    if terminal_failure_classification.adapter_scoped_credential_failure(disposition):
+        return terminal_failure_classification.adapter_credential_retry_allowed(
+            disposition=disposition, attempts_made=attempts_made,
+        )
+    return (
+        isinstance(disposition, Mapping)
+        and disposition.get("failure_class")
+        == terminal_failure_classification.FAILURE_CLASS_TRANSIENT
+        and terminal_failure_classification.distinct_route_retry_allowed(
+            disposition=disposition, attempts_made=attempts_made,
+        )
+    )
+
+
+def reviewer_route_same_route_retry(failure_reason: Any) -> bool:
+    """Whether a retired attempt's reason permits a successor on its own route."""
+    tokens = [token.strip() for token in str(failure_reason or "").split(":")]
+    return (
+        _SAME_ROUTE_RETRY_MARKER.lstrip(":") in tokens
+        and not route_attempt_hold(failure_reason)
+    )
+
+
+def _allow_same_route_successor(
+    attempt: Mapping[str, Any], retirement: str, dispatch: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Stamp a reviewer that RAN and died on a transient/credential-reset signature.
+
+    The stamp travels on the durable retirement, so the planner -- on this pass
+    or any later one -- may fall back to the same route. It also lifts the hold
+    ``_credential_failover`` places when no other adapter exists: that hold is
+    exactly the stranding this card removes.
+    """
+    if not reviewer_same_route_retry_allowed(
+        dispatch.get("disposition"), attempts_made=int(attempt["attempt_index"]),
+    ):
+        return retirement, dispatch
+    return retirement + _SAME_ROUTE_RETRY_MARKER, {
+        **dispatch,
+        "relaunch_distinct_route": True,
+        "relaunch_same_route": True,
+        "route_hold": False,
+    }
+
+
+def _same_route_successor(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The retired last attempt's own route, when its reason permits reusing it."""
+    if not attempts:
+        return None
+    last = attempts[-1]
+    if str(last["state"]) != "retired" or not reviewer_route_same_route_retry(
+        last["failure_reason"]
+    ):
+        return None
+    return {
+        "runner": str(last["runner"]),
+        "adapter_id": str(last["adapter_id"]),
+        "model": str(last["model"]),
+    }
+
+
 # --- mechanical short-circuit -------------------------------------------
 #
 # Measured on this repository's canonical ledger: of 2,470 reject_review
@@ -1789,8 +1870,80 @@ def _verified_lens_report(
     )
 
 
+# NF-2026-02277: the row states of a reviewer child the launcher reserved or
+# queued but no worker ever took. Such a row is a plan, not a reviewer: alone it
+# is coverage only inside the settle window, never past it.
+_REVIEWER_UNSTARTED_STATES = frozenset({
+    "pending", "unclaimed", "reserved", "queued", "planned",
+})
+_REVIEWER_ROW_TIMESTAMP_KEYS = ("updated_at", "claimed_at", "created_at")
+
+
+def _row_age_seconds(row: Mapping[str, Any], now: datetime) -> float | None:
+    """Seconds since the row's newest recorded timestamp, or ``None`` if unreadable."""
+    newest: datetime | None = None
+    for key in _REVIEWER_ROW_TIMESTAMP_KEYS:
+        raw = str(row.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if newest is None or stamp > newest:
+            newest = stamp
+    if newest is None:
+        return None
+    return (now - newest).total_seconds()
+
+
+def _reviewer_child_live(
+    row: Mapping[str, Any],
+    status_of: Callable[[str], Any] | None,
+    now: datetime | None,
+) -> bool:
+    """Whether a non-terminal reviewer child without a verified report is coverage.
+
+    The process ledger is asked first, through the same ``status`` read and the
+    same ``_REVIEWER_RUNNING_STATES`` the drain uses to call a reviewer running:
+    a running process is live, a mechanically terminal one is not, whatever the
+    card still says. A row a worker has taken (claimed, processing, ...) whose
+    process cannot be read stays coverage, exactly as before -- ambiguous is
+    waited on. Only a row that never left reserved/pending is judged by age: it
+    counts inside ``_LENS_SETTLE_WINDOW_SECONDS`` and not after it, and an
+    unreadable age is past it (fail closed: nothing proves it will start).
+    """
+    request_id = str(row.get("launch_request_id") or "").strip()
+    if request_id and callable(status_of):
+        try:
+            status = status_of(request_id)
+        except Exception:  # noqa: BLE001 -- unreadable is ambiguous, judged below
+            status = None
+        state = (
+            str(status.get("state") or "").strip().lower()
+            if isinstance(status, Mapping) else ""
+        )
+        if state in _REVIEWER_RUNNING_STATES:
+            return True
+        if state in _REVIEWER_MECHANICAL_TERMINAL_STATES:
+            return False
+    states = _reviewer_row_states(row)
+    if states and not states <= _REVIEWER_UNSTARTED_STATES:
+        return True
+    if now is None:
+        # No clock to judge the window by: the caller predates this rule.
+        return True
+    age = _row_age_seconds(row, now)
+    return age is not None and age < _LENS_SETTLE_WINDOW_SECONDS
+
+
 def _reviewer_lens_coverage(
     repo: Path, identity: Mapping[str, str], lenses: tuple[str, ...],
+    *,
+    status_of: Callable[[str], Any] | None = None,
+    now: datetime | None = None,
 ) -> dict[str, str]:
     """Classify each planned lens as covered, unusable, exhausted or absent.
 
@@ -1800,6 +1953,10 @@ def _reviewer_lens_coverage(
     so the children observed here are exactly the ones this claim owns -- a
     stale request or a superseded claim epoch hashes to different task ids
     and can never be read as coverage for the current lens.
+
+    NF-2026-02277: ``covered`` means a verified report or a LIVE reviewer
+    (:func:`_reviewer_child_live`). A child reserved or pending with no live
+    process past the settle window is ``unusable``, so recovery ensures it.
     """
     try:
         canonical = review_lifecycle._chain_identity(
@@ -1838,13 +1995,15 @@ def _reviewer_lens_coverage(
                 states & _REVIEWER_FAILED_STATES
                 or states & _REVIEWER_STOPPED_STATES
                 or any(state.startswith("blocked") for state in states)
+                or not _reviewer_child_live(row, status_of, now)
             ):
-                # It has stopped, and it can never file the report this lens
-                # still owes. Keep probing: a successor attempt bought by an
-                # earlier recovery pass may already be live. The LAST slot
-                # inside the retry ceiling dying is a different answer: there
-                # is no successor left to buy, so ensuring this chain again
-                # would report an ensure that bought nothing.
+                # It has stopped -- or never started and is past the window --
+                # and it can never file the report this lens still owes. Keep
+                # probing: a successor attempt bought by an earlier recovery
+                # pass may already be live. The LAST slot inside the retry
+                # ceiling dying is a different answer: there is no successor
+                # left to buy, so ensuring this chain again would report an
+                # ensure that bought nothing.
                 coverage[lens] = (
                     _COVERAGE_EXHAUSTED
                     if attempt >= _MAX_ROUTE_ATTEMPTS
@@ -1856,6 +2015,73 @@ def _reviewer_lens_coverage(
             coverage[lens] = _COVERAGE_COVERED
             break
     return coverage
+
+
+# NF-2026-02277: the prefix every recovery skip reason carries on its target.
+_RECOVERY_SKIP_PREFIX = "review_recovery_skipped:"
+
+
+def _lens_blocked_event(
+    identity: Mapping[str, Any], lens: str, reason: str, now: datetime, **binding: Any,
+) -> dict[str, Any]:
+    """The ONE ``review_orchestrator_lens_blocked`` event shape put on a target."""
+    return {
+        "event_type": "review_orchestrator_lens_blocked",
+        "request_id": identity["target_request_id"],
+        "task_id": identity["target_task_id"],
+        "review_automation": {
+            "state": "lens_blocked",
+            "lens": lens,
+            "reason": reason,
+            **binding,
+            "recorded_at": now.isoformat(),
+        },
+    }
+
+
+# NF-2026-02277: the last recovery reason stamped per (ledger, target, lens).
+# ponytail: per-process memory, so a restart re-stamps each skip once and the
+# map is simply cleared past _RECOVERY_SKIP_MEMORY_CAP; read the ledger
+# instead if a restart duplicate ever matters.
+_RECOVERY_SKIP_STAMPED: dict[tuple[str, str, str], str] = {}
+_RECOVERY_SKIP_MEMORY_CAP = 4096
+
+
+def _stamp_recovery_skip(
+    manager: Any, identity: Mapping[str, Any], lenses: Iterable[str], reason: str,
+) -> None:
+    """Name, on the target, why recovery left each still-owed lens unlaunched.
+
+    The same event the drain's settlement records (NF-2026-02107), so a target
+    that recovery skipped carries a concrete reason instead of a bare missing
+    lens. A reason already stamped for that lens is not stamped again, so a
+    reconciler pass repeating the same skip adds no event. Best effort: an
+    event the ledger refuses never stops the scan.
+    """
+    append = getattr(manager, "_append_event", None)
+    if not callable(append):
+        return
+    bounded = (_RECOVERY_SKIP_PREFIX + str(reason))[:_LENS_REASON_LIMIT]
+    now = datetime.now(timezone.utc)
+    # The ledger the event lands in scopes the memory; without one, never dedupe.
+    ledger = str(
+        getattr(manager, "process_log_path", None) or getattr(manager, "repo", None) or "",
+    )
+    for lens in lenses:
+        key = (ledger, str(identity["target_request_id"]), str(lens))
+        if ledger and _RECOVERY_SKIP_STAMPED.get(key) == bounded:
+            continue
+        try:
+            append(_lens_blocked_event(
+                identity, lens, bounded, now, source="review_recovery",
+            ))
+        except Exception:  # noqa: BLE001 -- never raise through the scan
+            continue
+        if not ledger:
+            continue
+        if len(_RECOVERY_SKIP_STAMPED) >= _RECOVERY_SKIP_MEMORY_CAP:
+            _RECOVERY_SKIP_STAMPED.clear()
+        _RECOVERY_SKIP_STAMPED[key] = bounded
 
 
 # A reviewer in any of these states can never report for its lens, so it is
@@ -2128,7 +2354,14 @@ def recover_review_ready_targets(
         planned = _normalize_lenses(registration.get("required_reviewer_lenses"))
         if not planned:
             planned = LENSES
-        coverage = _reviewer_lens_coverage(repo, identity, planned)
+        # NF-2026-02277: coverage is a LIVE reviewer or a verified report. A
+        # child reserved or left pending with no live process past the settle
+        # window is not one, so this pass ensures the lens instead of skipping it.
+        coverage = _reviewer_lens_coverage(
+            repo, identity, planned,
+            status_of=getattr(manager, "status", None),
+            now=datetime.now(timezone.utc),
+        )
         missing = tuple(
             lens for lens in planned if coverage[lens] != _COVERAGE_COVERED
         )
@@ -2144,6 +2377,10 @@ def recover_review_ready_targets(
             # A manager or a reset moves this target; the scan only names it.
             skipped += 1
             _recovery_reason(reasons, "retry_exhausted")
+            _stamp_recovery_skip(
+                manager, identity, missing,
+                f"retry_exhausted:attempts={_MAX_ROUTE_ATTEMPTS}",
+            )
             continue
         if any(coverage[lens] == _COVERAGE_UNUSABLE for lens in missing):
             # Named apart from a target that never had children: this one DID,
@@ -2155,6 +2392,10 @@ def recover_review_ready_targets(
         except Exception as exc:  # noqa: BLE001
             failed += 1
             _recovery_reason(reasons, "ensure_failed")
+            # Only the exception TYPE reaches the target: its text is not ours.
+            _stamp_recovery_skip(
+                manager, identity, missing, f"ensure_failed:{type(exc).__name__}",
+            )
             if len(failures) < _RECOVERY_FAILURE_LIMIT:
                 failures.append({
                     "request_id": request_id,
@@ -3852,6 +4093,9 @@ class ReviewOrchestrator:
         retirement, dispatch = self._credential_failover(
             action, attempt, route_failure, dispatch,
         )
+        retirement, dispatch = _allow_same_route_successor(
+            attempt, retirement, dispatch,
+        )
         if dispatch["route_hold"]:
             retirement = f"{retirement}{_ROUTE_HOLD_MARKER}{dispatch['action']}"
         if not self._retire_route_attempt(action, attempt, retirement):
@@ -3986,10 +4230,20 @@ class ReviewOrchestrator:
             identity, action.lens, attempt_index=attempt_index
         )
         excluded, excluded_adapters = _route_attempt_exclusions(attempts)
-        route = self._select_attempt_route(
-            reviewer_task_id, action.lens, excluded,
-            excluded_adapters=excluded_adapters,
-        )
+        try:
+            route = self._select_attempt_route(
+                reviewer_task_id, action.lens, excluded,
+                excluded_adapters=excluded_adapters,
+            )
+        except ReviewRouteUnavailable:
+            # NF-2026-02359: a distinct route is still preferred, but a reviewer
+            # retired on a transient or credential-reset signature may take its
+            # own route again when no other one exists. The successor is a new
+            # attempt -- new reviewer task, new request -- inside the same ceiling.
+            same_route = _same_route_successor(attempts)
+            if same_route is None:
+                raise
+            route = same_route
         with closing(_side_table_connection(self.db_path)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(ROUTE_ATTEMPT_TABLE)
@@ -4636,6 +4890,9 @@ class ReviewOrchestrator:
                 )
                 retirement, dispatch = self._credential_failover(
                     action, attempt, route_failure, dispatch,
+                )
+                retirement, dispatch = _allow_same_route_successor(
+                    attempt, retirement, dispatch,
                 )
                 if dispatch["route_hold"]:
                     retirement = (
@@ -5456,22 +5713,12 @@ class ReviewOrchestrator:
     def _append_lens_blocked_event(
         self, action: review_lifecycle.ReviewAction, lens: str, reason: str, now: datetime,
     ) -> None:
-        identity = action.descriptor["chain_identity"]
         append = getattr(self.manager, "_append_event", None)
         if callable(append):
-            append({
-                "event_type": "review_orchestrator_lens_blocked",
-                "request_id": identity["target_request_id"],
-                "task_id": identity["target_task_id"],
-                "review_automation": {
-                    "state": "lens_blocked",
-                    "lens": lens,
-                    "reason": reason,
-                    "action_id": action.action_id,
-                    "chain_id": action.chain_id,
-                    "recorded_at": now.isoformat(),
-                },
-            })
+            append(_lens_blocked_event(
+                action.descriptor["chain_identity"], lens, reason, now,
+                action_id=action.action_id, chain_id=action.chain_id,
+            ))
 
     def _linked_needfix_rows(self, target_task_id: str) -> list[dict[str, Any]]:
         """Return every durable NeedFix row already bound to this exact task."""
