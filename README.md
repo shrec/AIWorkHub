@@ -177,13 +177,12 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.8
+## What's new in 0.13.9
 
-- Manager Chat (Claude): text the Claude CLI injects into the conversation (its compaction summary, interrupt notices, hook output) no longer appears as a phantom manager reply.
-- Manager Chat (Claude): when the CLI compacts its own context, the chat shows a "Provider compacted context" marker and rotates into a clean successor session instead of continuing on the CLI's lossy summary.
-- Manager Chat: a turn ends at the provider's terminal event, a stop kills the whole CLI process tree, an empty turn or a provider error is an error, every finished card the chat launched reaches that chat, and closing the panel no longer kills the running turn.
-- Dashboard: no more "Dashboard snapshot delayed" loop, and a running Claude Code manager shows as ✓ Route / ✓ Callback.
-- 0.13.8 includes everything in 0.13.6 and 0.13.7, which were tagged but not published because their Linux CI failed; 0.13.8 fixes that failure.
+- Linux: the AIWorkHub MCP server no longer grows to many gigabytes of memory. glibc kept every tool thread's freed memory in its own arena; the server now caps the arenas and trims the heap after each request (same load measured: about 100 MB instead of 1 GB).
+- Linux sandbox: worker sessions inside bubblewrap get their AIWorkHub tools again when Python lives in a venv or toolcache outside `/usr`.
+- Doctor: `aiworkhub_doctor_diagnose heap_census=true` attributes a large server process to Python objects, the C allocator or swap, and no longer freezes on a large heap.
+- 0.13.9 includes everything in 0.13.6, 0.13.7 and 0.13.8 (the Manager Chat and Dashboard fixes among them), which were tagged but not published because Linux CI failed on GitHub's Ubuntu 26.04 runner; 0.13.9 fixes those failures.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

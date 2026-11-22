@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.9 — 2026-11-22
+
+### Fixed
+
+- Bundles runtime 0.13.9: on Linux the MCP server caps glibc malloc arenas and trims the heap after every request, so it no longer grows to gigabytes; the bubblewrap worker sandbox publishes the coordinator Python runtime, so workers get their AIWorkHub tools when Python lives outside `/usr`; the doctor heap census no longer freezes on a large heap. Includes all of 0.13.6–0.13.8, which were tagged but not published; their Linux CI failures are fixed.
+
 ## 0.13.8 — 2026-11-21
 
 ### Fixed

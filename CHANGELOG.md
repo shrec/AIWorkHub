@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.9] - 2026-11-22
+
+0.13.6, 0.13.7 and 0.13.8 were tagged but never published: GitHub's `ubuntu-latest` runner moved to Ubuntu 26.04, where bubblewrap is usable, so Linux CI switched from the landlock sandbox to bubblewrap and each release hit a different bubblewrap gap. 0.13.9 carries all of 0.13.6–0.13.8 plus these fixes.
+
+### Fixed
+
+- Linux server memory: the MCP server no longer grows to many gigabytes on glibc hosts. Tool calls run on a thread pool, and glibc kept every thread's freed memory in its own arena (measured: 16 threads, +130–160 MB per round, 92 → 789 MB, back to 100 MB after one `malloc_trim`). The stdlib server now caps glibc malloc arenas at 2 at startup (unless `MALLOC_ARENA_MAX` is set), schedules a coalescing heap trim after every request (a trim requested inside the rate-limit window is deferred, never dropped), and the dashboard reader trims after each reply (NF-2026-02273).
+- Doctor (`aiworkhub_doctor_diagnose heap_census=true`): the heap census totals untracked str/bytes/bytearray payloads per type (deduped by id, bounded) and names the containers holding the most payload bytes; on Linux the native-memory section reports `VmRSS`, `VmSwap`, `RssAnon` and glibc `mallinfo2()` so a large server process can be attributed to Python objects, the C allocator or swap (NF-2026-02331).
+- Doctor heap census: the owners of the largest objects come from one pass over the module/class/function namespace dicts recorded during the walk instead of one `gc.get_referrers` heap walk per object, which froze a long-lived process with a large heap for 45+ minutes (NF-2026-02334).
+- Bubblewrap worker sandbox: the coordinator Python runtime (`sys.prefix` and `sys.base_prefix`) is published at its identity paths whenever the worker MCP package root is bound, so the AIWorkHub worker MCP server starts inside bubblewrap on hosts whose Python lives outside `/usr` (venv, toolcache, bundled runtime); before, every non-validation worker failed `execvp` with ENOENT and ran without AIWorkHub tools (NF-2026-02332).
+- Validation-sandbox tests on Linux hosts with bubblewrap but no landlock: manual-workspace fixtures get the worktree `.git` marker bubblewrap binds, and the cd-prefix tests accept the bubblewrap `/workspace` view of the working directory (NF-2026-02333).
+- Release CI: the timestamp-broker end-to-end test runs its scripts by worktree-relative path, so the bubblewrap sandbox (which mounts a private `/tmp` and sees the worktree only at its sandbox path) can find them; this was the 0.13.8 Linux CI and Release failure (NF-2026-02330).
+- Windows: stopping a child process tree no longer prints taskkill's "SUCCESS" line into the caller's output, which could break the dashboard reader's replies to the Manager Chat view when it stopped a slow `opencode models` probe (NF-2026-02336).
+
 ## [0.13.8] - 2026-11-21
 
 0.13.7 was tagged but never published: its Linux CI and Release failed on the bubblewrap validation sandbox (fixed below). 0.13.8 carries all of 0.13.6 and 0.13.7 plus these fixes.

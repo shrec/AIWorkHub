@@ -94,11 +94,10 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.8
+## What's new in 0.13.9
 
-- Manager Chat: text the Claude CLI injects (its compaction summary, interrupt notices, hook output) no longer appears as a manager reply; when the CLI compacts its own context the chat shows a marker and rotates into a clean successor session.
-- Manager Chat: a turn ends at the provider's terminal event, a stop kills the whole CLI process tree, an empty turn or a provider error is an error, every finished card the chat launched reaches that chat, and closing the panel no longer kills the running turn.
-- Dashboard: no more "Dashboard snapshot delayed" loop, and a running Claude Code manager shows as ✓ Route / ✓ Callback.
+- Linux: the bundled AIWorkHub server no longer grows to gigabytes of memory, and worker sessions inside the bubblewrap sandbox get their AIWorkHub tools again.
+- Includes the Manager Chat and Dashboard fixes of 0.13.6–0.13.8, which were tagged but not published because Linux CI failed; 0.13.9 fixes that.
 
 ## Get started
 
