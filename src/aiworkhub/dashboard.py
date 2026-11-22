@@ -2146,10 +2146,14 @@ class DashboardProvider:
         # memoized one with read-only nested sections instead of a per-call
         # deepcopy (NF-2026-02274).  Top-level keys stay a private plain dict;
         # every other caller keeps the default independent mutable copy.
+        # persist=True: a fresh reader process with unchanged inputs serves
+        # the fingerprint-keyed persisted ledger instead of a full rebuild
+        # (NF-2026-02346).
         return cost_ledger.build_cost_ledger(
             repo_root=self.repo_root,
             include_tasks=include_tasks,
             shared_read_only=True,
+            persist=True,
         )
 
     def get_storage_readiness(self) -> task_store.StorageReadiness:
@@ -2364,7 +2368,7 @@ class DashboardProvider:
         goes to the store instead, and caches on the database's
         ``(size, mtime_ns)`` so an unchanged store never rescans it.
         """
-        return history_series.build_history_series(self.repo_root)
+        return history_series.build_history_series(self.repo_root, persist=True)
 
     def get_needfix_snapshot(self) -> dict[str, Any]:
         """NeedFix view derived from this dashboard snapshot's task cards."""

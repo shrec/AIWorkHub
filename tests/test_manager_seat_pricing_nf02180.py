@@ -89,7 +89,7 @@ def test_real_shaped_model_ids_are_normalized_and_priced() -> None:
 
 
 def _patch_ledger(monkeypatch, sessions: list[dict]) -> None:
-    def fake_memoized(repo_root, *, runner, topic, status, include_tasks, shared_read_only=False):
+    def fake_memoized(repo_root, *, runner, topic, status, include_tasks, shared_read_only=False, persist=False):
         return {
             "aggregates": {
                 "by_role": {

@@ -74,6 +74,8 @@ MAX_MODEL_ROWS = 60
 # Cached payloads are reused while the canonical DB is byte-identical, and in
 # any case for no longer than this.
 CACHE_TTL_SECONDS = 60.0
+# Cross-process persisted payload (NF-2026-02346), under .aiworkhub/runtime/.
+_PERSISTED_HISTORY_NAME = "history_series_persisted.json"
 
 _POSITIVE_INFINITY_DAYS = 10_000
 
@@ -487,6 +489,7 @@ def build_history_series(
     window_days: int = DEFAULT_WINDOW_DAYS,
     now: datetime | None = None,
     use_cache: bool = True,
+    persist: bool = False,
 ) -> dict[str, Any]:
     """Build every history series from the canonical store, read-only.
 
@@ -494,6 +497,9 @@ def build_history_series(
     full-scan it every call. Seven bounded queries cost ~1.0 s cold on the
     live repository and the result is cached against the database's
     ``(size, mtime_ns)``, so an unchanged store answers from memory.
+    ``persist=True`` (the dashboard, NF-2026-02346) also serves and stores
+    the payload in a fingerprint-keyed file under ``.aiworkhub/runtime/``, so
+    a fresh reader process with an unchanged store skips the queries.
     """
     window_days = max(1, min(int(window_days or DEFAULT_WINDOW_DAYS), 3650))
 
@@ -520,6 +526,38 @@ def build_history_series(
                 return payload
 
     since = _since_bound(window_days, now)
+    persist_path: Path | None = None
+    persist_key: list[Any] | None = None
+    if persist and key is not None and now is None and repo_root is not None:
+        # Lazy: cost_ledger owns the persisted-payload codec and its import
+        # graph is heavier than this module's.
+        from aiworkhub import cost_ledger
+
+        persist_path = cost_ledger.persisted_payload_path(
+            repo_root, _PERSISTED_HISTORY_NAME
+        )
+        persist_key = [
+            "history_series",
+            HISTORY_SERIES_SCHEMA_ID,
+            cost_ledger.persisted_code_stamp(),
+            cost_ledger.persisted_stamp(db_path),
+            cost_ledger.persisted_stamp(f"{db_path}-wal"),
+            window_days,
+            since,
+        ]
+        loaded = cost_ledger.read_persisted_payload(persist_path, persist_key)
+        if (
+            isinstance(loaded, dict)
+            and loaded.get("schema_id") == HISTORY_SERIES_SCHEMA_ID
+            and loaded.get("measured") is True
+        ):
+            with _cache_lock:
+                _cache["entry"] = {
+                    "key": key,
+                    "stored_at": time.monotonic(),
+                    "payload": loaded,
+                }
+            return loaded
     reviewer_topic = EXCLUDED_TOPICS[0]
     timings: dict[str, float] = {}
 
@@ -623,6 +661,10 @@ def build_history_series(
                 "stored_at": time.monotonic(),
                 "payload": payload,
             }
+    if persist_path is not None and persist_key is not None:
+        from aiworkhub import cost_ledger
+
+        cost_ledger.write_persisted_payload(persist_path, persist_key, payload)
     return payload
 
 

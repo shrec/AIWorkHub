@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import functools
+import hashlib
 import json
 import re
 import sqlite3
@@ -1499,6 +1501,7 @@ def build_cost_ledger(
     status: str | None = None,
     include_tasks: bool = False,
     shared_read_only: bool = False,
+    persist: bool = False,
 ) -> dict[str, Any]:
     """Build the cost ledger for ``repo_root``.
 
@@ -1507,6 +1510,9 @@ def build_cost_ledger(
     dashboard, NF-2026-02274): the top-level dict is private, but its nested
     sections are the memo's read-only containers, so no per-call deepcopy is
     made and a mutation raises ``TypeError`` instead of corrupting the memo.
+    ``persist=True`` (the dashboard, NF-2026-02346) also serves and stores the
+    memoized ledger in a fingerprint-keyed file under ``.aiworkhub/runtime/``
+    so a fresh reader process with unchanged inputs skips the full build.
     """
     if repo_root is None:
         return _assemble_cost_ledger(
@@ -1523,6 +1529,7 @@ def build_cost_ledger(
         status=status,
         include_tasks=include_tasks,
         shared_read_only=shared_read_only,
+        persist=persist,
     )
     # Read-only surfacing of Claude Code's own transcript usage; never
     # touches usage_rows/aggregates above, so existing attribution holds. It
@@ -1625,6 +1632,177 @@ def _process_ledger_stamp(repo_root: Path | str) -> tuple[Any, ...]:
     except OSError:
         return (str(_PROCESS_EVENTS_PATH), "absent")
     return (str(_PROCESS_EVENTS_PATH), stat.st_size, stat.st_mtime_ns)
+
+
+# --- Cross-process persistence for the dashboard reader (NF-2026-02346) -----
+#
+# A new dashboard reader process starts with an empty memo and paid the full
+# ledger (~5 s) and history series (~2.5 s) on its first snapshot. The
+# computed payload is persisted to a gitignored file under .aiworkhub/runtime/
+# keyed by a cheap input fingerprint (file size + mtime_ns stamps, the store
+# marks, the code version) and served only on an exact key match. A missing,
+# unreadable, oversized, corrupt or foreign-schema file is a miss and the
+# caller rebuilds; a persist failure never reaches the dashboard. Containers
+# are tagged on disk ({"d": [[key, value], ...]} for a dict, {"t": [...]} for
+# a tuple) so key types, key order and tuples survive the round trip exactly,
+# and a value that is not plain JSON data is never persisted.
+PERSISTED_SCHEMA_ID = "aiworkhub.dashboard.persisted_payload.v1"
+PERSISTED_RUNTIME_PARTS = (".aiworkhub", "runtime")
+PERSISTED_MAX_BYTES = 64 * 1024 * 1024
+_PERSISTED_LEDGER_NAME = "cost_ledger_persisted.json"
+_PERSIST_DICT_TAG = "d"
+_PERSIST_TUPLE_TAG = "t"
+_PERSIST_SCALARS = (str, int, float, bool, type(None))
+PERSISTED_CACHE_STATS: dict[str, int] = {
+    "hits": 0,
+    "misses": 0,
+    "rejected": 0,
+    "writes": 0,
+    "write_errors": 0,
+}
+
+
+class _UnpersistableValue(TypeError):
+    """A payload holding something other than plain JSON data."""
+
+
+def _count_persisted(event: str) -> None:
+    with _LEDGER_MEMO_LOCK:
+        PERSISTED_CACHE_STATS[event] += 1
+
+
+def _persist_encode(value: Any) -> Any:
+    if type(value) in _PERSIST_SCALARS:
+        return value
+    if isinstance(value, dict):
+        return {
+            _PERSIST_DICT_TAG: [
+                [_persist_encode(key), _persist_encode(item)]
+                for key, item in value.items()
+            ]
+        }
+    if isinstance(value, tuple):
+        return {_PERSIST_TUPLE_TAG: [_persist_encode(item) for item in value]}
+    if isinstance(value, list):
+        return [_persist_encode(item) for item in value]
+    raise _UnpersistableValue(type(value).__name__)
+
+
+def _persist_decode(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_persist_decode(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if len(value) != 1:
+        raise ValueError("persisted_container_untagged")
+    tag, body = next(iter(value.items()))
+    if not isinstance(body, list):
+        raise ValueError("persisted_container_body")
+    if tag == _PERSIST_TUPLE_TAG:
+        return tuple(_persist_decode(item) for item in body)
+    if tag != _PERSIST_DICT_TAG:
+        raise ValueError("persisted_container_tag")
+    decoded: dict[Any, Any] = {}
+    for pair in body:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError("persisted_dict_pair")
+        decoded[_persist_decode(pair[0])] = _persist_decode(pair[1])
+    return decoded
+
+
+def persisted_stamp(path: Path | str) -> list[Any]:
+    """``[path, size, mtime_ns]``, or ``[path, "absent"]`` when unstatable."""
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return [str(path), "absent"]
+    return [str(path), stat.st_size, stat.st_mtime_ns]
+
+
+@functools.lru_cache(maxsize=1)
+def persisted_code_stamp() -> str:
+    """One digest of size+mtime of every module of this package, once per process.
+
+    Both persisted payloads are shaped by more modules than the one writing
+    them (task_store, claude_code_usage, core, ...), so their keys carry the
+    whole package source: a release editing any module misses the old file.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(Path(__file__).resolve().parent.rglob("*.py")):
+        digest.update(json.dumps(persisted_stamp(path)).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def persisted_payload_path(repo_root: Path | str, name: str) -> Path:
+    return Path(repo_root).joinpath(*PERSISTED_RUNTIME_PARTS, name)
+
+
+def read_persisted_payload(path: Path, key: Any) -> Any | None:
+    """The value persisted under exactly ``key``, else ``None`` (a miss)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        _count_persisted("misses")
+        return None
+    if size > PERSISTED_MAX_BYTES:
+        _count_persisted("rejected")
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        if (
+            not isinstance(document, dict)
+            or document.get("schema_id") != PERSISTED_SCHEMA_ID
+            or "value" not in document
+        ):
+            _count_persisted("rejected")
+            return None
+        if document.get("key") != _persist_encode(key):
+            _count_persisted("misses")
+            return None
+        value = _persist_decode(document["value"])
+    except (OSError, ValueError, TypeError, RecursionError, _UnpersistableValue):
+        _count_persisted("rejected")
+        return None
+    _count_persisted("hits")
+    return value
+
+
+def write_persisted_payload(path: Path, key: Any, value: Any) -> bool:
+    """Atomically persist ``value`` under ``key``; a failure is only counted."""
+    try:
+        document = {
+            "schema_id": PERSISTED_SCHEMA_ID,
+            "key": _persist_encode(key),
+            "value": _persist_encode(value),
+        }
+        task_store._atomic_write_json(path, document)  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - persisting is best effort, never fatal
+        _count_persisted("write_errors")
+        return False
+    _count_persisted("writes")
+    return True
+
+
+def _persisted_ledger_key(
+    repo_root: Path | str,
+    root_key: str,
+    store_fingerprint: Any,
+    usage_mark: tuple[int, int],
+) -> list[Any]:
+    db_path = Path(str(store_fingerprint[0])) if store_fingerprint else None
+    process_path = Path(repo_root) / _PROCESS_EVENTS_PATH
+    return [
+        "cost_ledger",
+        persisted_code_stamp(),
+        root_key,
+        store_fingerprint,
+        list(usage_mark),
+        persisted_stamp(db_path) if db_path is not None else None,
+        persisted_stamp(f"{db_path}-wal") if db_path is not None else None,
+        persisted_stamp(process_path),
+        persisted_stamp(process_path.parent),
+    ]
 
 
 def _read_ledger_inputs(
@@ -1772,6 +1950,31 @@ def _copy_ledger(result: dict[str, Any], *, shared_read_only: bool = False) -> d
     return copy.deepcopy(result)
 
 
+def _load_persisted_results(
+    path: Path, key: list[Any]
+) -> OrderedDict[tuple[Any, ...], dict[str, Any]] | None:
+    """Persisted per-filter ledgers for ``key``, frozen like a fresh build."""
+    value = read_persisted_payload(path, key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) > _LEDGER_MEMO_MAX_RESULTS:
+        _count_persisted("rejected")
+        return None
+    results: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+    for pair in value:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not isinstance(pair[0], tuple)
+            or len(pair[0]) != 4
+            or not isinstance(pair[1], dict)
+        ):
+            _count_persisted("rejected")
+            return None
+        results[pair[0]] = _freeze(pair[1])
+    return results
+
+
 def _memoized_cost_ledger(
     repo_root: Path | str,
     *,
@@ -1780,6 +1983,7 @@ def _memoized_cost_ledger(
     status: str | None,
     include_tasks: bool,
     shared_read_only: bool = False,
+    persist: bool = False,
 ) -> dict[str, Any]:
     filters = (runner, topic, status, bool(include_tasks))
     readers = _ledger_readers()
@@ -1804,6 +2008,15 @@ def _memoized_cost_ledger(
         _process_ledger_stamp(repo_root),
         readers,
     )
+    # Only the canonical reader set may persist: a substituted reader's
+    # output must never be served to a later process (NF-2026-02346).
+    persist_path: Path | None = None
+    persist_key: list[Any] | None = None
+    if persist and canonical:
+        persist_path = persisted_payload_path(repo_root, _PERSISTED_LEDGER_NAME)
+        persist_key = _persisted_ledger_key(
+            repo_root, root_key, marks["store_fingerprint"], usage_mark
+        )
     cached: dict[str, Any] | None = None
     fresh_entry: dict[str, Any] | None = None
     with _LEDGER_MEMO_LOCK:
@@ -1818,8 +2031,28 @@ def _memoized_cost_ledger(
                     entry["results"].move_to_end(filters)
     if cached is not None:
         return _copy_ledger(cached, shared_read_only=shared_read_only)
+    if fresh_entry is None and persist_path is not None and persist_key is not None:
+        loaded = _load_persisted_results(persist_path, persist_key)
+        if loaded is not None:
+            # A persisted entry carries no raw inputs: a filter miss or a
+            # usage fold on it rebuilds them in full.
+            fresh_entry = {
+                "fingerprint": fingerprint,
+                "usage": usage_mark,
+                "inputs": None,
+                "results": loaded,
+            }
+            entry = fresh_entry
+            with _LEDGER_MEMO_LOCK:
+                _LEDGER_MEMO[root_key] = fresh_entry
+                _LEDGER_MEMO.move_to_end(root_key)
+                while len(_LEDGER_MEMO) > _LEDGER_MEMO_MAX_REPOSITORIES:
+                    _LEDGER_MEMO.popitem(last=False)
+            cached = loaded.get(filters)
+            if cached is not None:
+                return _copy_ledger(cached, shared_read_only=shared_read_only)
     results: OrderedDict[tuple[Any, ...], dict[str, Any]]
-    if fresh_entry is not None:
+    if fresh_entry is not None and fresh_entry["inputs"] is not None:
         _count_ledger_cache("filter_misses")
         inputs = fresh_entry["inputs"]
         results = fresh_entry["results"]
@@ -1828,6 +2061,7 @@ def _memoized_cost_ledger(
         if (
             entry is not None
             and canonical
+            and entry["inputs"] is not None
             and entry["fingerprint"] == fingerprint
             and usage_mark[0] > entry["usage"][0]
         ):
@@ -1846,7 +2080,7 @@ def _memoized_cost_ledger(
             inputs = _read_ledger_inputs(
                 repo_root, through_event_id=usage_mark[0] if canonical else None
             )
-        results = OrderedDict()
+        results = fresh_entry["results"] if fresh_entry is not None else OrderedDict()
     # Frozen once per build: a memo hit then needs no deepcopy for a shared
     # (dashboard) reader, and a nested mutation can never reach the memo.
     result = _freeze(
@@ -1873,4 +2107,11 @@ def _memoized_cost_ledger(
         _LEDGER_MEMO.move_to_end(root_key)
         while len(_LEDGER_MEMO) > _LEDGER_MEMO_MAX_REPOSITORIES:
             _LEDGER_MEMO.popitem(last=False)
+        persisted = (
+            [[key, value] for key, value in results.items()]
+            if persist_key is not None
+            else None
+        )
+    if persist_path is not None and persisted is not None:
+        write_persisted_payload(persist_path, persist_key, persisted)
     return _copy_ledger(result, shared_read_only=shared_read_only)
