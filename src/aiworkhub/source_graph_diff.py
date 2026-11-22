@@ -27,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import hashlib
+import json
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -37,10 +38,15 @@ from . import parallelism, source_graph, source_graph_ast, worker_workspace
 from .semantic_edit import _split_lines
 
 SCHEMA_ID = "aiworkhub.source_graph_diff.v1"
+# The page cap: every page's ``page_bytes`` (inventory, hunk entries and
+# envelope included) stays <= ``byte_budget`` once the budget can hold one
+# page's envelope (NF-2026-02362).
 DEFAULT_BYTE_BUDGET = 32 * 1024
 MAX_FILE_BYTES = source_graph.SOURCE_GRAPH_AUTHENTICATED_FILE_BYTE_LIMIT
 GIT_TIMEOUT_SECONDS = 60.0
 _CURSOR_PREFIX = "sgd1"
+_INVENTORY_CURSOR_PREFIX = "sgd1i"
+_ITEM_SEPARATOR_BYTES = len(", ")
 _SYMBOL_KINDS = frozenset({"function", "method", "class", "async_function"})
 _WORKTREES_RELATIVE = Path(".aiworkhub") / "runtime" / "worktrees"
 
@@ -475,67 +481,141 @@ def _ascii_digits(text: str) -> bool:
     return text.isascii() and text.isdigit()
 
 
-def _parse_cursor(cursor: str | None, fingerprint: str) -> tuple[int, int]:
+def page_bytes(page: Any) -> int:
+    """The size a diff page's ``byte_budget`` caps (NF-2026-02362).
+
+    ``json.dumps`` defaults: ASCII-escaped with ``", "``/``": "`` separators,
+    never smaller than the compact or UTF-8 encoding a transport sends.
+    """
+    return len(json.dumps(page))
+
+
+def _parse_cursor(cursor: str | None, fingerprint: str) -> tuple[bool, int, int]:
+    """``(in_inventory, index, offset)``; no cursor starts at the inventory."""
     if cursor is None or cursor == "":
-        return 0, 0
+        return True, 0, 0
     if not isinstance(cursor, str):
         raise SourceGraphDiffError("cursor_invalid")
     parts = cursor.split(":")
     if (
-        len(parts) != 4 or parts[0] != _CURSOR_PREFIX
+        len(parts) != 4 or parts[0] not in (_CURSOR_PREFIX, _INVENTORY_CURSOR_PREFIX)
         or not _ascii_digits(parts[1]) or not _ascii_digits(parts[2])
     ):
         raise SourceGraphDiffError("cursor_invalid")
     if parts[3] != fingerprint:
         raise SourceGraphDiffError("cursor_stale")
-    return int(parts[1]), int(parts[2])
+    in_inventory = parts[0] == _INVENTORY_CURSOR_PREFIX
+    if in_inventory and parts[2] != "0":
+        raise SourceGraphDiffError("cursor_invalid")
+    return in_inventory, int(parts[1]), int(parts[2])
+
+
+def _char_end(data: bytes, offset: int, allowance: int) -> int:
+    """The last UTF-8 character boundary at or before ``offset + allowance``."""
+    end = min(len(data), offset + max(0, allowance))
+    while end < len(data) and end > offset and (data[end] & 0xC0) == 0x80:
+        end -= 1
+    return end
+
+
+def _fitting_end(data: bytes, offset: int, allowance: int) -> int:
+    """The largest ``end`` whose JSON-escaped ``data[offset:end]`` fits ``allowance``.
+
+    Escaping never shrinks a byte, so the raw boundary bounds the search.
+    """
+    end = _char_end(data, offset, allowance)
+    if end == offset:
+        return end
+    text = data[offset:end].decode("utf-8", "surrogateescape")
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if page_bytes(text[:middle]) - 2 <= allowance:
+            low = middle
+        else:
+            high = middle - 1
+    return offset + len(text[:low].encode("utf-8", "surrogateescape"))
 
 
 def _paginate(
-    hunks: Sequence[Mapping[str, Any]], byte_budget: int, cursor: str | None, fingerprint: str
+    hunks: Sequence[Mapping[str, Any]], inventory: Mapping[str, Sequence[Mapping[str, Any]]],
+    head: Mapping[str, Any], byte_budget: int, cursor: str | None, fingerprint: str,
 ) -> dict[str, Any]:
+    """One page whose ``page_bytes`` stays within ``byte_budget``.
+
+    The files/symbols/skipped inventory leads the cursor chain: the first page
+    carries it (and pages on if it alone overflows); later pages carry only its
+    ``inventory_total`` counts, then the hunk pieces in order.  A budget too
+    small for one page's envelope still advances: such a page carries exactly
+    one inventory row or one hunk piece of at most ``byte_budget`` raw bytes.
+    """
     if byte_budget < 1:
         raise SourceGraphDiffError("byte_budget_invalid")
-    index, offset = _parse_cursor(cursor, fingerprint)
-    if index > len(hunks):
+    in_inventory, index, offset = _parse_cursor(cursor, fingerprint)
+    rows = [(key, row) for key, listed in inventory.items() for row in listed]
+    if index > (len(rows) if in_inventory else len(hunks)):
         raise SourceGraphDiffError("cursor_invalid")
-    remaining = byte_budget
+    sections: dict[str, list[Any]] = {key: [] for key in inventory}
     page: list[dict[str, Any]] = []
-    while index < len(hunks) and remaining > 0:
-        data = hunks[index]["text"].encode("utf-8", "surrogateescape")
+    marker = f"[source_graph_diff truncated at {byte_budget} bytes; resume with cursor]"
+
+    def build(truncated: bool, next_cursor: str | None, shown: str | None) -> dict[str, Any]:
+        return {
+            **head, **sections,
+            "inventory_total": {key: len(listed) for key, listed in inventory.items()},
+            "fingerprint": fingerprint, "hunks": page, "hunk_total": len(hunks),
+            "byte_budget": byte_budget, "truncated": truncated,
+            "truncation_marker": shown, "next_cursor": next_cursor,
+        }
+
+    widest = max([len(rows), len(hunks), *(4 * len(hunk["text"]) for hunk in hunks)])
+    widest_cursor = f"{_INVENTORY_CURSOR_PREFIX}:{widest}:{widest}:{fingerprint}"
+    # An envelope bound for every final state ("false" outweighs "true").
+    remaining = byte_budget - page_bytes(build(False, widest_cursor, marker))
+    emitted = 0
+    while in_inventory and index < len(rows):
+        key, row = rows[index]
+        cost = page_bytes(row) + _ITEM_SEPARATOR_BYTES
+        if cost > remaining and emitted:
+            break
+        sections[key].append(row)
+        remaining -= cost
+        emitted += 1
+        index += 1
+    if in_inventory and index >= len(rows):
+        in_inventory, index, offset = False, 0, 0
+    while not in_inventory and index < len(hunks):
+        hunk = hunks[index]
+        data = hunk["text"].encode("utf-8", "surrogateescape")
         if offset > len(data):
             raise SourceGraphDiffError("cursor_invalid")
-        end = min(len(data), offset + remaining)
-        while end < len(data) and end > offset and (data[end] & 0xC0) == 0x80:
-            end -= 1
+        entry = {
+            "index": index, "path": hunk["path"], "header": hunk["header"],
+            "offset": offset, "text": "", "complete": False,
+        }
+        end = _fitting_end(data, offset, remaining - page_bytes(entry) - _ITEM_SEPARATOR_BYTES)
         if end == offset:
-            if page:
+            if emitted:
                 break
-            end = offset + 1
-            while end < len(data) and (data[end] & 0xC0) == 0x80:
-                end += 1
-        page.append({
-            "index": index, "path": hunks[index]["path"], "header": hunks[index]["header"],
-            "offset": offset, "text": data[offset:end].decode("utf-8", "surrogateescape"),
-            "complete": end == len(data),
-        })
-        remaining -= end - offset
+            # Minimum progress: this budget cannot hold the page's envelope.
+            end = _char_end(data, offset, byte_budget)
+            if end == offset:
+                end = offset + 1
+                while end < len(data) and (data[end] & 0xC0) == 0x80:
+                    end += 1
+        entry["text"] = data[offset:end].decode("utf-8", "surrogateescape")
+        entry["complete"] = end == len(data)
+        page.append(entry)
+        remaining -= page_bytes(entry) + _ITEM_SEPARATOR_BYTES
+        emitted += 1
         offset = end
         if offset >= len(data):
             index, offset = index + 1, 0
+    if in_inventory:
+        return build(True, f"{_INVENTORY_CURSOR_PREFIX}:{index}:0:{fingerprint}", marker)
     truncated = index < len(hunks)
     next_cursor = f"{_CURSOR_PREFIX}:{index}:{offset}:{fingerprint}" if truncated else None
-    return {
-        "hunks": page,
-        "hunk_total": len(hunks),
-        "byte_budget": byte_budget,
-        "truncated": truncated,
-        "truncation_marker": (
-            f"[source_graph_diff truncated at {byte_budget} bytes; resume with cursor]"
-            if truncated else None
-        ),
-        "next_cursor": next_cursor,
-    }
+    return build(truncated, next_cursor, marker if truncated else None)
 
 
 def _repo_path(prefix: str, relative: str) -> str:
@@ -579,15 +659,10 @@ def _assemble(
         hunks.extend(_file_hunks(row, before, after))
         symbols.extend(_changed_symbols(root_old, root_new, row, before, after))
     fingerprint = _fingerprint(files, hunks)
-    return {
-        "schema_id": SCHEMA_ID,
-        **extra,
-        "files": files,
-        "symbols": symbols,
-        "skipped": skipped,
-        "fingerprint": fingerprint,
-        **_paginate(hunks, byte_budget, cursor, fingerprint),
-    }
+    inventory = {"files": files, "symbols": symbols, "skipped": skipped}
+    return _paginate(
+        hunks, inventory, {"schema_id": SCHEMA_ID, **extra}, byte_budget, cursor, fingerprint
+    )
 
 
 # ---- public entry points -------------------------------------------------------

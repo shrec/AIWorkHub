@@ -214,8 +214,70 @@ def fold_task_card_contract(card: Any) -> Any:
     return result
 
 
+# NF-2026-02362: the summary folds by size, not by a denylist. A card value
+# whose compact JSON exceeds this many bytes folds to {summarized, bytes,
+# sha256} unless it is an identity/lifecycle field the summary promises exact.
+SUMMARY_VALUE_BYTE_LIMIT = 1024
+# Exact on top of _BRIEF_CARD_KEYS (task_id, title, status, substatus, runner,
+# topic, request ids) and every ``*_at`` timestamp.
+_PROCESS_STATUS_EXACT_KEYS = ("claim_epoch", "allowed_writes")
+# Folded afterwards by server._fold_card_manager_bodies with its own facts;
+# tests/test_reply_size_nf02362.py asserts this matches server._CARD_MANAGER_BODY_KEYS.
+PROCESS_STATUS_SERVER_FOLDED_KEYS = ("review_feedback", "recovery_feedback", "history")
+# Containers the summary keeps open: descended, never folded whole.
+# terminal_review keeps _BRIEF_TERMINAL_REVIEW_KEYS exact because
+# brief_task_card reads them from the summary, so detail=brief stays unchanged.
+_OPEN_SUMMARY_CONTAINERS = (("terminal_review",), ("terminal_review", "evidence"))
+
+
+def _open_container_keep(path: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Members an open container keeps exact; ``None`` for a foldable dict."""
+
+    if path not in _OPEN_SUMMARY_CONTAINERS:
+        return None
+    return _BRIEF_TERMINAL_REVIEW_KEYS if path == ("terminal_review",) else ()
+
+
+def _process_status_exact(key: str) -> bool:
+    return (
+        key in _BRIEF_CARD_KEYS
+        or key in _PROCESS_STATUS_EXACT_KEYS
+        or key in PROCESS_STATUS_SERVER_FOLDED_KEYS
+        or key.endswith("_at")
+    )
+
+
+def _fold_oversized(value: Any, path: tuple[str, ...]) -> Any:
+    """Bound one summary value: what fits stays exact, the rest folds to identity.
+
+    An oversized dict first folds its own oversized members; it folds whole
+    (keeping verdict/status-like facts, via ``_fold_blob_generic``) only if it
+    still exceeds the limit and is not an open container.
+    """
+
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if core._evidence_identity(value)[0] <= SUMMARY_VALUE_BYTE_LIMIT:
+        return value
+    if not isinstance(value, dict):
+        return _fold_to_identity(value)
+    keep = _open_container_keep(path)
+    folded = {
+        key: member if keep and key in keep else _fold_oversized(member, (*path, str(key)))
+        for key, member in value.items()
+    }
+    if keep is not None or core._evidence_identity(folded)[0] <= SUMMARY_VALUE_BYTE_LIMIT:
+        return folded
+    return _fold_blob_generic(value)
+
+
 def fold_task_card_for_process_status(card: Any) -> Any:
-    """Fold contract text and repeated retry/reroute prose, not lifecycle facts."""
+    """Fold contract text, retry/reroute prose and any oversized value; keep lifecycle facts.
+
+    Identity and lifecycle fields (``_BRIEF_CARD_KEYS``, claim_epoch,
+    allowed_writes, ``*_at`` timestamps) stay exact; every other value whose
+    compact JSON exceeds ``SUMMARY_VALUE_BYTE_LIMIT`` folds (NF-2026-02362).
+    """
     result = fold_task_card_contract(fold_task_card_facts(card))
     if not isinstance(result, dict):
         return result
@@ -235,7 +297,54 @@ def fold_task_card_for_process_status(card: Any) -> Any:
             authorization["reason"] = _fold_to_identity(authorization["reason"])
             provenance["operational_provider_authorization"] = authorization
         result[key] = provenance
+    for key, value in result.items():
+        if not _process_status_exact(key):
+            result[key] = _fold_oversized(value, (key,))
+    _bound_summary_total(result)
     return result
+
+
+# NF-2026-02362: values that each fit SUMMARY_VALUE_BYTE_LIMIT can still sum
+# past the total the summary promises; the largest foldable ones then fold to
+# identity, largest first. Exact fields never fold, so the bound holds unless
+# they alone exceed it. The server-folded bodies are bounded by the server.
+SUMMARY_TOTAL_BYTE_LIMIT = 12 * 1024
+# An identity fold is ~100 B; folding a smaller value would only grow it.
+_TOTAL_FOLD_MIN_BYTES = 128
+
+
+def _summary_bytes(result: dict) -> int:
+    return core._evidence_identity(
+        {key: value for key, value in result.items() if key not in PROCESS_STATUS_SERVER_FOLDED_KEYS}
+    )[0]
+
+
+def _bound_summary_total(result: dict) -> None:
+    """Fold the largest non-exact members until the summary card fits."""
+
+    if _summary_bytes(result) <= SUMMARY_TOTAL_BYTE_LIMIT:
+        return
+    slots: list[tuple[int, dict, Any]] = []
+
+    def collect(container: dict, path: tuple[str, ...]) -> None:
+        keep = _open_container_keep(path) or ()
+        for key, member in container.items():
+            child = (*path, str(key))
+            if (not path and _process_status_exact(key)) or key in keep:
+                continue
+            if isinstance(member, dict) and _open_container_keep(child) is not None:
+                container[key] = dict(member)  # never mutate the caller's card
+                collect(container[key], child)
+            elif not (isinstance(member, dict) and member.get("summarized") is True):
+                size = core._evidence_identity(member)[0]
+                if size > _TOTAL_FOLD_MIN_BYTES:
+                    slots.append((size, container, key))
+
+    collect(result, ())
+    for _size, container, key in sorted(slots, key=lambda slot: slot[0], reverse=True):
+        if _summary_bytes(result) <= SUMMARY_TOTAL_BYTE_LIMIT:
+            return
+        container[key] = _fold_to_identity(container[key])
 
 
 # NF-2026-02153: the brief lifecycle view keeps these facts and nothing else.
