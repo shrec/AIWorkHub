@@ -420,12 +420,14 @@ def adapter_readiness(
             # The completion-inbox compatibility surface must consume the same
             # live-auth authority as environment preflight. Executable presence
             # alone is not launchability after a provider-observed 401/403.
-            from . import claude_auth
+            # That authority also owns the dashboard reader's polled probe; the
+            # local import avoids the repo_policy<->readiness cycle.
+            from . import repo_policy
 
             resolution = runtime_adapters.resolve_executable(adapter_id)
             installed = bool(resolution.ok)
             auth = (
-                claude_auth.auth_status(resolution.executable)
+                repo_policy.claude_auth_status(resolution.executable)
                 if installed
                 else {
                     "authenticated": False,
@@ -435,7 +437,7 @@ def adapter_readiness(
                 }
             )
             launchable = installed and bool(auth.get("launchable"))
-            adapters.append({
+            row: dict[str, Any] = {
                 "adapter_id": adapter_id,
                 "kind": "local_cli",
                 "installed": installed,
@@ -453,7 +455,11 @@ def adapter_readiness(
                     )
                 ),
                 "runtime_observed": bool(auth.get("runtime_observed")),
-            })
+            }
+            if repo_policy.auth_probe_pending(auth):
+                row["status"] = auth["status"]
+                row["auth_probe"] = dict(auth["auth_probe"])
+            adapters.append(row)
             continue
         if adapter_id in runtime_adapters.MANUAL_ONLY_ADAPTERS:
             adapters.append({

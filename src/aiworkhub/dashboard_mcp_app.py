@@ -2484,10 +2484,20 @@ def _probe_pending(snapshot: Mapping[str, Any]) -> bool:
     The snapshot never waits for those background probes (NF-2026-02274), so
     such a build is not memoized: the next poll picks up the landed result.
     """
+    readiness = snapshot.get("adapter_readiness")
+    if isinstance(readiness, Mapping) and _any_auth_probe_pending(readiness.get("adapters")):
+        return True
     preflight = snapshot.get("environment_preflight")
     if not isinstance(preflight, Mapping):
         return False
     if preflight.get("status") == "probing":
+        return True
+    # A row policy already denies keeps that status, yet its access fact is
+    # still unmeasured (NF-2026-02338): the marker alone blocks memoization.
+    observability = preflight.get("provider_observability")
+    if isinstance(observability, Mapping) and _any_auth_probe_pending(observability.get("adapters")):
+        return True
+    if _any_auth_probe_pending(preflight.get("providers")):
         return True
     # The finalization probe is pending even when another error already made
     # the aggregate ``blocked``: its verdict is transient, never memoized.
@@ -2502,6 +2512,10 @@ def _probe_pending(snapshot: Mapping[str, Any]) -> bool:
         if isinstance(row, Mapping) and repo_policy._provider_probe_pending(row):
             return True
     return False
+
+
+def _any_auth_probe_pending(rows: object) -> bool:
+    return isinstance(rows, list) and any(repo_policy.auth_probe_pending(row) for row in rows)
 
 
 def _cacheable_build(snapshot: Mapping[str, Any]) -> bool:

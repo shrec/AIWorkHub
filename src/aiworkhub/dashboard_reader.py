@@ -252,15 +252,16 @@ def install_single_thread_fence() -> None:
     setattr(dashboard, "_snapshot_read_worker_limit", lambda: 1)
     # NF-2026-02324: the ``opencode models`` refresh runs here as a polled
     # child process, so a drain never waits on it (it is a child process and
-    # not a thread because this process stays single-threaded).
+    # not a thread because this process stays single-threaded). The same
+    # switch polls the Claude and Codex auth probes (NF-2026-02338).
     repo_policy.enable_polled_opencode_probe(_DeferredThread)
 
 
 def drain_deferred_work(limit: int = MAX_DEFERRED_JOBS_PER_DRAIN) -> int:
     """Run up to ``limit`` queued background jobs on this thread; return the count.
 
-    A job whose child process is still running (the polled ``opencode models``
-    refresh, NF-2026-02324) is polled once without waiting and, unfinished,
+    A job whose child process is still running (a polled provider probe,
+    NF-2026-02324/02338) is polled once without waiting and, unfinished,
     queued again for the next drain.
     """
     ran = 0

@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1074,8 +1075,10 @@ def nonblocking_provider_probes() -> Iterator[None]:
     Inside this scope (the dashboard snapshot, NF-2026-02274) a cached or
     stale probe value is served as before, and a never-probed one is reported
     as ``probing`` while one background probe runs, instead of blocking on the
-    ``opencode models`` subprocess.  Thread-local: other callers keep the
-    synchronous first probe.
+    ``opencode models`` subprocess.  In the fenced dashboard reader the Claude
+    and Codex auth probes do not block either (NF-2026-02338), each by its own
+    module's cache rules.  Thread-local: other callers keep the synchronous
+    first probe.
     """
 
     previous = getattr(_PROBE_MODE_LOCAL, "nonblocking", False)
@@ -1091,10 +1094,18 @@ def _probes_nonblocking() -> bool:
 
 
 def _provider_probe_pending(row: Mapping[str, Any]) -> bool:
-    """A provider row whose model probe is still running in the background."""
+    """A provider row whose model or auth probe is still running in the background.
 
-    probe = row.get("opencode_models_probe") if isinstance(row, Mapping) else None
-    return isinstance(probe, Mapping) and probe.get("state") == OPENCODE_PROBE_STATE_PROBING
+    An auth probe only counts while ``probing`` is the row's final status: a
+    policy or sandbox verdict that replaced it does not wait for the probe.
+    """
+
+    if not isinstance(row, Mapping):
+        return False
+    probe = row.get("opencode_models_probe")
+    if isinstance(probe, Mapping) and probe.get("state") == OPENCODE_PROBE_STATE_PROBING:
+        return True
+    return row.get("status") == AUTH_PROBE_STATE_PROBING and auth_probe_pending(row)
 
 
 _OPENCODE_MODELS_CACHE = _TtlSingleFlightCache("opencode_models")
@@ -1113,10 +1124,16 @@ _PROBE_CACHE_ENV_KEYS: tuple[str, ...] = (
 
 
 def reset_provider_probe_caches() -> None:
-    """Drop the opencode-models and deepseek-status caches (tests, refresh)."""
+    """Drop the opencode-models and deepseek-status caches (tests, refresh).
+
+    Also forgets the polled auth probes' results and in-flight children; such
+    a child is killed, unpublished, when it is next polled.
+    """
 
     _OPENCODE_MODELS_CACHE.reset()
     _DEEPSEEK_STATUS_CACHE.reset()
+    _AUTH_PROBE_JOBS.clear()
+    _AUTH_PROBE_RESULTS.clear()
 
 
 def provider_probe_cache_stats() -> list[dict[str, Any]]:
@@ -1388,8 +1405,7 @@ def enable_polled_opencode_probe(thread_class: Any) -> None:
 def _polled_probe_runtime_dir() -> Path | None:
     """The runtime directory of a polled probe, or None for the blocking path."""
 
-    thread_class = _POLLED_PROBE_THREAD_CLASS
-    if thread_class is None or getattr(threading, "Thread", None) is not thread_class:
+    if not _reader_fence_active():
         return None
     if (
         _list_opencode_models is not _BLOCKING_OPENCODE_PROBE[0]
@@ -1397,6 +1413,15 @@ def _polled_probe_runtime_dir() -> Path | None:
         or subprocess.run is not _BLOCKING_OPENCODE_PROBE[2]
     ):
         return None
+    return _reader_probe_dir(_OPENCODE_PROBE_RUNTIME_PARTS)
+
+
+def _reader_fence_active() -> bool:
+    thread_class = _POLLED_PROBE_THREAD_CLASS
+    return thread_class is not None and getattr(threading, "Thread", None) is thread_class
+
+
+def _reader_probe_dir(parts: tuple[str, ...]) -> Path | None:
     from . import runtime_temp
 
     root = runtime_temp.known_repository()
@@ -1404,7 +1429,7 @@ def _polled_probe_runtime_dir() -> Path | None:
         # Never write probe output outside a known repository.
         return None
     try:
-        return runtime_temp.repo_runtime_dir(root, *_OPENCODE_PROBE_RUNTIME_PARTS)
+        return runtime_temp.repo_runtime_dir(root, *parts)
     except runtime_temp.RuntimeTempError:
         return None
 
@@ -1415,21 +1440,130 @@ def _probe_child_session_kwargs() -> dict[str, Any]:
     return {} if _is_windows_host() else {"start_new_session": True}
 
 
-def _read_probe_output(path: Path) -> bytes:
+def _read_probe_output(path: Path, limit: int | None = None) -> bytes:
     # One byte past the limit is enough to name the probe ``oversized``.
+    size = _OPENCODE_PROBE_MAX_PAYLOAD_BYTES if limit is None else limit
     with path.open("rb") as handle:
-        return handle.read(_OPENCODE_PROBE_MAX_PAYLOAD_BYTES + 1)
+        return handle.read(size + 1)
 
 
-def _remove_probe_outputs(paths: Any) -> None:
+def _remove_probe_outputs(paths: Any, wait: float = 0.0) -> None:
+    """Remove the files; ``wait`` bounds retries while a killed tree lets go of them."""
+
+    deadline = time.monotonic() + wait
     for path in paths:
+        while True:
+            try:
+                Path(path).unlink(missing_ok=True)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+
+
+class _PolledChild:
+    """One child process writing to runtime files, polled and never waited on."""
+
+    def __init__(self, runtime_dir: Path) -> None:
+        self._runtime_dir = runtime_dir
+        self._process: subprocess.Popen[bytes] | None = None
+        self._outputs: tuple[Path, ...] = ()
+        self._deadline = 0.0
+
+    def cancel(self) -> None:
+        """Kill a still-running child and remove its files; publishes nothing."""
+
+        self._stop_child()
+
+    def _spawn(
+        self,
+        argv: list[str],
+        timeout: float,
+        *,
+        prefix: str,
+        suffixes: tuple[str, ...],
+        **launch: Any,
+    ) -> str | None:
+        """Start the child; None while it runs, else the failure reason.
+
+        stdout, then stderr, go to one file per suffix; without a second
+        suffix stderr is discarded.
+        """
+
+        descriptors: list[int] = []
+        paths: list[Path] = []
+        reason: str | None = None
         try:
-            Path(path).unlink(missing_ok=True)
+            self._runtime_dir.mkdir(parents=True, exist_ok=True)
+            for suffix in suffixes:
+                descriptor, name = tempfile.mkstemp(
+                    prefix=prefix, suffix=suffix, dir=self._runtime_dir
+                )
+                descriptors.append(descriptor)
+                paths.append(Path(name))
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=descriptors[0],
+                stderr=descriptors[1] if len(descriptors) > 1 else subprocess.DEVNULL,
+                **launch,
+            )
         except OSError:
-            pass
+            reason = "oserror"
+        except ValueError:
+            reason = "invalid"
+        else:
+            self._process = process
+            self._outputs = tuple(paths)
+            self._deadline = time.monotonic() + timeout
+        finally:
+            for descriptor in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if reason is not None:
+            _remove_probe_outputs(paths)
+        return reason
+
+    def _take_outputs(self) -> tuple[Path, ...]:
+        outputs, self._outputs = self._outputs, ()
+        self._process = None
+        return outputs
+
+    def _stop_child(self) -> None:
+        process = self._process
+        outputs = self._take_outputs()
+        if process is not None:
+            from . import platform_io
+
+            def tree_alive(identity: int) -> bool:
+                # poll() reaps the root, so on POSIX only real survivors of
+                # its process group still count.
+                if process.poll() is None:
+                    return True
+                return not _is_windows_host() and platform_io.probe_process_group(identity)
+
+            if tree_alive(process.pid):
+                platform_io.terminate_process_tree(
+                    process.pid,
+                    timeout=_OPENCODE_PROBE_KILL_TIMEOUT_SECONDS,
+                    probe=tree_alive,
+                )
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=_OPENCODE_PROBE_KILL_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        _remove_probe_outputs(outputs, _OPENCODE_PROBE_KILL_TIMEOUT_SECONDS)
 
 
-class _PolledOpencodeModelsProbe:
+class _PolledOpencodeModelsProbe(_PolledChild):
     """One ``opencode models`` listing as a polled child process (NF-2026-02324).
 
     :meth:`poll` never waits on the child: it starts it, or checks it with
@@ -1441,12 +1575,9 @@ class _PolledOpencodeModelsProbe:
     """
 
     def __init__(self, executable: str, runtime_dir: Path) -> None:
+        super().__init__(runtime_dir)
         self._executable = executable
-        self._runtime_dir = runtime_dir
         self._attempts = 0
-        self._process: subprocess.Popen[bytes] | None = None
-        self._outputs: tuple[Path, Path] | None = None
-        self._deadline = 0.0
         self._result: tuple[list[str], dict[str, Any]] | None = None
 
     def result(self) -> tuple[list[str], dict[str, Any]]:
@@ -1480,55 +1611,20 @@ class _PolledOpencodeModelsProbe:
         self._result = _publish_opencode_probe(self._executable, rows, reason)
         return True
 
-    def cancel(self) -> None:
-        """Kill a still-running child and remove its files; publishes nothing."""
-
-        self._stop_child()
-
     def _start(self, timeout: int) -> str | None:
         """Start one attempt; None while it runs, else its failure reason."""
 
         self._attempts += 1
-        descriptors: list[int] = []
-        paths: list[Path] = []
-        reason: str | None = None
-        try:
-            self._runtime_dir.mkdir(parents=True, exist_ok=True)
-            for suffix in (".out", ".err"):
-                descriptor, name = tempfile.mkstemp(
-                    prefix="opencode-models-", suffix=suffix, dir=self._runtime_dir
-                )
-                descriptors.append(descriptor)
-                paths.append(Path(name))
-            process = subprocess.Popen(
-                [self._executable, "models"],
-                stdin=subprocess.DEVNULL,
-                stdout=descriptors[0],
-                stderr=descriptors[1],
-                **_probe_child_session_kwargs(),
-            )
-        except OSError:
-            reason = "oserror"
-        except ValueError:
-            reason = "invalid"
-        else:
-            self._process = process
-            self._outputs = (paths[0], paths[1])
-            self._deadline = time.monotonic() + timeout
-        finally:
-            for descriptor in descriptors:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-        if reason is not None:
-            _remove_probe_outputs(paths)
-        return reason
+        return self._spawn(
+            [self._executable, "models"],
+            timeout,
+            prefix="opencode-models-",
+            suffixes=(".out", ".err"),
+            **_probe_child_session_kwargs(),
+        )
 
     def _collect(self, returncode: int) -> tuple[list[str], str | None]:
-        outputs = self._outputs or ()
-        self._process = None
-        self._outputs = None
+        outputs = self._take_outputs()
         try:
             stdout = _read_probe_output(outputs[0])
             stderr = _read_probe_output(outputs[1])
@@ -1537,31 +1633,6 @@ class _PolledOpencodeModelsProbe:
         finally:
             _remove_probe_outputs(outputs)
         return _opencode_models_from_output(stdout, stderr, returncode)
-
-    def _stop_child(self) -> None:
-        process = self._process
-        outputs = self._outputs or ()
-        self._process = None
-        self._outputs = None
-        if process is not None:
-            if process.poll() is None:
-                from . import platform_io
-
-                platform_io.terminate_process_tree(
-                    process.pid,
-                    timeout=_OPENCODE_PROBE_KILL_TIMEOUT_SECONDS,
-                    probe=lambda _identity: process.poll() is None,
-                )
-            if process.poll() is None:
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-            try:
-                process.wait(timeout=_OPENCODE_PROBE_KILL_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
-        _remove_probe_outputs(outputs)
 
 
 class _PolledOpencodeModels:
@@ -1576,6 +1647,224 @@ class _PolledOpencodeModels:
 
     def start_polled(self) -> _PolledOpencodeModelsProbe:
         return _PolledOpencodeModelsProbe(self._executable, self._runtime_dir)
+
+
+# NF-2026-02338: the same polled child for the Claude and Codex auth probes.
+# The OpenCode cache's TTL/stale/negative rules do not apply to them: each auth
+# module's ``PolledProbe`` answers from its own cheap checks and cache, and
+# publishes a finished child through its own rules.  Only two things live here:
+# the one child in flight per key, and the last finished result of a key.  A
+# positive is held through its refresh until it expires; anything else until
+# the next child for the key starts, because Claude never caches a negative:
+# without it such a row would read ``probing`` forever.
+AUTH_PROBE_STATE_PROBING = OPENCODE_PROBE_STATE_PROBING
+_AUTH_PROBE_PENDING_REASON = "provider_auth_probe_pending"
+_AUTH_PROBE_RUNTIME_PARTS: tuple[str, ...] = ("provider_auth_probe",)
+# Interpreter start and teardown on top of the bounds the child enforces itself.
+_AUTH_PROBE_CHILD_GRACE_SECONDS = 15.0
+# No finished result outlives this.  Codex's 30 s negative TTL would be too short:
+# refresh cadence plus build memo can first show a result about 156 s after it.
+_AUTH_PROBE_SHOW_MAX_SECONDS = 300.0
+_AUTH_PROBE_MAX_RESULT_BYTES = 256 * 1024
+_AUTH_PROBE_JOBS: dict[tuple[str, str], _PolledAuthProbe] = {}
+# key -> (monotonic time until which it may be shown, published status)
+_AUTH_PROBE_RESULTS: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+# The blocking callables as defined by their modules; a replaced one is called
+# exactly as before.
+_BLOCKING_CLAUDE_AUTH_STATUS = claude_auth.auth_status
+_BLOCKING_CODEX_CAPABILITY_STATUS = codex_auth.capability_status
+
+
+def auth_probe_pending(value: object) -> bool:
+    """An auth status, or a row built from one, whose probe has not finished."""
+
+    probe = value.get("auth_probe") if isinstance(value, Mapping) else None
+    return isinstance(probe, Mapping) and probe.get("state") == AUTH_PROBE_STATE_PROBING
+
+
+def claude_auth_status(executable: str | None) -> Mapping[str, Any]:
+    """``claude_auth.auth_status``; never waits inside the fenced reader's scope."""
+
+    return _auth_status_without_waiting(
+        claude_auth, claude_auth.auth_status, _BLOCKING_CLAUDE_AUTH_STATUS, executable
+    )
+
+
+def codex_capability_status(executable: str | None) -> Mapping[str, Any]:
+    """``codex_auth.capability_status``; never waits inside the fenced reader's scope."""
+
+    return _auth_status_without_waiting(
+        codex_auth, codex_auth.capability_status, _BLOCKING_CODEX_CAPABILITY_STATUS, executable
+    )
+
+
+def _auth_status_without_waiting(
+    auth: Any, status: Any, blocking: Any, executable: str | None
+) -> Mapping[str, Any]:
+    # A replaced blocking callable is called exactly as before.
+    if status is blocking:
+        runtime_dir = _polled_auth_runtime_dir()
+        if runtime_dir is not None:
+            return _polled_auth_status(auth.PolledProbe(executable), runtime_dir)
+    return status(executable)
+
+
+def _polled_auth_runtime_dir() -> Path | None:
+    if not _probes_nonblocking() or not _reader_fence_active():
+        return None
+    return _reader_probe_dir(_AUTH_PROBE_RUNTIME_PARTS)
+
+
+def _polled_auth_status(probe: Any, runtime_dir: Path) -> dict[str, Any]:
+    """What is known without waiting; a miss queues the key's one child."""
+
+    key = (str(probe.module), str(probe.key))
+    if probe.known is not None:
+        # The module's own answer supersedes whatever its last child reported; a
+        # cached positive keeps that result for the refresh that follows it.
+        if probe.known.get("launchable") is not True:
+            _AUTH_PROBE_RESULTS.pop(key, None)
+        return dict(probe.known)
+    if key not in _AUTH_PROBE_JOBS:
+        job = _PolledAuthProbe(probe, key, runtime_dir)
+        try:
+            # The fence's queued stand-in, never a thread: the next drain starts
+            # the child and later drains poll it.
+            threading.Thread(
+                target=lambda: job, name="aiworkhub-auth-probe", daemon=True
+            ).start()
+        except RuntimeError:
+            # A full deferred queue: still unmeasured, and a later read retries.
+            pass
+        else:
+            _AUTH_PROBE_JOBS[key] = job
+    finished = _AUTH_PROBE_RESULTS.get(key)
+    if finished is not None and time.monotonic() < finished[0]:
+        return deepcopy(finished[1])
+    return {
+        "ok": False,
+        "authenticated": False,
+        "launchable": False,
+        "status": AUTH_PROBE_STATE_PROBING,
+        "blocker_reason": _AUTH_PROBE_PENDING_REASON,
+        "auth_probe": {"state": AUTH_PROBE_STATE_PROBING},
+    }
+
+
+class _PolledAuthProbe(_PolledChild):
+    """One Claude or Codex auth probe in a child of our own Python.
+
+    The child is the auth module run with ``-m``: it does the blocking probe
+    and writes only its sanitized result to stdout, a file in the repository
+    runtime directory.  Its stderr is discarded, so no raw CLI output is kept.
+    """
+
+    def __init__(self, probe: Any, key: tuple[str, str], runtime_dir: Path) -> None:
+        super().__init__(runtime_dir)
+        self._probe = probe
+        self._key = key
+        self._started = 0.0
+        self._done = False
+
+    def poll(self) -> bool:
+        if self._done:
+            return True
+        if _AUTH_PROBE_JOBS.get(self._key) is not self:
+            # The caches were reset meanwhile: nobody is waiting for this one.
+            self.cancel()
+            return True
+        payload: object = None
+        failure: str | None
+        try:
+            if self._process is None:
+                # A held positive is served through its refresh, until it expires.
+                # Anything else has been shown by the read that queued this child:
+                # from here on the key reads ``probing`` until the child lands.
+                held = _AUTH_PROBE_RESULTS.get(self._key)
+                if held is not None and held[1].get("launchable") is not True:
+                    del _AUTH_PROBE_RESULTS[self._key]
+                failure = self._start()
+                if failure is None:
+                    return False
+            else:
+                returncode = self._process.poll()
+                if returncode is not None:
+                    payload, failure = self._collect(returncode)
+                elif time.monotonic() < self._deadline:
+                    return False
+                else:
+                    failure = "timeout"
+                    self._stop_child()
+        except Exception as exc:  # noqa: BLE001 - a row never stays probing for good
+            failure = type(exc).__name__
+            try:
+                self._stop_child()
+            finally:
+                self._finish(None, failure)
+            return True
+        self._finish(payload, failure)
+        return True
+
+    def cancel(self) -> None:
+        self._done = True
+        if _AUTH_PROBE_JOBS.get(self._key) is self:
+            del _AUTH_PROBE_JOBS[self._key]
+        super().cancel()
+
+    def _start(self) -> str | None:
+        from . import platform_io
+
+        self._started = time.monotonic()
+        arguments, bound = self._probe.child_arguments()
+        # ``-m`` imports from the child's working directory first, so it starts
+        # beside this package, never in a repository that could shadow a module;
+        # it then returns to this directory before it runs the CLI.
+        return self._spawn(
+            [sys.executable, "-m", self._probe.module, os.getcwd(), *arguments],
+            bound + _AUTH_PROBE_CHILD_GRACE_SECONDS,
+            prefix="auth-probe-",
+            suffixes=(".out",),
+            cwd=Path(__file__).resolve().parent.parent,
+            **platform_io.background_process_launch_kwargs(),
+        )
+
+    def _collect(self, returncode: int) -> tuple[object, str | None]:
+        if returncode != 0:
+            # A failed root may leave its group behind: stop it while still owned.
+            self._stop_child()
+            return None, f"exit_{returncode}"
+        outputs = self._take_outputs()
+        try:
+            raw = _read_probe_output(outputs[0], _AUTH_PROBE_MAX_RESULT_BYTES)
+            if len(raw) > _AUTH_PROBE_MAX_RESULT_BYTES:
+                return None, "oversized"
+            return json.loads(raw.decode("utf-8")), None
+        except (OSError, IndexError):
+            return None, "oserror"
+        except ValueError:
+            return None, "malformed"
+        finally:
+            _remove_probe_outputs(outputs)
+
+    def _finish(self, payload: object, failure: str | None) -> None:
+        self._done = True
+        try:
+            status, show_until = self._probe.publish(payload, failure, self._started)
+        except Exception as exc:  # noqa: BLE001 - publish a failure, never a silent probe
+            status = {
+                "ok": False,
+                "authenticated": False,
+                "launchable": False,
+                "status": "access_unavailable",
+                "blocker_reason": f"provider_auth_probe_failed:{type(exc).__name__}",
+            }
+            show_until = float("inf")
+        if _AUTH_PROBE_JOBS.get(self._key) is self:
+            del _AUTH_PROBE_JOBS[self._key]
+        show_until = min(show_until, time.monotonic() + _AUTH_PROBE_SHOW_MAX_SECONDS)
+        _AUTH_PROBE_RESULTS[self._key] = (show_until, dict(status))
+        while len(_AUTH_PROBE_RESULTS) > _PROVIDER_PROBE_CACHE_MAX_ENTRIES:
+            _AUTH_PROBE_RESULTS.pop(next(iter(_AUTH_PROBE_RESULTS)))
 
 
 def _provider_status(
@@ -1671,9 +1960,9 @@ def _provider_status(
                 adapter_id=adapter_id,
             )
         elif adapter_id == "claude_cli":
-            readiness = claude_auth.auth_status(resolution.executable)
+            readiness = claude_auth_status(resolution.executable)
         elif adapter_id == "codex_cli":
-            readiness = codex_auth.capability_status(resolution.executable)
+            readiness = codex_capability_status(resolution.executable)
         elif adapter_id == runtime_adapters.GROK_KILO_ADAPTER:
             readiness = kilo_auth.auth_status(
                 home=Path.home(),
@@ -1713,6 +2002,11 @@ def _provider_status(
             )
         elif result["launchable"] and readiness.get("consent_required"):
             result["status"] = "consent_required"
+        elif auth_probe_pending(readiness):
+            # Unmeasured, so neither available nor unavailable. A sandbox or
+            # policy verdict below still replaces this status.
+            result["status"] = AUTH_PROBE_STATE_PROBING
+            result["auth_probe"] = dict(readiness["auth_probe"])
         else:
             result["status"] = "access_unavailable"
         result["reason"] = str(
@@ -2686,6 +2980,7 @@ def describe_provider_observability(
     if installed:
         observable_signals.append("binary_installed")
     access_observed = False
+    auth_pending = False
     reachable = installed
     reachability_evidence = install_evidence
 
@@ -2767,10 +3062,11 @@ def describe_provider_observability(
     elif family == _ROUTE_FAMILY_CLAUDE and installed:
         status = None
         try:
-            status = claude_auth.auth_status(resolution.executable)
+            status = claude_auth_status(resolution.executable)
         except Exception:  # bounded probe
             status = None
-        if isinstance(status, Mapping):
+        auth_pending = auth_probe_pending(status)
+        if isinstance(status, Mapping) and not auth_pending:
             access_observed = bool(
                 status.get("authenticated")
                 or status.get("access_observed")
@@ -2803,6 +3099,8 @@ def describe_provider_observability(
         "reachable": bool(reachable),
         "reachability_evidence": str(reachability_evidence)[:200],
         "access_observed": bool(access_observed),
+        # Only while pending: no access fact was observed, so never memoized.
+        **({"auth_probe": {"state": AUTH_PROBE_STATE_PROBING}} if auth_pending else {}),
         "quota_observable": False,
         "quota_observability_reason": _QUOTA_UNOBSERVABLE_REASON_BY_FAMILY[family],
         "observable_signals": observable_signals,

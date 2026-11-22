@@ -2389,7 +2389,11 @@ class DashboardProvider:
 
     def get_adapter_readiness(self) -> dict[str, Any]:
         """Read-only worker-adapter readiness (never exposes any secret)."""
-        return deepseek_credentials.adapter_readiness(repo=self.repo_root)
+        # The preflight's scope: in the fenced reader an unfinished Claude auth
+        # probe reads ``probing`` here too (NF-2026-02338).
+        scope = getattr(repo_policy, "nonblocking_provider_probes", None)
+        with scope() if callable(scope) else nullcontext():
+            return deepseek_credentials.adapter_readiness(repo=self.repo_root)
 
     def get_environment_preflight(self) -> dict[str, Any]:
         """Unified repository, policy, Source Graph and provider readiness."""

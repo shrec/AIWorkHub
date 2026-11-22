@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -284,7 +285,9 @@ def status_probe_timeouts(path: str) -> tuple[float, float]:
     return first, min(STATUS_TIMEOUT_CEILING_SECONDS, 2.0 * first)
 
 
-def _probe_auth_status(path: str) -> dict[str, Any]:
+def _probe_auth_status(
+    path: str, timeouts: tuple[float, float] | None = None
+) -> dict[str, Any]:
     """Run Claude's bounded local status probe without changing failure circuits.
 
     The CLI's status call is I/O and scheduler bound: on a loaded host it was
@@ -297,7 +300,8 @@ def _probe_auth_status(path: str) -> dict[str, Any]:
 
     attempts: list[dict[str, Any]] = []
     completed = None
-    for index, timeout in enumerate(status_probe_timeouts(path)):
+    bounds = status_probe_timeouts(path) if timeouts is None else timeouts
+    for index, timeout in enumerate(bounds):
         if index:
             time.sleep(STATUS_RETRY_BACKOFF_SECONDS)
         started = time.monotonic()
@@ -355,10 +359,14 @@ def _probe_auth_status(path: str) -> dict[str, Any]:
     }
 
 
-def auth_status(executable: str | None = None, *, force: bool = False) -> dict[str, Any]:
+def _status_without_probe(
+    executable: str | None, *, force: bool = False
+) -> tuple[str, float, dict[str, Any] | None]:
+    """Return (path, checked at, the status when it needs no CLI process)."""
+
     resolved = executable or shutil.which("claude") or ""
     if not resolved:
-        return {
+        return "", 0.0, {
             "ok": False,
             "authenticated": False,
             "launchable": False,
@@ -368,7 +376,7 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
     try:
         path = str(Path(resolved).resolve(strict=True))
     except (OSError, RuntimeError, ValueError):
-        return {
+        return "", 0.0, {
             "ok": False,
             "authenticated": False,
             "launchable": False,
@@ -376,7 +384,7 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
             "blocker_reason": "claude_executable_invalid",
         }
     if _is_editor_launcher(str(resolved)) or _is_editor_launcher(path):
-        return {
+        return path, 0.0, {
             "ok": False,
             "authenticated": False,
             "launchable": False,
@@ -389,7 +397,7 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
         if runtime_failure is not None:
             observed_at, http_status, _session_hash = runtime_failure
             if now - observed_at < RUNTIME_AUTH_FAILURE_TTL_SECONDS:
-                return {
+                return path, now, {
                     "ok": False,
                     "authenticated": False,
                     "launchable": False,
@@ -403,7 +411,7 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
         persisted_failure = None if force else _persisted_runtime_failure(path)
         if persisted_failure is not None:
             http_status, _age, _session_hash = persisted_failure
-            return {
+            return path, now, {
                 "ok": False,
                 "authenticated": False,
                 "launchable": False,
@@ -422,14 +430,20 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
             and cached is not None
             and 0 <= now - cached[0] < CACHE_REFRESH_SECONDS
         ):
-            return {**cached[1], "cache_hit": True}
-    result = _probe_auth_status(path)
-    finished = time.monotonic()
+            return path, now, {**cached[1], "cache_hit": True}
+    return path, now, None
+
+
+def _publish_status(
+    path: str, result: dict[str, Any], started: float, finished: float
+) -> dict[str, Any]:
+    """Apply the cache, circuit and transient-grace rules to a finished probe."""
+
     with _lock:
         if result.get("launchable") is True:
             _runtime_failures.pop(path, None)
             _clear_persisted_runtime_failure(path)
-            _cache[path] = (now, dict(result))
+            _cache[path] = (started, dict(result))
             return result
         cached = _cache.get(path)
         if result.get("transient") is True and cached is not None:
@@ -449,6 +463,76 @@ def auth_status(executable: str | None = None, *, force: bool = False) -> dict[s
         # A negative or expired result is never cached and evicts any positive.
         _cache.pop(path, None)
     return result
+
+
+def auth_status(executable: str | None = None, *, force: bool = False) -> dict[str, Any]:
+    path, now, known = _status_without_probe(executable, force=force)
+    if known is not None:
+        return known
+    result = _probe_auth_status(path)
+    return _publish_status(path, result, now, time.monotonic())
+
+
+class PolledProbe:
+    """``auth_status`` split around a child process (dashboard reader only).
+
+    The reader resolves the no-process checks and the cache itself; the child
+    (this module run with ``-m``) only runs :func:`_probe_auth_status`.
+    """
+
+    module = "aiworkhub.claude_auth"
+
+    def __init__(self, executable: str | None) -> None:
+        self.key, _checked_at, self.known = _status_without_probe(executable)
+        self._timeouts: tuple[float, float] = (0.0, 0.0)
+
+    def child_arguments(self) -> tuple[list[str], float]:
+        """The child's arguments, and the longest its own bounds let it run."""
+
+        self._timeouts = status_probe_timeouts(self.key)
+        return (
+            [self.key, *(repr(bound) for bound in self._timeouts)],
+            sum(self._timeouts) + STATUS_RETRY_BACKOFF_SECONDS,
+        )
+
+    def publish(
+        self, payload: object, failure: str | None, started: float
+    ) -> tuple[dict[str, Any], float]:
+        """Publish a finished child; return (status, how long it may be shown)."""
+
+        finished = time.monotonic()
+        reported = payload.get("result") if isinstance(payload, dict) else None
+        if failure == "timeout":
+            attempt = {
+                "timeout_seconds": sum(self._timeouts),
+                "elapsed_seconds": round(finished - started, 3),
+                "outcome": "TimeoutExpired",
+            }
+            result = _status_probe_transient(self.key, [attempt])
+        elif (
+            failure is None
+            and isinstance(reported, dict)
+            and isinstance(reported.get("launchable"), bool)
+        ):
+            result = reported
+            elapsed = payload.get("elapsed_seconds") if isinstance(payload, dict) else None
+            if isinstance(elapsed, (int, float)) and 0 <= elapsed < float("inf"):
+                _record_probe_latency(self.key, elapsed)
+        else:
+            result = _status_probe_unavailable(
+                self.key, f"probe_child_{failure or 'malformed'}", []
+            )
+        # A non-positive answer known now is newer than whatever the child reports,
+        # and publishing a positive would clear a 401 circuit from memory and disk,
+        # also while the executable is briefly unresolvable during an update.
+        _path, _checked_at, known = _status_without_probe(self.key)
+        if known is not None and known.get("launchable") is not True:
+            return known, float("inf")
+        status = _publish_status(self.key, result, started, finished)
+        if status.get("launchable") is True:
+            # A positive, or the grace of one, vouches only within its own TTL.
+            return status, _cache[self.key][0] + CACHE_TTL_SECONDS
+        return status, float("inf")
 
 
 def refresh_subscription_session_for_retry(
@@ -562,3 +646,29 @@ __all__ = [
     "record_runtime_auth_failure",
     "status_probe_timeouts",
 ]
+
+
+def _probe_child_main(argv: list[str]) -> int:
+    """The dashboard reader's probe child: ``<cwd> <path> <first> <retry>``.
+
+    Writes only the sanitized probe result and how long a completed probe
+    took; the parent owns every cache, circuit and latency sample.
+    """
+
+    try:
+        cwd, path, first, retry = argv
+        timeouts = (float(first), float(retry))
+        os.chdir(cwd)
+    except (OSError, ValueError):
+        return 2
+    if not all(0 < bound <= STATUS_TIMEOUT_CEILING_SECONDS for bound in timeouts):
+        return 2
+    result = _probe_auth_status(path, timeouts)
+    samples = _probe_latencies.get(path)
+    elapsed = samples[-1] if samples else None
+    sys.stdout.write(json.dumps({"result": result, "elapsed_seconds": elapsed}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_probe_child_main(sys.argv[1:]))

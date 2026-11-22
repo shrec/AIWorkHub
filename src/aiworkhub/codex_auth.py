@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -39,10 +41,20 @@ _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$")
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[float, float, dict[str, Any]]] = {}
+_in_probe_child = False
 
 
 class _ProbeError(RuntimeError):
     pass
+
+
+def _launch_kwargs() -> Any:
+    kwargs = background_process_launch_kwargs()
+    if _in_probe_child:
+        # The reader cancels the probe child by process group: the CLI must
+        # not leave that group for a session of its own.
+        kwargs.pop("start_new_session", None)
+    return kwargs
 
 
 def _resolved_executable(executable: str | None) -> str:
@@ -104,7 +116,7 @@ def _login_ready(path: str) -> bool:
             check=False,
             shell=False,
             timeout=LOGIN_TIMEOUT_SECONDS,
-            **background_process_launch_kwargs(),
+            **_launch_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -235,7 +247,7 @@ def _probe_app_server(path: str) -> tuple[bool, list[str]]:
             stderr=subprocess.DEVNULL,
             shell=False,
             close_fds=True,
-            **background_process_launch_kwargs(),
+            **_launch_kwargs(),
         )
     except OSError as exc:
         raise _ProbeError("codex_app_server_start_failed") from exc
@@ -347,53 +359,117 @@ def capability_status(
 ) -> dict[str, Any]:
     """Return current Codex access and exact visible models without secrets."""
 
-    try:
-        path = _resolved_executable(executable)
-        cache_key = _executable_identity(path)
-    except (OSError, _ProbeError) as exc:
-        reason = str(exc) if isinstance(exc, _ProbeError) else "codex_cli_path_invalid"
-        return _failure(reason)
+    path, cache_key, invalid = _probe_identity(executable)
+    if invalid is not None:
+        return invalid
 
     # Hold the lock while probing. Preflight is infrequent and bounded, and
     # this provides one simple single-flight for every executable identity.
     with _lock:
         now = time.monotonic()
-        cached = _cache.get(cache_key)
-        if not force and cached is not None and now - cached[0] < cached[1]:
-            return {**cached[2], "cache_hit": True}
+        cached = None if force else _cached_status(cache_key, now)
+        if cached is not None:
+            return cached
+        return _store_status(cache_key, _probe_capability(path, cache_key), now)
 
-        if not _login_ready(path):
-            result = _failure("codex_authentication_required", cache_key=cache_key)
+
+def _probe_identity(executable: str | None) -> tuple[str, str, dict[str, Any] | None]:
+    """Return (path, cache key, the failure when there is nothing to probe)."""
+
+    try:
+        path = _resolved_executable(executable)
+        return path, _executable_identity(path), None
+    except (OSError, _ProbeError) as exc:
+        reason = str(exc) if isinstance(exc, _ProbeError) else "codex_cli_path_invalid"
+        return "", "", _failure(reason)
+
+
+def _cached_status(cache_key: str, now: float) -> dict[str, Any] | None:
+    cached = _cache.get(cache_key)
+    if cached is not None and now - cached[0] < cached[1]:
+        return {**cached[2], "cache_hit": True}
+    return None
+
+
+def _probe_capability(path: str, cache_key: str) -> dict[str, Any]:
+    if not _login_ready(path):
+        return _failure("codex_authentication_required", cache_key=cache_key)
+    try:
+        authenticated, models = _probe_app_server(path)
+    except (OSError, UnicodeError, _ProbeError) as exc:
+        reason = str(exc) if isinstance(exc, _ProbeError) else "codex_capability_probe_failed"
+        return _failure(reason, cache_key=cache_key)
+    launchable = bool(authenticated and models)
+    return {
+        "ok": launchable,
+        "authenticated": authenticated,
+        "access_observed": authenticated,
+        "launchable": launchable,
+        "status": "ready" if launchable else "access_unavailable",
+        "blocker_reason": "" if launchable else "codex_model_catalog_empty",
+        "observed_models": models,
+        "model_catalog_complete": bool(authenticated),
+        "quota_observed": False,
+        "quota_state": "unavailable_from_provider_api",
+        "cache_hit": False,
+        "cache_key_sha256": cache_key,
+    }
+
+
+def _store_status(cache_key: str, result: dict[str, Any], started: float) -> dict[str, Any]:
+    ttl = (
+        POSITIVE_CACHE_TTL_SECONDS
+        if result.get("launchable") is True
+        else NEGATIVE_CACHE_TTL_SECONDS
+    )
+    result["cache_ttl_seconds"] = ttl
+    _cache[cache_key] = (started, ttl, dict(result))
+    return result
+
+
+class PolledProbe:
+    """``capability_status`` split around a child process (dashboard reader only).
+
+    The reader resolves the executable and the cache itself; the child (this
+    module run with ``-m``) runs the probe, so the app-server reader thread
+    exists only there.
+    """
+
+    module = "aiworkhub.codex_auth"
+
+    def __init__(self, executable: str | None) -> None:
+        self._path, self.key, self.known = _probe_identity(executable)
+        if self.known is None:
+            with _lock:
+                self.known = _cached_status(self.key, time.monotonic())
+
+    def child_arguments(self) -> tuple[list[str], float]:
+        """The child's arguments, and the longest its own bounds let it run."""
+
+        bounds = (LOGIN_TIMEOUT_SECONDS, APP_SERVER_TIMEOUT_SECONDS)
+        return [self._path, self.key, *(repr(bound) for bound in bounds)], sum(bounds)
+
+    def publish(
+        self, payload: object, failure: str | None, started: float
+    ) -> tuple[dict[str, Any], float]:
+        """Publish a finished child; return (status, how long it may be shown)."""
+
+        reported = payload.get("result") if isinstance(payload, dict) else None
+        if failure == "timeout":
+            result = _failure("codex_capability_probe_timeout", cache_key=self.key)
+        elif (
+            failure is None
+            and isinstance(reported, dict)
+            and isinstance(reported.get("launchable"), bool)
+        ):
+            result = reported
         else:
-            try:
-                authenticated, models = _probe_app_server(path)
-            except (OSError, UnicodeError, _ProbeError) as exc:
-                reason = str(exc) if isinstance(exc, _ProbeError) else "codex_capability_probe_failed"
-                result = _failure(reason, cache_key=cache_key)
-            else:
-                launchable = bool(authenticated and models)
-                result = {
-                    "ok": launchable,
-                    "authenticated": authenticated,
-                    "access_observed": authenticated,
-                    "launchable": launchable,
-                    "status": "ready" if launchable else "access_unavailable",
-                    "blocker_reason": "" if launchable else "codex_model_catalog_empty",
-                    "observed_models": models,
-                    "model_catalog_complete": bool(authenticated),
-                    "quota_observed": False,
-                    "quota_state": "unavailable_from_provider_api",
-                    "cache_hit": False,
-                    "cache_key_sha256": cache_key,
-                }
-        ttl = (
-            POSITIVE_CACHE_TTL_SECONDS
-            if result.get("launchable") is True
-            else NEGATIVE_CACHE_TTL_SECONDS
-        )
-        result["cache_ttl_seconds"] = ttl
-        _cache[cache_key] = (now, ttl, dict(result))
-        return result
+            result = _failure("codex_capability_probe_failed", cache_key=self.key)
+        with _lock:
+            status = _store_status(self.key, result, started)
+        if status.get("launchable") is True:
+            return status, started + POSITIVE_CACHE_TTL_SECONDS
+        return status, float("inf")
 
 
 def invalidate() -> None:
@@ -402,3 +478,29 @@ def invalidate() -> None:
 
 
 __all__ = ["capability_status", "invalidate"]
+
+
+def _probe_child_main(argv: list[str]) -> int:
+    """The dashboard reader's probe child: ``<cwd> <path> <key> <login> <server>``.
+
+    Writes only the sanitized result; the parent owns the cache.
+    """
+
+    global LOGIN_TIMEOUT_SECONDS, APP_SERVER_TIMEOUT_SECONDS, _in_probe_child
+    try:
+        cwd, path, cache_key, login, server = argv
+        bounds = (float(login), float(server))
+        os.chdir(cwd)
+    except (OSError, ValueError):
+        return 2
+    if not all(0 < bound < float("inf") for bound in bounds):
+        return 2
+    LOGIN_TIMEOUT_SECONDS, APP_SERVER_TIMEOUT_SECONDS = bounds
+    _in_probe_child = True
+    result = _probe_capability(path, cache_key)
+    sys.stdout.write(json.dumps({"result": result}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_probe_child_main(sys.argv[1:]))
