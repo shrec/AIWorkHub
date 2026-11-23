@@ -1037,6 +1037,76 @@ def assess_reviewer_launch_target(
     }
 
 
+# NF-2026-02357: the refusal a reviewer gets when its target request is no
+# longer the target card's CURRENT review request (a later rework round reached
+# review_ready after the reviewer's round was rejected).
+REVIEWER_TARGET_SUPERSEDED = "quality_review_target_superseded"
+
+
+def target_current_review_request_id(target_card: Mapping[str, Any] | None) -> str:
+    """The request id the target card currently presents for review.
+
+    This is ``terminal_review.evidence.request_identity.request_id`` -- the same
+    field the retention policy treats as the card's current review request.
+    Empty when the card carries no such identity.
+    """
+
+    if not isinstance(target_card, Mapping):
+        return ""
+    terminal_review = target_card.get("terminal_review")
+    evidence = terminal_review.get("evidence") if isinstance(terminal_review, Mapping) else None
+    identity = evidence.get("request_identity") if isinstance(evidence, Mapping) else None
+    if not isinstance(identity, Mapping):
+        return ""
+    return str(identity.get("request_id") or "").strip()
+
+
+def reviewer_card_binding(reviewer_card: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """The ONE ``quality_review`` binding of a reviewer CARD, ``{}`` when unbound.
+
+    Reads the terminal-evidence binding first and the root ``quality_review``
+    binding second, matching ``task_engine.disposition_reviewer_children``.
+    """
+
+    if not isinstance(reviewer_card, Mapping):
+        return {}
+    terminal_review = reviewer_card.get("terminal_review")
+    evidence = terminal_review.get("evidence") if isinstance(terminal_review, Mapping) else None
+    binding = evidence.get("quality_review") if isinstance(evidence, Mapping) else None
+    if not isinstance(binding, Mapping) or not binding:
+        binding = reviewer_card.get("quality_review")
+    return binding if isinstance(binding, Mapping) else {}
+
+
+def reviewer_card_target_request_id(reviewer_card: Mapping[str, Any] | None) -> str:
+    """The target request a reviewer CARD is bound to, or empty when unbound.
+
+    The binding is read with the single owner :func:`reviewer_card_binding`.
+    """
+
+    binding = reviewer_card_binding(reviewer_card)
+    return str(binding.get("target_request_id") or "").strip()
+
+
+def assess_reviewer_target_identity(
+    *, target_card: Mapping[str, Any] | None, target_request_id: str
+) -> str | None:
+    """Name a reviewer whose target request is not the card's current one.
+
+    Returns ``quality_review_target_superseded:<target_request_id>`` only on a
+    PROVEN mismatch: the target card names a current review request and it is
+    a different request.  A card with no readable current identity proves
+    nothing here; the exact-ledger-request gate and the packet build still
+    refuse an unknown target, so this never turns unknown into success.
+    """
+
+    requested = str(target_request_id or "").strip()
+    current = target_current_review_request_id(target_card)
+    if not requested or not current or current == requested:
+        return None
+    return f"{REVIEWER_TARGET_SUPERSEDED}:{requested}"
+
+
 # ---------------------------------------------------------------------------
 # Candidate reachability gate (NF-2026-00304).
 #

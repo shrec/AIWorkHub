@@ -646,6 +646,10 @@ def launch_isolated(
                         + ",".join(sorted(str(key) for key in review_scopes))[:200]
                     )
                 write_json_0600(review_packet_path, review_packet)
+                # NF-2026-02357: a reject can land between launch entry and
+                # here; prewarming a rejected round reads a worktree that no
+                # longer exists, so a stale target is refused first.
+                recheck_reviewer_target(self, quality_review_binding)
                 launch_phase = "quality_review_source_graph_prewarm"
                 try:
                     worker_ai_tools_mcp.verify_quality_review_prewarm_authority(
@@ -1767,7 +1771,18 @@ def launch_isolated(
             else:
                 detail = failed_claim.get("stderr") or failed_claim.get("stdout") or ""
                 reason += ":launch_failure_claim_failed:" + str(detail)[:200]
-        if claimed:
+        # NF-2026-02357: a superseded-target reviewer is finalized SUPERSEDED,
+        # never released into blocked; on failure the release path still runs.
+        superseded_reviewer = (
+            reserved_request_id is not None
+            and isinstance(exc, LaunchRejected)
+            and finalize_superseded_reviewer(
+                self, task_id, reason, quality_review_binding
+            )
+        )
+        if superseded_reviewer:
+            pass
+        elif claimed:
             claim_epoch = card.get("claim_epoch")
             if reserved_request_id is not None and (
                 type(claim_epoch) is int and claim_epoch >= 1
@@ -1833,6 +1848,11 @@ def launch_isolated(
                 "recovery_state": "starting_reservation_retained",
                 "reviewer_claim_epoch": card["claim_epoch"],
             }
+        if superseded_reviewer:
+            return superseded_reviewer_result(
+                self, task_id, runner, topic, adapter_id, reason,
+                request_id=request_id, claimed=claimed, diagnostic=diagnostic,
+            )
         return self._blocked(
             task_id,
             runner,
@@ -1843,6 +1863,330 @@ def launch_isolated(
             state="launch_failed" if claimed else "blocked",
             diagnostic=diagnostic,
         )
+
+
+def superseded_reviewer_result(
+    manager: Any,
+    task_id: str,
+    runner: str,
+    topic: str,
+    adapter_id: str,
+    reason: str,
+    *,
+    request_id: str | None,
+    claimed: bool,
+    diagnostic: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Receipt for a reviewer launch finalized SUPERSEDED (NF-2026-02357).
+
+    Same shape as the ``_blocked`` launch-failure receipt, but ``state`` is
+    ``superseded`` and ``error`` names ``REVIEWER_TARGET_SUPERSEDED`` -- never
+    ``launch_failed``.  The ledger row keeps a terminal launcher state
+    (``superseded`` is a card status, not a launcher state) so the reserved
+    request never dangles.
+    """
+    from . import process_launcher as _pl
+
+    result = manager._blocked(
+        task_id,
+        runner,
+        topic,
+        adapter_id,
+        reason,
+        request_id=request_id,
+        state="launch_failed" if claimed else "blocked",
+        diagnostic=diagnostic,
+        extra={"error": _pl.quality_review.REVIEWER_TARGET_SUPERSEDED},
+    )
+    return {**result, "state": "superseded"}
+
+
+def recheck_reviewer_target(manager: Any, binding: Any) -> None:
+    """Refuse a reviewer whose target is no longer the current review request.
+
+    NF-2026-02357: re-reads the target card immediately before the expensive
+    prewarm and applies ``quality_review.assess_reviewer_target_identity``.  A
+    stale target raises ``LaunchRejected("quality_review_target_superseded:
+    <target_request_id>")``, which :func:`finalize_superseded_reviewer` routes
+    to a superseded card.
+    """
+    from . import process_launcher as _pl
+
+    target_task_id = str(binding.get("target_task_id") or "")
+    try:
+        card: dict[str, Any] | None = _pl._parse_card(
+            manager._show_task(target_task_id), target_task_id
+        )
+    except _pl.LaunchRejected:
+        card = None
+    stale = _pl.quality_review.assess_reviewer_target_identity(
+        target_card=card,
+        target_request_id=str(binding.get("target_request_id") or ""),
+    )
+    if stale is not None:
+        raise _pl.LaunchRejected(stale)
+
+
+def finalize_superseded_reviewer(
+    manager: Any, task_id: str, reason: str, binding: Any
+) -> bool:
+    """True once a superseded-target reviewer card is finalized SUPERSEDED.
+
+    Only a ``quality_review_target_superseded:`` refusal of a reviewer launch
+    qualifies; anything else (or a failed transition) returns False so the
+    caller's ordinary launch-failure release still runs.
+    """
+    from . import process_launcher as _pl
+
+    if binding is None or not str(reason).startswith(
+        _pl.quality_review.REVIEWER_TARGET_SUPERSEDED + ":"
+    ):
+        return False
+    outcome = supersede_stale_reviewer_card(
+        manager,
+        task_id,
+        reason=reason,
+        target_request_id=str(binding.get("target_request_id") or ""),
+        target_task_id=str(binding.get("target_task_id") or ""),
+        ledger_bound=True,
+        allow_processing=True,
+    )
+    return outcome.get("superseded") is True
+
+
+def reviewer_launch_target_request_id(manager: Any, request_id: str, event: Any) -> str:
+    """The quality-review target request a reviewer request is bound to.
+
+    A later ledger row can replace an earlier one's full payload without
+    re-embedding the launch-time ``quality_review`` binding, so the
+    durable ``request.json`` is the fallback authority when the latest
+    event does not carry it.  Bound as
+    ``ProcessManager._reviewer_launch_target_request_id``.
+    """
+    from . import process_launcher as _pl
+
+    binding = event.get("quality_review")
+    if not isinstance(binding, dict):
+        metadata_path = manager.process_dir / f"{request_id}.request.json"
+        try:
+            metadata = _pl.json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            metadata = None
+        binding = metadata.get("quality_review") if isinstance(metadata, dict) else None
+    return str(binding.get("target_request_id") or "").strip() if isinstance(binding, dict) else ""
+
+
+def stale_reviewer_target_refusal(
+    manager: Any,
+    *,
+    target_card: Any,
+    target_request_id: str,
+    target_task_id: str,
+    reviewer_task_id: str,
+) -> dict[str, Any] | None:
+    """Launch-entry refusal of a reviewer bound to a superseded round, or None.
+
+    NF-2026-02357: review_ready says nothing about WHICH round is ready.  A
+    reviewer bound to a rejected round's request must never start (its
+    worktree is gone); its queued card is finalized superseded, not blocked.
+    The caller runs this only after the ledger check proved
+    ``target_request_id`` is a request OF ``target_task_id``, so a made-up id
+    never mutates a card.
+    """
+    from . import process_launcher as _pl
+
+    stale_target = _pl.quality_review.assess_reviewer_target_identity(
+        target_card=target_card, target_request_id=target_request_id
+    )
+    if stale_target is None:
+        return None
+    return {
+        "ok": False,
+        "error": _pl.quality_review.REVIEWER_TARGET_SUPERSEDED,
+        "reason": stale_target,
+        "target_request_id": target_request_id,
+        "current_target_request_id": (
+            _pl.quality_review.target_current_review_request_id(target_card)
+        ),
+        "reviewer_card_superseded": supersede_stale_reviewer_card(
+            manager,
+            reviewer_task_id,
+            reason=stale_target,
+            target_request_id=target_request_id,
+            target_task_id=target_task_id,
+        ),
+        "fails_at_launch": True,
+        "request_created": False,
+    }
+
+
+def supersede_queued_reviewers(
+    manager: Any,
+    *,
+    latest: Any,
+    candidates: Any,
+    target_request_id: str,
+    reason: str,
+) -> list[dict[str, Any]]:
+    """Supersede reviewer cards bound to a rejected request with no live process.
+
+    NF-2026-02357: a reviewer card that is pending / admission-deferred has no
+    live ledger request, so the reject's cancel loop never reaches it and it
+    would later launch against the rejected round.  The parent reject already
+    committed: this pass never raises, so the caller's computed ``cancelled``
+    receipt is always returned.
+    """
+    superseded_cards: list[dict[str, Any]] = []
+    if not target_request_id or getattr(manager, "repo", None) is None:
+        return superseded_cards
+    try:
+        live_task_ids = {str(event.get("task_id") or "") for _r, event, _m in candidates}
+        # Ownership comes ONLY from each reviewer task's newest ledger
+        # request: an older request of a reused reviewer task that
+        # targeted the rejected round never makes it ledger_bound.
+        # Newest = greatest ``timestamp``, ties broken by ledger order.
+        newest: dict[str, tuple[tuple[str, int], str, dict[str, Any]]] = {}
+        for order, (request_id, event) in enumerate(latest.items()):
+            if not isinstance(event, dict):
+                continue
+            task_id = str(event.get("task_id") or "")
+            if not task_id:
+                continue
+            key = (str(event.get("timestamp") or ""), order)
+            held = newest.get(task_id)
+            if held is None or key > held[0]:
+                newest[task_id] = (key, str(request_id), event)
+        ledger_bound = sorted(
+            task_id
+            for task_id, (_key, request_id, event) in newest.items()
+            if str(event.get("topic") or "") == "quality_review"
+            and task_id not in live_task_ids
+            and manager._reviewer_launch_target_request_id(request_id, event)
+            == target_request_id
+        )
+        queued = sorted(
+            set(manager._queued_reviewer_task_ids(target_request_id)) - live_task_ids
+        )
+        for reviewer_id in sorted(set(queued) | set(ledger_bound)):
+            outcome = manager._supersede_stale_reviewer_card(
+                reviewer_id,
+                reason=f"{reason}:{target_request_id}",
+                target_request_id=target_request_id,
+                ledger_bound=reviewer_id in ledger_bound,
+            )
+            if outcome.get("superseded") or not outcome.get("ok"):
+                superseded_cards.append(outcome)
+    except Exception as exc:  # noqa: BLE001 - reject already committed
+        superseded_cards.append({
+            "task_id": "",
+            "target_request_id": target_request_id,
+            "ok": False,
+            "superseded": False,
+            "state": f"supersede_pass_failed:{type(exc).__name__}",
+        })
+    return superseded_cards
+
+
+def queued_reviewer_task_ids(manager: Any, target_request_id: str) -> list[str]:
+    """Pending/blocked reviewer cards whose card binding targets one request.
+
+    Read-only and bounded to ``topic='quality_review'`` rows that are not
+    archived and whose ``card_json`` contains the request id (an SQL prefilter,
+    so non-matching cards are never decoded); the cursor is streamed, and the
+    binding is still read with the single owner
+    ``quality_review.reviewer_card_target_request_id``, so results are exact.
+    """
+    from . import process_launcher as _pl
+
+    wanted = str(target_request_id or "").strip()
+    if not wanted:
+        return []
+    _readiness, db_path = _pl.task_store._require_ready(manager.repo)
+    conn = _pl.task_store._connect(db_path, readonly=True)
+    found: list[str] = []
+    try:
+        for row in conn.execute(
+            "SELECT task_id, card_json FROM tasks WHERE topic='quality_review' "
+            "AND status IN ('pending','blocked') AND COALESCE(archived_at,'')='' "
+            "AND instr(card_json, ?) > 0",
+            (wanted,),
+        ):
+            try:
+                card = _pl.json.loads(str(row["card_json"] or "{}"))
+            except ValueError:
+                continue
+            if _pl.quality_review.reviewer_card_target_request_id(card) == wanted:
+                found.append(str(row["task_id"]))
+    finally:
+        conn.close()
+    return sorted(found)
+
+
+def supersede_stale_reviewer_card(
+    manager: Any,
+    reviewer_task_id: str,
+    *,
+    reason: str,
+    target_request_id: str,
+    target_task_id: str = "",
+    ledger_bound: bool = False,
+    allow_processing: bool = False,
+) -> dict[str, Any]:
+    """Finalize one reviewer card bound to a stale target as SUPERSEDED.
+
+    The card must provably belong to ``target_request_id``: its own card
+    binding names it, or (no card binding) the caller proved it from the
+    ledger (``ledger_bound``) or the card reviews ``target_task_id``.  The
+    binding's ``target_task_id`` is read from the SAME mapping
+    (``quality_review.reviewer_card_binding``) that named the request.  A
+    terminal card is left alone; a ``processing`` card is left to its live
+    owner unless that owner is the caller (``allow_processing``).  The
+    transition is ``task_store.archive_task(operation="superseded")`` --
+    the same atomic helper ``core.supersede_task`` uses -- never blocked.
+    """
+    from . import process_launcher as _pl
+
+    base = {"task_id": reviewer_task_id, "target_request_id": target_request_id}
+    try:
+        card = _pl._parse_card(manager._show_task(reviewer_task_id), reviewer_task_id)
+    except _pl.LaunchRejected:
+        return {**base, "ok": True, "superseded": False, "state": "no_reviewer_card"}
+    if str(card.get("topic") or "") != "quality_review":
+        return {**base, "ok": False, "superseded": False, "state": "not_a_reviewer_card"}
+    binding = _pl.quality_review.reviewer_card_binding(card)
+    bound = str(binding.get("target_request_id") or "").strip()
+    if bound:
+        owned = bound == target_request_id
+        bound_task = str(binding.get("target_task_id") or "").strip()
+        if owned and target_task_id and bound_task and bound_task != target_task_id:
+            return {**base, "ok": True, "superseded": False, "state": "bound_to_other_target"}
+    else:
+        owned = ledger_bound or (
+            bool(target_task_id)
+            and str(card.get("review_target_task_id") or "") == target_task_id
+        )
+    if not owned:
+        return {**base, "ok": True, "superseded": False, "state": "bound_to_other_request"}
+    status = _pl._canonical_task_status(card)
+    if status in _pl.GC_DISPOSED_CANONICAL_STATUSES:
+        return {**base, "ok": True, "superseded": False, "state": f"already_terminal:{status}"}
+    if status == "processing" and not allow_processing:
+        return {**base, "ok": True, "superseded": False, "state": "live_owner"}
+    try:
+        ok, state = _pl.task_store.archive_task(
+            manager.repo,
+            reviewer_task_id,
+            actor="aiworkhub_process_launcher",
+            reason=reason[:200],
+            allow_processing=allow_processing,
+            operation="superseded",
+        )
+    except (_pl.task_store.TaskStoreError, _pl.sqlite3.Error, OSError) as exc:
+        return {
+            **base, "ok": False, "superseded": False,
+            "state": f"archive_failed:{type(exc).__name__}",
+        }
+    return {**base, "ok": bool(ok), "superseded": bool(ok), "state": str(state)}
 
 
 def bind_review_contract(

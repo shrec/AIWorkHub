@@ -7724,6 +7724,32 @@ def _quality_review_card(task_id: str = "TASK_REVIEW_1") -> dict:
     }
 
 
+def _reviewer_launch_show(card_fn):
+    """``_show`` that also serves the binding's target card (NF-2026-02357).
+
+    The launcher re-reads ``TARGET_TASK_1`` right before prewarm and refuses
+    a target whose current review request is not ``target-request-1``.
+    """
+
+    reviewer_show = _show(card_fn)
+    target = {
+        "task_id": "TARGET_TASK_1",
+        "status": "review",
+        "worker_status": "review",
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {"request_identity": {"request_id": "target-request-1"}},
+        },
+    }
+
+    def show(task_id: str):
+        if task_id == target["task_id"]:
+            return {"returncode": 0, "stdout": json.dumps(target), "stderr": ""}
+        return reviewer_show(task_id)
+
+    return show
+
+
 def _reviewer_launch_setup(tmp_path: Path, monkeypatch):
     """Shared scaffolding for the real-``_launch_isolated`` reviewer ordering
     tests below.  Mocks only what a synthetic reviewer launch cannot
@@ -7739,7 +7765,7 @@ def _reviewer_launch_setup(tmp_path: Path, monkeypatch):
     _open_gates(monkeypatch)
     manager = _manager(
         tmp_path,
-        show_task=_show(lambda: _quality_review_card()),
+        show_task=_reviewer_launch_show(lambda: _quality_review_card()),
         argv=[sys.executable, "-c", "pass"],
     )
     def fake_claim_start_exact(_repo, task_id, runner, topic, *, request_id):
@@ -14045,7 +14071,7 @@ def _reach_reviewer_prompt_seam(tmp_path, monkeypatch, card_extra: dict) -> dict
     monkeypatch.setattr(
         manager,
         "_show_task",
-        _show(lambda: {**_quality_review_card(), **card_extra}),
+        _reviewer_launch_show(lambda: {**_quality_review_card(), **card_extra}),
     )
     monkeypatch.setattr(
         worker_ai_tools_mcp,

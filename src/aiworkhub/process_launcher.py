@@ -85,6 +85,7 @@ from .process_launcher_accept_review import _accept_manager_identity as _calling
 from .process_launcher_accept_review import accept_preview as _accept_preview_impl
 from .process_launcher_accept_review import accept_review as _accept_review_impl
 from .process_launcher_husk_gc import gc_husk_without_metadata
+from . import process_launcher_launch_isolated as _launch_isolated_mod
 from .process_launcher_launch_isolated import bind_review_contract as _bind_review_contract
 from .process_launcher_launch_isolated import launch_isolated as _launch_isolated_impl
 from .process_launcher_launch_isolated import relaunch_input_paths as _relaunch_input_paths
@@ -8425,6 +8426,12 @@ class ProcessManager:
         )
         if target_refusal is not None:
             return {**target_refusal, "request_created": False}
+        stale_refusal = _launch_isolated_mod.stale_reviewer_target_refusal(  # NF-2026-02357
+            self, target_card=_target_card, target_request_id=target_request_id,
+            target_task_id=target_task_id, reviewer_task_id=reviewer_task_id,
+        )
+        if stale_refusal is not None:
+            return stale_refusal
         # The target claim epoch is sealed into the reservation so reuse of a
         # live reviewer is keyed to this exact claim, not merely its request.
         # The caller's epoch is the one that commissioned this review; the
@@ -13424,25 +13431,7 @@ class ProcessManager:
         """
         return _accept_preview_impl(self, request_id, task_id, **overrides)
 
-    def _reviewer_launch_target_request_id(
-        self, request_id: str, event: Mapping[str, Any]
-    ) -> str:
-        """The quality-review target request a reviewer request is bound to.
-
-        A later ledger row can replace an earlier one's full payload without
-        re-embedding the launch-time ``quality_review`` binding, so the
-        durable ``request.json`` is the fallback authority when the latest
-        event does not carry it.
-        """
-        binding = event.get("quality_review")
-        if not isinstance(binding, dict):
-            metadata_path = self.process_dir / f"{request_id}.request.json"
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                metadata = None
-            binding = metadata.get("quality_review") if isinstance(metadata, dict) else None
-        return str(binding.get("target_request_id") or "").strip() if isinstance(binding, dict) else ""
+    _reviewer_launch_target_request_id = _launch_isolated_mod.reviewer_launch_target_request_id
 
     def cancel_disposed_reviewer_processes(
         self,
@@ -13533,14 +13522,24 @@ class ProcessManager:
                     else "cancel_result_invalid"
                 ),
             })
+        superseded_cards = _launch_isolated_mod.supersede_queued_reviewers(  # NF-2026-02357
+            self, latest=latest, candidates=candidates,
+            target_request_id=target_request_id, reason=reason,
+        )
         return {
             "schema_id": "aiworkhub.reviewer_process_cancellation.v1",
-            "ok": all(row["ok"] for row in cancelled),
+            "ok": all(row["ok"] for row in cancelled)
+            and all(row["ok"] for row in superseded_cards),
             "state": "completed",
             "reviewer_task_ids": reviewer_task_ids,
             "cancelled": cancelled,
+            **({"superseded_cards": superseded_cards} if superseded_cards else {}),
             **({"cleanup_deferred": deferred} if deferred else {}),
         }
+
+    # NF-2026-02357 reviewer-card supersede helpers live in launch_isolated.
+    _queued_reviewer_task_ids = _launch_isolated_mod.queued_reviewer_task_ids
+    _supersede_stale_reviewer_card = _launch_isolated_mod.supersede_stale_reviewer_card
 
     @staticmethod
     def _rejected_request_id_from_result(result: Mapping[str, Any]) -> str:
