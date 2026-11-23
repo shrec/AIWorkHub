@@ -303,7 +303,7 @@ def _stuck_manager(
     monkeypatch.setattr(
         process_launcher_accept_review,
         "bound_reviewer_rows",
-        lambda *_args: [{
+        lambda *_args, **_kwargs: [{
             "task_id": TASK_ID,
             "lens": LENS,
             "packet_sha256": "",

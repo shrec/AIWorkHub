@@ -1263,6 +1263,9 @@ def _supplemental_env(tmp_path: Path, monkeypatch, reviewer_specs: list[dict]):
         }
         receipts[request_id] = {
             "packet_sha256": packet["packet_sha256"],
+            # NF-2026-02389: the sealed receipt names the same target its
+            # metadata binding does, as _reviewer_target_split requires.
+            "target": {"request_id": "R-1", "task_id": "T-1"},
             "report": {
                 "lens": spec["lens"],
                 "provider": "claude_cli",

@@ -3155,11 +3155,16 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "MANAGER_EVIDENCE_ID_PREFIX",
     "VALIDATION_ROW_NOT_FAILED_ERROR",
     "validation_failed_source_evidence",
+    "_admitted_reviewer_target",
+    "_reviewer_target_split",
+    "carried_reviewer_evidence",
+    "retained_sealed_binding",
 )
 
 ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
     "GitCommandTimeout",
     "LaunchRejected",
+    "Mapping",
     "Path",
     "WorkerWorkspace",
     "WorkspaceError",
@@ -3264,6 +3269,7 @@ def accept_review(
 
     GitCommandTimeout = _pl.GitCommandTimeout
     LaunchRejected = _pl.LaunchRejected
+    Mapping = _pl.Mapping
     Path = _pl.Path
     WorkerWorkspace = _pl.WorkerWorkspace
     WorkspaceError = _pl.WorkspaceError
