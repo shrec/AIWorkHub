@@ -30,7 +30,14 @@ def materialize_rework_overlay(
 
     Each file entry is (repo_relative_path, sha256_or_None, content_bytes_or_None).
     sha256=None means delete; content=None with sha256 indicates a hash-only reference.
-    Returns JSON bytes with a deterministic canonical_digest over the sorted files payload.
+    Inline bytes are budgeted against ``max_content_bytes`` in path order: a file
+    whose bytes would push the running total past the budget is emitted hash-only
+    (path + sha256, no content_base64) instead of failing the packet
+    (NF-2026-02384).  The caller has already verified that the successor workspace
+    holds that file with that hash; a consumer that needs the bytes of an absent
+    hash-only entry refuses by name.
+    Returns JSON bytes with a deterministic canonical_digest over the sorted files
+    payload, exactly as emitted.
     """
     if not request_id_pattern.fullmatch(successor_request_id):
         raise ValueError(f"invalid successor_request_id: {successor_request_id!r}")
@@ -48,9 +55,8 @@ def materialize_rework_overlay(
         raise FileNotFoundError(f"authority_repo not found: {authority_repo}")
     if len(file_entries) > max_files:
         raise ValueError("rework overlay file count exceeds limit")
-    normalized_files: list[dict[str, Any]] = []
+    candidates: list[tuple[dict[str, Any], bytes | None]] = []
     seen_paths: set[str] = set()
-    total_content_bytes = 0
     for rel_path, file_sha, content in file_entries:
         normalized_path = PurePosixPath(str(rel_path)).as_posix()
         if (
@@ -72,12 +78,17 @@ def materialize_rework_overlay(
             if not re.fullmatch(r"[0-9a-f]{64}", str(file_sha)):
                 raise ValueError(f"invalid rework overlay hash: {normalized_path}")
             entry["sha256"] = file_sha
-        if content is not None:
-            if hashlib.sha256(content).hexdigest() != file_sha:
-                raise ValueError(f"rework overlay content hash mismatch: {normalized_path}")
+        if content is not None and hashlib.sha256(content).hexdigest() != file_sha:
+            raise ValueError(f"rework overlay content hash mismatch: {normalized_path}")
+        candidates.append((entry, content))
+    # Path order decides which files fit the inline budget, so the emitted
+    # packet is independent of the caller's entry order.
+    candidates.sort(key=lambda item: item[0]["path"])
+    normalized_files: list[dict[str, Any]] = []
+    total_content_bytes = 0
+    for entry, content in candidates:
+        if content is not None and total_content_bytes + len(content) <= max_content_bytes:
             total_content_bytes += len(content)
-            if total_content_bytes > max_content_bytes:
-                raise ValueError("rework overlay content exceeds limit")
             entry["content_base64"] = base64.b64encode(content).decode("ascii")
         normalized_files.append(entry)
     normalized_files.sort(key=lambda e: e["path"])

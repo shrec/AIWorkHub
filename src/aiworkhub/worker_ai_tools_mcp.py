@@ -3812,8 +3812,6 @@ def materialize_rework_overlay_sealed_files(
         if entry.get("deleted") is True:
             continue
         content = _sealed_rework_overlay_bytes(entry, relative)
-        if content is None:
-            continue
         raw = repo / relative
         candidate = raw.resolve(strict=False)
         if not candidate.is_relative_to(repo_root):
@@ -3822,6 +3820,11 @@ def materialize_rework_overlay_sealed_files(
             raise WorkerToolError(f"rework_overlay_path_symlink:{relative}")
         if candidate.exists() and not candidate.is_file():
             raise WorkerToolError(f"rework_overlay_path_not_file:{relative}")
+        # NF-2026-02384: an inherited file over the packet's inline budget travels
+        # hash-only.  Its bytes exist only in the workspace, so an absent one is
+        # refused by name rather than leaving the tree without it.
+        if content is None and not candidate.exists():
+            raise WorkerToolError(f"rework_overlay_hash_only_missing:{relative}")
         expected = str(entry["sha256"])
         # Held (semantic_edit.held_path): this may run on the host for a
         # contained worker, whose tree could otherwise redirect the write.
@@ -3832,6 +3835,8 @@ def materialize_rework_overlay_sealed_files(
                 if held.is_file():
                     with semantic_edit.held_path(repo_root, relative):
                         observed = hashlib.sha256(held.read_bytes()).hexdigest()
+                    # A present hash-only file is admitted against its digest
+                    # exactly as a sealed one is.
                     _admit_rework_overlay_observation(
                         relative=relative,
                         expected_hash=expected,
@@ -3840,6 +3845,8 @@ def materialize_rework_overlay_sealed_files(
                         allowed_writes=allowed_writes,
                     )
                     continue
+                if content is None:
+                    raise WorkerToolError(f"rework_overlay_hash_only_missing:{relative}")
                 tmp = held.parent / f".{held.name}.{secrets.token_hex(8)}.tmp"
                 try:
                     tmp.write_bytes(content)

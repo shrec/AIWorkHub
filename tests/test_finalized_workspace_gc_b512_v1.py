@@ -648,6 +648,101 @@ def test_blocked_rework_predecessor_survives_failed_successor(tmp_path, monkeypa
     assert "workspace_gc" not in manager._request_events(request_id)[-1]
 
 
+def test_blocked_rework_predecessor_survives_overlay_failed_successor_cleanup_and_gc(
+    tmp_path, monkeypatch
+):
+    """NF-2026-02384: a successor launch that fails inside rework-overlay
+    materialization, followed by the successor cleanup and the finalized-
+    workspace GC passes, leaves the blocked predecessor's workspace and its
+    hash-pinned bytes intact, so recovery never needs
+    ``clean_root_if_predecessor_missing``."""
+    import shutil
+
+    from aiworkhub import rework_overlay_packet, workspace_cleanup_retry
+    from aiworkhub.successful_rework_recovery import candidate_entries
+
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    predecessor_id = "req-nf02384-predecessor"
+    successor_id = "req-nf02384-successor"
+    inherited = b"predecessor work\n" * 64
+    hashes = {"out/result.txt": hashlib.sha256(inherited).hexdigest()}
+    card = _card()
+    card.update({
+        "status": "blocked",
+        "worker_status": "worker_failed",
+        "rework_predecessor": {
+            "schema_id": "aiworkhub.rework_predecessor.v1",
+            "request_id": predecessor_id,
+            "task_id": card["task_id"],
+            "claim_epoch": 1,
+            "changed_path_hashes": hashes,
+        },
+    })
+    manager = _build_manager(tmp_path, card)
+    path, home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=predecessor_id,
+        pid=2_147_483_090, pid_start_ticks=999_999_940,
+        state="validation_failed",
+    )
+    (path / "out").mkdir()
+    (path / "out" / "result.txt").write_bytes(inherited)
+
+    # The successor launch fails inside overlay materialization (hash mismatch;
+    # size no longer fails it).
+    successor_path = tmp_path / "wtroot" / successor_id / "worktree"
+    successor_home = successor_path.parent / "home"
+    (successor_path / "out").mkdir(parents=True)
+    successor_home.mkdir()
+    (successor_path / "out" / "result.txt").write_bytes(b"drifted\n")
+    successor = SimpleNamespace(
+        request_id=successor_id,
+        repo=tmp_path / "repo",
+        path=successor_path,
+        home=successor_home,
+        inherited_rework_paths=("out/result.txt",),
+        workspace_baseline={},
+    )
+
+    def no_packet(*_args):
+        raise AssertionError("a failed overlay must not write a packet")
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="rework_overlay_hash_mismatch:out/result.txt"
+    ):
+        rework_overlay_packet.materialize_worker_rework_overlay(
+            successor, card["task_id"], card,
+            worker_workspace.materialize_rework_overlay, no_packet,
+            worker_workspace.WorkspaceError,
+            lambda _card, task_id, **_kwargs: task_id,
+        )
+
+    # The failed launch's cleanup removes only the successor's own tree.
+    workspace_cleanup_retry.remove_request_workspace(
+        tmp_path / "repo", successor_path, successor_home,
+        admin_dir=lambda: None, remove=shutil.rmtree,
+        error=worker_workspace.WorkspaceError,
+    )
+    assert not successor_path.parent.exists()
+    assert path.exists() and home.exists()
+
+    # The finalized-workspace GC passes that follow keep the pinned predecessor.
+    for _ in range(2):
+        result = manager._gc_finalized_workspaces()
+        assert result["gc_cleaned"] == 0, result
+        assert all(
+            failure["reason"].startswith("rework_seal_failed:")
+            for failure in result.get("failures", [])
+        ), result
+    assert path.exists() and home.exists()
+    assert (path / "out" / "result.txt").read_bytes() == inherited
+    assert "workspace_gc" not in manager._request_events(predecessor_id)[-1]
+    # recover_blocked_rework re-reads exactly these hash-pinned bytes.
+    assert [relative for relative, _ in candidate_entries(path, hashes)] == [
+        "out/result.txt"
+    ]
+
+
 def test_current_review_request_is_preserved_but_older_attempt_is_gc_cleaned(tmp_path, monkeypatch):
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
     current_request = "req-current-review"
