@@ -185,9 +185,9 @@ def _run_lane(
     monkeypatch.setattr(ww, "resolve_validation_pythonpath", lambda *a, **k: "")
     monkeypatch.setattr(ww, "_approved_pythonpath_site", lambda component: Path(component))
     monkeypatch.setattr(ww, "resolve_trusted_pytest_runtime_root", lambda *a, **k: tmp_path)
-    # The skipping file is candidate-changed, so the NF-2026-02307 withhold applies
-    # regardless of any enclosing git repository around tmp_path.
-    monkeypatch.setattr(ww, "changed_paths", lambda workspace, **_: ["tests/test_skipped.py"])
+    # A conftest on the skipping file's path is candidate-changed, so the NF-2026-02307
+    # withhold applies (NF-2026-02374) regardless of any enclosing git repository.
+    monkeypatch.setattr(ww, "changed_paths", lambda workspace, **_: ["tests/conftest.py"])
     try:
         rows = ww.run_validations(
             workspace, [command], backend=ww.VSCODE_LM_IN_PROCESS_BACKEND, adapter_id="vscode_lm"

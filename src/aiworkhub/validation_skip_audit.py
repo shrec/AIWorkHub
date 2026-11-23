@@ -45,6 +45,11 @@ VALIDATION_ENV_SKIPPED = "validation_env_skipped"
 SKIP_REASONS_UNREADABLE = "skip_reasons_unreadable"
 # NF-2026-02371: env-skip authored only by canonical-unchanged test files.
 ENV_SKIP_CANONICAL = "validation_env_skip_canonical"
+# NF-2026-02374: env-skip in a test file the candidate changed; routed, marked.
+ENV_SKIP_CANDIDATE_CHANGED = "validation_env_skip_candidate_changed"
+ENV_SKIP_CANDIDATE_AUTHORED = "env_skip_candidate_authored"
+# Row keys whose skipped-path list routes the row's command to the host stage.
+ENV_SKIP_ROUTED_KEYS: tuple[str, ...] = (ENV_SKIP_CANONICAL, ENV_SKIP_CANDIDATE_CHANGED)
 HOST_STAGE_COMMAND = "host_stage_command"
 MAX_REPORTED_SKIPS = 64
 MAX_REASON_CHARS = 300
@@ -191,10 +196,16 @@ def conftest_chain(path: str) -> list[str]:
     return ["/".join((*parents[:depth], "conftest.py")) for depth in range(len(parents) + 1)]
 
 
-def canonical_env_skip_paths(
+def env_skip_path_split(
     skips: list[dict[str, Any]], changed_paths: Collection[str]
-) -> list[str] | None:
-    """The skipping files when none of them nor their conftests was changed, else ``None``."""
+) -> tuple[list[str], list[str]] | None:
+    """``(skipping files, candidate-changed ones)``; ``None`` when the row must be withheld.
+
+    Withheld (``None``): no skips, a truncated report, an unparseable location,
+    a changed pytest rootdir file, or a changed ``conftest.py`` on any skipping
+    file's path.  Otherwise the second list names the skipping files the
+    candidate itself changed (NF-2026-02374); it is empty for a canonical skip.
+    """
     if not skips or len(skips) >= MAX_REPORTED_SKIPS:
         return None  # truncated report: an unlisted skip could be candidate-authored
     paths = environment_skip_paths(skips)
@@ -205,9 +216,19 @@ def canonical_env_skip_paths(
     if any(PurePosixPath(path).name in PYTEST_ROOTDIR_FILES for path in changed):
         return None
     for path in paths:
-        if path in changed or any(conftest in changed for conftest in conftest_chain(path)):
+        if any(conftest in changed for conftest in conftest_chain(path)):
             return None
-    return paths
+    return paths, [path for path in paths if path in changed]
+
+
+def canonical_env_skip_paths(
+    skips: list[dict[str, Any]], changed_paths: Collection[str]
+) -> list[str] | None:
+    """The skipping files when none of them nor their conftests was changed, else ``None``."""
+    split = env_skip_path_split(skips, changed_paths)
+    if split is None or split[1]:
+        return None
+    return split[0]
 
 
 def env_skip_canonical_fields(
@@ -234,6 +255,38 @@ def env_skip_canonical_fields(
     }
 
 
+def env_skip_candidate_fields(
+    row: Mapping[str, Any], skips: list[dict[str, Any]], paths: list[str], authored: list[str]
+) -> dict[str, Any] | None:
+    """Green-row evidence for an env-skip in a candidate-changed test file (NF-2026-02374).
+
+    Same routing evidence as :func:`env_skip_canonical_fields`, under the
+    ``validation_env_skip_candidate_changed`` kind, plus the explicit
+    ``env_skip_candidate_authored`` marker listing the changed skipping files.
+    The accept-time host stage decides; nothing runs here.
+    """
+    command = row.get("declared_command") or row.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    prior = row.get("known_unknown")
+    known = [dict(item) for item in prior if isinstance(item, Mapping)] if isinstance(prior, list) else []
+    known.append(
+        {
+            "kind": ENV_SKIP_CANDIDATE_CHANGED,
+            "paths": list(paths),
+            ENV_SKIP_CANDIDATE_AUTHORED: list(authored),
+            "reason": "environment skip in candidate-changed test file; host stage decides",
+        }
+    )
+    return {
+        ENV_SKIP_CANDIDATE_CHANGED: list(paths),
+        ENV_SKIP_CANDIDATE_AUTHORED: list(authored),
+        "known_unknown": known,
+        "env_skipped_tests": [dict(item) for item in skips],
+        HOST_STAGE_COMMAND: command,
+    }
+
+
 def apply_env_skip_audit(
     row: Mapping[str, Any],
     output: str,
@@ -254,6 +307,11 @@ def apply_env_skip_audit(
     its path is unchanged stays green with ``known_unknown`` evidence and a
     ``host_stage_command``.  Without the callable (default), when it raises, a
     timed-out row, or an unparseable location, the row is withheld.
+
+    NF-2026-02374: an env-skip whose skipping file the candidate changed (no
+    changed conftest on its path, no changed rootdir file) is routed to the
+    accept-time host stage the same way, marked candidate-authored, instead of
+    a withhold whose lane replay would repeat the same skip forever.
     """
     updated = dict(row)
     if updated.get("returncode") != 0:
@@ -269,7 +327,11 @@ def apply_env_skip_audit(
             # Broad on purpose: WorkspaceError cannot be imported (circular) and any failure must withhold.
             except Exception:
                 delta = None
-        canonical = canonical_env_skip_paths(skips, delta) if delta is not None else None
-        fields = env_skip_canonical_fields(updated, skips, canonical) if canonical else None
+        split = env_skip_path_split(skips, delta) if delta is not None else None
+        fields: dict[str, Any] | None = None
+        if split is not None and not split[1]:
+            fields = env_skip_canonical_fields(updated, skips, split[0])
+        elif split is not None:
+            fields = env_skip_candidate_fields(updated, skips, split[0], split[1])
         updated.update(fields if fields is not None else env_skip_row_fields(skips))
     return updated

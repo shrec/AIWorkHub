@@ -103,10 +103,21 @@ def test_changed_paths_callable_is_lazy_without_env_skips() -> None:
     ],
 )
 def test_candidate_authored_skip_is_still_withheld(changed: set[str]) -> None:
+    """NF-2026-02374: a changed skipping file routes, marked; a changed conftest withholds."""
     row = audit.apply_env_skip_audit(
         _green_row(CANONICAL_SKIP_OUTPUT), CANONICAL_SKIP_OUTPUT, changed_paths=lambda: changed
     )
-    _assert_withheld(row)
+    if any(path.endswith("conftest.py") for path in changed):
+        _assert_withheld(row)
+        assert audit.ENV_SKIP_CANDIDATE_CHANGED not in row
+        return
+    assert row["returncode"] == 0
+    assert audit.VALIDATION_ENV_SKIPPED not in row
+    assert audit.ENV_SKIP_CANONICAL not in row
+    assert row[audit.ENV_SKIP_CANDIDATE_CHANGED] == ["tests/test_sandbox_lane.py"]
+    assert row[audit.ENV_SKIP_CANDIDATE_AUTHORED] == ["tests/test_sandbox_lane.py"]
+    assert row[audit.HOST_STAGE_COMMAND] == COMMAND
+    assert [item["kind"] for item in row["known_unknown"]] == [audit.ENV_SKIP_CANDIDATE_CHANGED]
 
 
 def test_nested_conftest_on_path_withholds() -> None:

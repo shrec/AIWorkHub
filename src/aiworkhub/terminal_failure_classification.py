@@ -3662,6 +3662,7 @@ def validation_environment_disposition(
         "evidence_source": entry.evidence_source,
         "candidate_forgeable": entry.candidate_forgeable,
     }
+    env_skip_only = _env_skip_withheld_only(validations)
     return {
         **_typed_disposition(
             cause=CAUSE_VALIDATION_ENVIRONMENT,
@@ -3680,6 +3681,8 @@ def validation_environment_disposition(
             "host_execution": False,
             "lane_change_available": False,
             "lane_change_reason": entry.lane_change_reason,
+            # NF-2026-02374: replaying a withheld env-skip row in the lane repeats the same skip.
+            **({"lane_replay_deterministic": True} if env_skip_only else {}),
             "plan": [
                 {
                     "tool": "aiworkhub_task_reject_review",
@@ -3690,13 +3693,32 @@ def validation_environment_disposition(
                         "failure_category": FAILURE_CATEGORY_VALIDATION_ENVIRONMENT,
                     },
                 },
-                {
-                    "tool": "aiworkhub_task_recover_blocked_rework",
-                    "arguments": {"task_id": task_id, "validation_only_replay": True},
-                },
+                *(
+                    []
+                    if env_skip_only
+                    else [
+                        {
+                            "tool": "aiworkhub_task_recover_blocked_rework",
+                            "arguments": {"task_id": task_id, "validation_only_replay": True},
+                        }
+                    ]
+                ),
             ],
         },
     }
+
+
+def _env_skip_withheld_only(validations: Any) -> bool:
+    """Every failing validation row is an NF-2026-02307 env-skip withhold (``validation_env_skipped``)."""
+    from .validation_skip_audit import VALIDATION_ENV_SKIPPED
+
+    rows = validations if isinstance(validations, list) else []
+    failing = [
+        row
+        for row in rows
+        if isinstance(row, Mapping) and (row.get("returncode") != 0 or row.get("timed_out"))
+    ]
+    return bool(failing) and all(row.get(VALIDATION_ENV_SKIPPED) is True for row in failing)
 
 
 # The refusal suffix ``core.mark_done`` appends when the plan above is on record.

@@ -327,7 +327,7 @@ def _evidence_validation_rows(evidence: object) -> list[Mapping[str, Any]]:
 def _env_skip_routes(
     rows: Iterable[object], declared: object
 ) -> list[tuple[list[str], list[str]]]:
-    """``(argv, env_skip_canonical paths)`` of every canonical env-skip row, argv deduplicated.
+    """``(argv, skipped paths)`` of every routed (canonical or candidate-changed) env-skip row.
 
     Fail closed, never dropped: a command that is not exactly one of the card's
     *declared* validation commands, or whose paths are not a list of strings,
@@ -342,7 +342,11 @@ def _env_skip_routes(
     for row in rows or ():
         if not isinstance(row, Mapping):
             continue
-        skipped = row.get(validation_skip_audit.ENV_SKIP_CANONICAL)
+        # NF-2026-02374: a candidate-changed env-skip row routes exactly like a canonical one.
+        skipped = next(
+            (row.get(key) for key in validation_skip_audit.ENV_SKIP_ROUTED_KEYS if row.get(key)),
+            None,
+        )
         if not skipped:
             continue
         command = row.get(validation_skip_audit.HOST_STAGE_COMMAND)
