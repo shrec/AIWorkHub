@@ -558,7 +558,7 @@ def index_write_lease(repo_root: Path):
     backends raise SourceGraphLockUnavailableError and never proceed unlocked.
     """
 
-    lock_path = resolve_db_path(repo_root).with_name("index.lock")
+    lock_path = _index_write_lease_path(repo_root)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
     acquired = False
@@ -644,8 +644,27 @@ def index_write_lease(repo_root: Path):
 INDEX_WRITE_LEASE_HOLDER_FILE = "index.lock.holder.json"
 
 
+def _index_write_lease_path(repo_root: Path) -> Path:
+    """The writer-lease lock file for the database ``repo_root`` resolves to.
+
+    NF-2026-02391: the canonical database keeps the unchanged ``index.lock``
+    name, so an older still-running runtime and a newer one keep excluding
+    each other. Under :func:`database_path_override` every private DB in one
+    directory (concurrent reviewer partitions) would otherwise share that one
+    lock and fail each other with build-in-progress; the lease is therefore
+    keyed by the overridden database's own file name.
+    """
+
+    db_path = resolve_db_path(repo_root)
+    if _DB_PATH_OVERRIDE.get() is None:
+        return db_path.with_name("index.lock")
+    return db_path.with_name(f"{db_path.name}.index.lock")
+
+
 def _lease_holder_path(lock_path: Path) -> Path:
-    return lock_path.with_name(INDEX_WRITE_LEASE_HOLDER_FILE)
+    # The canonical holder stays exactly INDEX_WRITE_LEASE_HOLDER_FILE; each
+    # overridden database gets its own holder record beside its own lock.
+    return lock_path.with_name(f"{lock_path.name}.holder.json")
 
 
 def _publish_lease_holder(lock_path: Path) -> str:
@@ -686,7 +705,7 @@ def read_index_write_lease_holder(repo_root: Path) -> dict[str, Any]:
     """Last recorded writer-lease holder for ``repo_root``; ``{}`` when none."""
 
     try:
-        path = _lease_holder_path(resolve_db_path(repo_root).with_name("index.lock"))
+        path = _lease_holder_path(_index_write_lease_path(repo_root))
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, SourceGraphError):
         return {}

@@ -190,6 +190,7 @@ def test_two_threads_pinning_one_generation_both_succeed(
     (pin,) = _pins(overlay)
     assert os.stat(pin).st_ino == generation.st_ino
     assert list(overlay.glob(".sg-base-link.*")) == []
+    assert all(r.failed_files == () for r in reports.values())
     for final in finals.values():
         marker = sgp.read_composed_marker(final)
         assert marker is not None and marker["base"]["pin"]["name"] == pin.name
@@ -312,6 +313,7 @@ def test_concurrent_reviewer_builds_survive_a_republish_and_both_answer(
     (pin,) = _pins(overlay)
     assert os.stat(pin).st_ino == current.st_ino
     assert list(overlay.glob(".sg-base-link.*")) == []
+    assert all(r.failed_files == () for r in reports.values())
     for final in finals.values():
         marker = sgp.read_composed_marker(final)
         assert marker is not None

@@ -272,61 +272,72 @@ def build_partition(
     failed_files: list[dict[str, str]] = []
     files_indexed = files_deleted = files_skipped = 0
     entities = edges = 0
-    with sg.database_path_override(partition_db_path):
-        for changed in changed_paths:
-            relative = str(changed.get("path") or "")
-            expected_hash = str(changed.get("sha256") or "")
-            if not relative:
-                raise PartitionError("partition_changed_path_missing")
-            scope.append(relative)
-            raw = repo_root / relative
-            candidate = raw.resolve(strict=False)
-            if not candidate.is_relative_to(repo_root):
-                raise PartitionError(
-                    f"quality_review_candidate_path_escapes_workspace:{relative}"
-                )
-            # ``resolve`` canonicalizes the final component, so a symlink must
-            # be tested on the UNRESOLVED path (as worker_ai_tools_mcp does on
-            # db_path); a post-resolve ``is_symlink`` can never fire.
-            if raw.is_symlink():
-                raise PartitionError(
-                    f"quality_review_candidate_path_symlink:{relative}"
-                )
-            if candidate.is_file():
-                if not admitted_changed_path(repo_root, relative, policy):
-                    files_skipped += 1
-                    continue
-                try:
-                    # ``admitted_changed_path`` is the one admit decision for
-                    # a packet path, so the gitignore refusal is not reapplied.
-                    result = sg.index_file(
-                        repo_root, relative, expected_hash, admit_gitignored=True,
+    try:
+        with sg.database_path_override(partition_db_path):
+            for changed in changed_paths:
+                relative = str(changed.get("path") or "")
+                expected_hash = str(changed.get("sha256") or "")
+                if not relative:
+                    raise PartitionError("partition_changed_path_missing")
+                scope.append(relative)
+                raw = repo_root / relative
+                candidate = raw.resolve(strict=False)
+                if not candidate.is_relative_to(repo_root):
+                    raise PartitionError(
+                        f"quality_review_candidate_path_escapes_workspace:{relative}"
                     )
-                except sqlite3.Error:
-                    raise
-                except Exception as exc:
-                    # The path stays in ``scope`` so the stale base row is
-                    # still hidden; only this file's partition row is lost.
-                    failed_files.append({
-                        "path": relative,
-                        "step": "index_file",
-                        "reason": f"{type(exc).__name__}: {exc}"[:160],
-                    })
+                # ``resolve`` canonicalizes the final component, so a symlink must
+                # be tested on the UNRESOLVED path (as worker_ai_tools_mcp does on
+                # db_path); a post-resolve ``is_symlink`` can never fire.
+                if raw.is_symlink():
+                    raise PartitionError(
+                        f"quality_review_candidate_path_symlink:{relative}"
+                    )
+                if candidate.is_file():
+                    if not admitted_changed_path(repo_root, relative, policy):
+                        files_skipped += 1
+                        continue
                     try:
-                        sg.remove_file(repo_root, relative)
-                    except Exception:
-                        pass
-                    continue
-                files_indexed += 1
-                entities += int(result.get("entities") or 0)
-                edges += int(result.get("edges") or 0)
-            elif candidate.exists():
-                raise PartitionError(
-                    f"quality_review_candidate_path_not_file:{relative}"
-                )
-            else:
-                sg.remove_file(repo_root, relative)
-                files_deleted += 1
+                        # ``admitted_changed_path`` is the one admit decision for
+                        # a packet path, so the gitignore refusal is not reapplied.
+                        result = sg.index_file(
+                            repo_root, relative, expected_hash, admit_gitignored=True,
+                        )
+                    except sqlite3.Error:
+                        raise
+                    except Exception as exc:
+                        # The path stays in ``scope`` so the stale base row is
+                        # still hidden; only this file's partition row is lost.
+                        failed_files.append({
+                            "path": relative,
+                            "step": "index_file",
+                            "reason": f"{type(exc).__name__}: {exc}"[:160],
+                        })
+                        try:
+                            sg.remove_file(repo_root, relative)
+                        except Exception:
+                            pass
+                        continue
+                    files_indexed += 1
+                    entities += int(result.get("entities") or 0)
+                    edges += int(result.get("edges") or 0)
+                elif candidate.exists():
+                    raise PartitionError(
+                        f"quality_review_candidate_path_not_file:{relative}"
+                    )
+                else:
+                    sg.remove_file(repo_root, relative)
+                    files_deleted += 1
+    finally:
+        # NF-2026-02391: the writer lease is keyed by this partition's own DB,
+        # so its lock file is private to this build; remove it so the overlay
+        # directory does not gain one lock file per review.
+        with sg.database_path_override(partition_db_path):
+            lease_path = sg._index_write_lease_path(repo_root)
+        try:
+            lease_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     pin_started = time.monotonic()
     pin = write_composed_marker(partition_db_path, base_db_path, scope)
