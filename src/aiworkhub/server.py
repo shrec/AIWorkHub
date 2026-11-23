@@ -814,6 +814,7 @@ from . import manager_recipe_tools
 from . import manager_skill_tools
 from . import process_launcher
 from . import process_launcher_accept_review
+from . import process_launcher_evidence
 from . import review_summarizer
 from . import skill_miner
 from . import stale_recovery
@@ -7627,6 +7628,7 @@ def _launch_task_internal(
     if isinstance(result, dict):
         result["timeout_seconds"] = timeout_seconds
         result["timeout_enforced"] = False
+        result.update(process_launcher_evidence.stall_policy_fields())  # NF-2026-02373
         # NF-2026-02367: a capacity deferral is queued, not failed.
         if result.get("state") == "admission_queued":
             from . import launch_admission
@@ -7681,6 +7683,7 @@ def aiworkhub_quality_reviewer_launch(
     ):
         result["timeout_seconds"] = timeout_seconds
         result["timeout_enforced"] = False
+        result.update(process_launcher_evidence.stall_policy_fields())  # NF-2026-02373
     return result
 
 

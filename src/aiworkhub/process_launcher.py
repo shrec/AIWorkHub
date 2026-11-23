@@ -144,6 +144,8 @@ from .process_launcher_evidence import (
     retained_candidate_identity_evidence as _retained_candidate_identity_evidence,
     retained_candidate_seal_evidence as _retained_candidate_seal_evidence,
     retained_rework_candidate_evidence,
+    harvest_delta_terminal_evidence as _harvest_delta_terminal_evidence,  # NF-2026-02373
+    stall_policy_fields as _stall_policy_fields,
     rework_no_delta_refusal as _rework_no_delta_refusal,
     source_graph_orientation_voided as _source_graph_orientation_voided,
 )
@@ -1830,6 +1832,7 @@ def _legacy_timeout_fields(timeout_seconds: int) -> dict[str, Any]:
     return {
         "timeout_seconds": int(timeout_seconds),
         "timeout_enforced": False,
+        **_stall_policy_fields(),
     }
 
 
@@ -11293,29 +11296,20 @@ class ProcessManager:
                         # lost claim) or a workspace that is gone yields no
                         # predecessor, never a finalize_failed that relabels a
                         # genuine timed_out as a finalization problem.
-                        if terminal_state in DELTA_RETAINING_TERMINAL_STATES:
-                            timeout_changed: list[str] = []
-                            retained: dict[str, Any] = {}
-                            try:
-                                timeout_changed = _enforce_finalization_scope()
-                                retained = retained_rework_candidate_evidence(
-                                    terminal_state,
-                                    workspace,
-                                    metadata,
-                                    request_id,
-                                    timeout_changed,
-                                    self._exact_claim_state(metadata),
-                                )
-                            except Exception:
-                                timeout_changed = []
-                                retained = {}
-                            if retained:
-                                # NF-2026-01199: the hashes and the sealed
-                                # delta both come from the retention helper's
-                                # single capture -- no second read of these
-                                # bytes can split the published pair.
-                                failure_evidence.update(retained)
-                                failure_evidence["changed_paths"] = timeout_changed
+                        # NF-2026-02373: changed_paths is the measured scope
+                        # whenever it was computed (retention only adds seal
+                        # evidence); a scope failure is named, never [].
+                        _harvest_delta_terminal_evidence(
+                            failure_evidence,
+                            terminal_state,
+                            workspace,
+                            metadata,
+                            request_id,
+                            enforce_scope=_enforce_finalization_scope,
+                            claim_state=partial(self._exact_claim_state, metadata),
+                            retain=retained_rework_candidate_evidence,
+                            validate=validate_required_outputs,
+                        )
                         release_result = phase_clock.transition(self._terminal_failure_exact,
                             metadata,
                             terminal_state,

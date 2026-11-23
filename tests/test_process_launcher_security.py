@@ -2461,8 +2461,15 @@ def test_workspace_error_terminal_states_keep_candidate_failures_and_signals() -
 
 
 def test_legacy_timeout_fields_are_non_enforcing() -> None:
+    from aiworkhub import worker_supervisor
+
     fields = process_launcher._legacy_timeout_fields(7200)
-    assert fields == {"timeout_seconds": 7200, "timeout_enforced": False}
+    assert fields == {
+        "timeout_seconds": 7200,
+        "timeout_enforced": False,
+        "timeout_policy": "stall_gated",
+        "stall_window_seconds": worker_supervisor.DEFAULT_STALL_WINDOW_SECONDS,
+    }
     fields = process_launcher._legacy_timeout_fields(1800)
     assert fields["timeout_enforced"] is False
 

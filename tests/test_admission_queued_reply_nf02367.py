@@ -173,7 +173,13 @@ def test_non_queued_refusal_stays_byte_identical(repo, manager):
     }
     manager.reply = refused
     reply = server._launch_task_internal(task_id="T1")
-    assert reply == {**refused, "timeout_seconds": 7200, "timeout_enforced": False}
+    stall = process_launcher._stall_policy_fields()
+    assert reply == {
+        **refused,
+        "timeout_seconds": 7200,
+        "timeout_enforced": False,
+        **stall,
+    }
     assert reply["ok"] is False
     assert "queued" not in reply and "start_notification" not in reply
 
@@ -183,6 +189,7 @@ def test_non_queued_refusal_stays_byte_identical(repo, manager):
         **started,
         "timeout_seconds": 7200,
         "timeout_enforced": False,
+        **stall,
     }
 
 

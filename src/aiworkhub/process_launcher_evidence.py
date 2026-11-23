@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import stat
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
+from . import worker_supervisor
 from .process_launcher_acceptance import changed_path_hashes
 from .tree_baseline_projection import card_workspace_metadata
 from .worker_workspace import WorkerWorkspace, WorkspaceError
@@ -473,3 +476,203 @@ def path_manifest(base: Path, declared: list[str]) -> dict[str, dict[str, Any]]:
         else:
             manifest[relative] = {"kind": "missing"}
     return manifest
+
+
+# NF-2026-02373: the launch reply names the deadline worker_supervisor applies.
+TIMEOUT_POLICY_STALL_GATED = "stall_gated"
+MEASURED_AT_TERMINAL_REASON = "measured_at_terminal"
+_MEASURE_ERROR_CHARS = 200
+_REQUIRED_OUTPUT_MISMATCH_PREFIX = "required_output_mismatch:"
+
+
+def stall_policy_fields() -> dict[str, Any]:
+    """Launch-reply keys for the stall-gated deadline (no wall-clock kill)."""
+
+    return {
+        "timeout_policy": TIMEOUT_POLICY_STALL_GATED,
+        "stall_window_seconds": worker_supervisor.DEFAULT_STALL_WINDOW_SECONDS,
+    }
+
+
+def _bounded_exc(exc: BaseException) -> str:
+    return f"{type(exc).__name__}:{str(exc)[:_MEASURE_ERROR_CHARS]}"
+
+
+def _hash_present_path(root: Path, relative: str) -> dict[str, Any] | None:
+    # A violation path comes from validator diagnostics a worker can steer:
+    # hash only a plain relative path that resolves inside ``root``.
+    candidate = Path(relative)
+    if not relative or candidate.anchor or ".." in candidate.parts:
+        return None
+    target = root / candidate
+    try:
+        target.resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return None
+    if target.is_symlink() or not target.is_file():
+        return None
+    data = target.read_bytes()
+    mode = stat.S_IMODE(target.stat().st_mode)
+    return {
+        "path": relative,
+        "bytes": len(data),
+        # Same ``file:<mode>:<hex>`` form validate_required_outputs records.
+        "sha256": f"file:{mode:o}:{hashlib.sha256(data).hexdigest()}",
+    }
+
+
+def _measured_row(
+    workspace: WorkerWorkspace,
+    pattern: str,
+    metadata: Mapping[str, Any],
+    validate: Callable[..., list[dict[str, Any]]],
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "pattern": pattern,
+        "path": pattern,
+        "bytes": None,
+        "sha256": "",
+        "missing": True,
+        "reason": MEASURED_AT_TERMINAL_REASON,
+    }
+    violations: list[str] = []
+    try:
+        records = validate(
+            workspace,
+            [pattern],
+            allow_empty=tuple(metadata.get("allow_empty_required_outputs") or []),
+            allow_unchanged=tuple(
+                metadata.get("allow_unchanged_required_outputs") or []
+            ),
+        )
+        missing = False
+    except WorkspaceError as exc:
+        text = str(exc)
+        if not text.startswith(_REQUIRED_OUTPUT_MISMATCH_PREFIX):
+            row["measure_error"] = _bounded_exc(exc)
+            return row
+        try:
+            diagnostics = json.loads(text[len(_REQUIRED_OUTPUT_MISMATCH_PREFIX):])
+        except ValueError as parse_exc:
+            row["measure_error"] = _bounded_exc(parse_exc)
+            return row
+        records = list(diagnostics.get("primary_validation_result") or [])
+        missing = bool(diagnostics.get("missing_required_artifacts"))
+        violations = [
+            str(p) for p in diagnostics.get("unchanged_mandatory_outputs") or []
+        ] + [
+            str(v.get("path") if isinstance(v, dict) else v)
+            for v in diagnostics.get("scope_violations") or []
+        ]
+    matches: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if isinstance(record, dict) and record.get("path"):
+            relative = str(record["path"])
+            matches[relative] = {
+                "path": relative,
+                "bytes": record.get("bytes"),
+                "sha256": str(record.get("sha256") or ""),
+            }
+    for relative in violations:
+        if relative not in matches:
+            measured = _hash_present_path(workspace.path, relative)
+            if measured is not None:
+                matches[relative] = measured
+    ordered = [matches[key] for key in sorted(matches)]
+    row["missing"] = missing or not ordered
+    if violations:
+        row["violations"] = sorted(set(violations))
+    if len(ordered) == 1:
+        row.update(ordered[0])
+    elif ordered:
+        row["bytes"] = sum(int(m.get("bytes") or 0) for m in ordered)
+        row["sha256"] = hashlib.sha256(
+            "".join(f"{m['path']}\0{m['sha256']}\n" for m in ordered).encode()
+        ).hexdigest()
+        row["matches"] = ordered
+    return row
+
+
+def measured_required_output_rows(
+    workspace: WorkerWorkspace | None,
+    metadata: Mapping[str, Any],
+    validate: Callable[..., list[dict[str, Any]]],
+    declared_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Measure each declared required output in a live terminal workspace.
+
+    A workspace that is gone (or unreadable) returns ``declared_rows``
+    unchanged: absent evidence is never upgraded to a measurement.
+    """
+
+    try:
+        if workspace is None or not Path(workspace.path).is_dir():
+            return declared_rows
+    except OSError:
+        return declared_rows
+    rows: list[dict[str, Any]] = []
+    for raw in list(metadata.get("required_outputs") or []):
+        pattern = str(raw or "").strip().replace("\\", "/")
+        try:
+            rows.append(_measured_row(workspace, pattern, metadata, validate))
+        except (OSError, WorkspaceError, ValueError) as exc:
+            rows.append(
+                {
+                    "pattern": pattern,
+                    "path": pattern,
+                    "bytes": None,
+                    "sha256": "",
+                    "missing": True,
+                    "reason": MEASURED_AT_TERMINAL_REASON,
+                    "measure_error": _bounded_exc(exc),
+                }
+            )
+    return rows
+
+
+def harvest_delta_terminal_evidence(
+    failure_evidence: dict[str, Any],
+    terminal_state: str,
+    workspace: WorkerWorkspace | None,
+    metadata: dict[str, Any],
+    request_id: str,
+    *,
+    enforce_scope: Callable[[], list[str]],
+    claim_state: Callable[[], str],
+    retain: Callable[..., dict[str, Any]],
+    validate: Callable[..., list[dict[str, Any]]],
+) -> None:
+    """NF-2026-02373: record the measured delta of a delta-retaining terminal.
+
+    ``changed_paths`` is the measured scope whenever ``enforce_scope``
+    returned; retention only ADDS seal evidence.  A scope failure is named in
+    ``changed_paths_error``, never flattened into ``[]``.  Nothing here can
+    change the terminal state.
+    """
+
+    if terminal_state not in DELTA_RETAINING_TERMINAL_STATES:
+        return
+    changed: list[str] | None = None
+    try:
+        changed = list(enforce_scope())
+    except Exception as exc:  # noqa: BLE001 - evidence only, named below
+        failure_evidence["changed_paths_error"] = _bounded_exc(exc)
+    if changed is not None:
+        retained: dict[str, Any] = {}
+        try:
+            retained = retain(
+                terminal_state, workspace, metadata, request_id, changed, claim_state()
+            )
+        except Exception as exc:  # noqa: BLE001 - seal is best-effort enrichment
+            failure_evidence["retention_error"] = _bounded_exc(exc)
+        if retained:
+            # NF-2026-01199: hashes and sealed delta come from one capture.
+            failure_evidence.update(retained)
+        failure_evidence["changed_paths"] = changed
+    declared_rows = list(failure_evidence.get("required_outputs") or [])
+    try:
+        failure_evidence["required_outputs"] = measured_required_output_rows(
+            workspace, metadata, validate, declared_rows
+        )
+    except Exception as exc:  # noqa: BLE001 - keep the declared denominators
+        failure_evidence["required_outputs_measure_error"] = _bounded_exc(exc)
