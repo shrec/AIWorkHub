@@ -221,8 +221,8 @@ def test_checkpointed_cold_read_equals_full_replay(
     assert first == expected
     assert _checkpoint_file(path).is_file()
 
-    # Count this thread's checkpoint loads and this ledger's decodes only: the
-    # process-global stats also move when a foreign thread loads a checkpoint.
+    # Count this thread's checkpoint loads only: the process-global stats also
+    # move when a foreign thread loads a checkpoint.
     outcomes = _own_checkpoint_outcomes(monkeypatch)
     second = _cold_read(path, options)
     assert second == expected
