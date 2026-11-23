@@ -305,6 +305,37 @@ def _ranker_exclusion_is_fallback_eligible(reasons: tuple[str, ...]) -> bool:
     )
 
 
+def reviewer_route_adapter_refusal(route: Mapping[str, Any]) -> str:
+    """Why this reviewer route's adapter cannot be pinned, or ``""``.
+
+    NF-2026-02388: an automatic reviewer was routed to an adapter the launcher
+    could never start, and failed only after it was launched. The rule is the
+    launcher's own, read from its owner: the adapter must be in the runner's
+    ``adapter_identity_tuple`` and, for a runner that owns any canonical
+    workforce row, must own one itself -- exactly ``derive_launch_identity``'s
+    ``pinnable`` set. Anything unresolvable is refused, never assumed usable.
+    """
+    from . import process_launcher  # local import: process_launcher imports this module
+
+    runner, adapter_id, _model = _review_route_identity(route)
+    if not runner or not adapter_id:
+        return reviewer_launch_refusal.adapter_unpinnable_reason(
+            runner, adapter_id, "route_identity_incomplete",
+        )
+    try:
+        process_launcher._validate_adapter_identity(runner, adapter_id)
+    except process_launcher.LaunchRejected as exc:
+        return reviewer_launch_refusal.adapter_unpinnable_reason(
+            runner, adapter_id, str(exc).split(":", 1)[0],
+        )
+    rows = process_launcher._CANONICAL_WORKFORCE
+    if (runner, adapter_id) not in rows and any(owner == runner for owner, _ in rows):
+        return reviewer_launch_refusal.adapter_unpinnable_reason(
+            runner, adapter_id, "workforce_route_absent",
+        )
+    return ""
+
+
 def _review_route_refusal(
     repo: Path,
     route: Mapping[str, str],
@@ -320,6 +351,9 @@ def _review_route_refusal(
         return "excluded_adapter"
     if _manager_reserved_codex_route(route):
         return "manager_reserved"
+    unpinnable = reviewer_route_adapter_refusal(route)
+    if unpinnable:
+        return unpinnable
     if not _review_route_policy_enabled(model_policy, route):
         return "policy_disabled"
     # NF-2026-01588: reviewer selection honors the same route failure
@@ -2145,6 +2179,7 @@ def _reviewer_lens_coverage(
     *,
     status_of: Callable[[str], Any] | None = None,
     now: datetime | None = None,
+    existing_of: Callable[[str], Any] | None = None,
 ) -> dict[str, str]:
     """Classify each planned lens as covered, unusable, exhausted or absent.
 
@@ -2215,7 +2250,51 @@ def _reviewer_lens_coverage(
             # second child would duplicate the reviewer already running.
             coverage[lens] = _COVERAGE_COVERED
             break
+    if callable(existing_of):
+        # NF-2026-02388: a lens is covered by ANY live or verified reviewer for
+        # this exact target request, claim epoch and lens -- a manager's manual
+        # reviewer included -- not only by this chain's own hashed children.
+        for lens in lenses:
+            if coverage[lens] != _COVERAGE_COVERED and _lens_held_elsewhere(
+                existing_of, lens
+            ):
+                coverage[lens] = _COVERAGE_COVERED
     return coverage
+
+
+def _lens_held_elsewhere(existing_of: Callable[[str], Any], lens: str) -> bool:
+    """Whether the shared reuse rule names a reviewer this lens already has.
+
+    The answer is :func:`existing_lens_reviewer`'s, supplied by the manager
+    from its own ledger. An unreadable lookup holds nothing, so the lens is
+    ensured exactly as before and the launcher's reservation still decides.
+    """
+    try:
+        found = existing_of(lens)
+    except Exception:  # noqa: BLE001 -- an unreadable lookup proves no reviewer
+        return False
+    return isinstance(found, Mapping) and bool(
+        str(found.get("task_id") or "") and str(found.get("request_id") or "")
+    )
+
+
+def _manager_lens_lookup(
+    manager: Any, identity: Mapping[str, Any],
+) -> Callable[[str], Any] | None:
+    """The manager's ``existing_lens_reviewer`` bound to one target claim, or None."""
+    finder = getattr(manager, "existing_lens_reviewer", None)
+    if not callable(finder):
+        return None
+
+    def _lookup(lens: str) -> Any:
+        return finder(
+            target_task_id=str(identity.get("target_task_id") or ""),
+            target_request_id=str(identity.get("target_request_id") or ""),
+            claim_epoch=str(identity.get("claim_epoch") or ""),
+            lens=lens,
+        )
+
+    return _lookup
 
 
 # NF-2026-02277: the prefix every recovery skip reason carries on its target.
@@ -2562,6 +2641,7 @@ def recover_review_ready_targets(
             repo, identity, planned,
             status_of=getattr(manager, "status", None),
             now=datetime.now(timezone.utc),
+            existing_of=_manager_lens_lookup(manager, identity),
         )
         missing = tuple(
             lens for lens in planned if coverage[lens] != _COVERAGE_COVERED
@@ -2656,6 +2736,48 @@ def _exception_route_skips(exc: BaseException) -> list[dict[str, Any]]:
     if not isinstance(skipped, (list, tuple)):
         return []
     return [dict(row) for row in skipped if isinstance(row, Mapping)]
+
+
+def _start_failure_dispatch() -> dict[str, Any]:
+    """The dispatch of an attempt retired before any provider ran for it."""
+    return {
+        "action": terminal_failure_classification.ACTION_ROUTE_RETRY,
+        "relaunch_distinct_route": True,
+        "route_hold": False,
+        "adapter_credential": False,
+        "start_failure": True,
+        "disposition": {},
+    }
+
+
+def _target_status_review_ready(status: Any) -> bool:
+    """Whether a target's status is ``review_ready`` by its process or its card.
+
+    The one readiness predicate a launch is gated on: ``_launch_readiness``
+    before a first launch and ``_target_not_review_ready`` around every launch.
+    """
+    if not isinstance(status, Mapping):
+        return False
+    if str(status.get("state") or "") == "review_ready":
+        return True
+    card = status.get("task_card")
+    return (
+        isinstance(card, Mapping)
+        and str(card.get("status") or "") == "review"
+        and str(card.get("worker_status") or "") == "review"
+        and str(card.get("terminal_substatus") or "") == "review_ready"
+    )
+
+
+def _identity_superseded_reason(
+    observed: Mapping[str, Any], identity: Mapping[str, Any],
+) -> str:
+    """Name the newer request or claim epoch that replaced this chain's, or ``""``."""
+    if observed["target_request_id"] != str(identity["target_request_id"]):
+        return "target_request_superseded:" + observed["target_request_id"]
+    if observed["claim_epoch"] != str(identity["claim_epoch"]):
+        return "target_claim_epoch_superseded:" + observed["claim_epoch"]
+    return ""
 
 
 class ReviewOrchestrator:
@@ -4215,6 +4337,11 @@ class ReviewOrchestrator:
                     "excluded_route" if identity in excluded else "excluded_adapter"
                 ),
             }])
+        # NF-2026-02388: whatever selector chose it, an adapter the launcher
+        # cannot pin is skipped with its reason here, never launched.
+        unpinnable = reviewer_route_adapter_refusal(route)
+        if unpinnable:
+            raise ReviewRouteUnavailable(lens, [{**route, "skip": unpinnable}])
         fallback = selected.get("route_fallback")
         if isinstance(fallback, Mapping):
             route["route_fallback"] = dict(fallback)
@@ -4700,6 +4827,29 @@ class ReviewOrchestrator:
                 "state": "adopted",
                 "adopted_existing_reviewer": True,
             }
+        # An attempt with no bound request has started no reviewer yet; only
+        # such a launch is gated, a bound one is reconciled as before.
+        unbound = not str(attempt.get("reviewer_request_id") or "")
+        if unbound:
+            # NF-2026-02388: every automatic launch -- first attempt, successor,
+            # hedge -- passes here. A target that is no longer review_ready at
+            # this chain's claim epoch (rejected, superseded, unreadable) gets
+            # no reviewer; the action waits on the named reason instead.
+            left = self._target_not_review_ready(identity)
+            if left:
+                raise _DeferredLaunch(left, {"outcome": "deferred", "reason": left})
+            unpinnable = reviewer_route_adapter_refusal(attempt)
+            if unpinnable:
+                # Skipped before any process starts, with its reason recorded on
+                # the attempt. A start failure excludes this exact route and
+                # spends no NF847 slot, so the successor plans the next route.
+                retirement = unpinnable + _START_FAILED_MARKER
+                if not self._retire_route_attempt(action, attempt, retirement):
+                    return None
+                return {
+                    "_route_terminal_failure": retirement,
+                    "_route_dispatch": _start_failure_dispatch(),
+                }
         try:
             result = self.manager.launch_quality_reviewer(
                 target_request_id=str(identity["target_request_id"]),
@@ -4745,14 +4895,7 @@ class ReviewOrchestrator:
                     return None
                 return {
                     "_route_terminal_failure": retirement,
-                    "_route_dispatch": {
-                        "action": terminal_failure_classification.ACTION_ROUTE_RETRY,
-                        "relaunch_distinct_route": True,
-                        "route_hold": False,
-                        "adapter_credential": False,
-                        "start_failure": True,
-                        "disposition": {},
-                    },
+                    "_route_dispatch": _start_failure_dispatch(),
                 }
             self._note_route_attempt_launch_fault(action, attempt, exc)
             return None
@@ -4838,7 +4981,29 @@ class ReviewOrchestrator:
             != str(attempt["reviewer_task_id"])
         ):
             raise RuntimeError("reviewer_launch_identity_invalid")
-        if not self._bind_route_attempt_request(action, attempt, request_id):
+        bound = self._bind_route_attempt_request(action, attempt, request_id)
+        if unbound:
+            # NF-2026-02388: a reject/supersede that landed while this reviewer
+            # was being reserved can sweep before its row existed. Re-read the
+            # target AFTER the launch: either the reject's cancel sweep saw this
+            # reviewer, or this read sees the reject and cancels. It runs even
+            # when the bind is not durable: a retry of a still-unbound attempt
+            # meets the pre-launch gate, which defers before it could reconcile
+            # this reviewer, so this is the one place it can be cancelled. When
+            # the bind landed, a reviewer whose cancel fails stays tracked by the
+            # bound-attempt path. The pre-launch gate passed, so an unreadable
+            # re-read is not evidence of a reject: no cancel.
+            left = self._target_not_review_ready(identity)
+            if left.startswith("target_status_unavailable:"):
+                left = ""
+            if left:
+                cancelled = self._cancel_orphaned_reviewer(request_id)
+                raise _DeferredLaunch(left, {
+                    "outcome": "deferred", "reason": left,
+                    "cancelled_reviewer_request_id": request_id,
+                    "cancel_state": cancelled,
+                })
+        if not bound:
             # The external launch is acknowledged but its request binding is
             # not durable yet. Keep this action pending: the pre-bound task and
             # route make the retry reconcile the same ProcessManager attempt.
@@ -5516,13 +5681,7 @@ class ReviewOrchestrator:
             return self._readiness_receipt(action, "terminal", "target_packet_identity_invalid")
         if observed["candidate_sha256"] != str(identity["candidate_sha256"]):
             return self._readiness_receipt(action, "terminal", "target_candidate_identity_invalid")
-        process_review_ready = str(status.get("state") or "") == "review_ready"
-        card_review_ready = (
-            str(card.get("status") or "") == "review"
-            and str(card.get("worker_status") or "") == "review"
-            and str(card.get("terminal_substatus") or "") == "review_ready"
-        )
-        if not process_review_ready and not card_review_ready:
+        if not _target_status_review_ready(status):
             return self._readiness_receipt(action, "deferred", "target_not_review_ready")
         # Every immutable identity above has matched and the card is genuinely
         # at review_ready, so its deterministic verdict is about THIS claim of
@@ -5580,11 +5739,49 @@ class ReviewOrchestrator:
             return ""
         if observed["target_task_id"] != str(identity["target_task_id"]):
             return ""
-        if observed["target_request_id"] != str(identity["target_request_id"]):
-            return "target_request_superseded:" + observed["target_request_id"]
-        if observed["claim_epoch"] != str(identity["claim_epoch"]):
-            return "target_claim_epoch_superseded:" + observed["claim_epoch"]
-        return ""
+        return _identity_superseded_reason(observed, identity)
+
+    def _target_not_review_ready(self, identity: Mapping[str, Any]) -> str:
+        """Why no automatic reviewer may start on this target now, or ``""``.
+
+        NF-2026-02388: read immediately before AND after every automatic
+        launch. Fail closed: an unreadable target, one that is no longer
+        ``review_ready`` (a rejected candidate is returned to ``pending``,
+        which ``_target_left_review`` still counts as reviewable), a conflicting
+        or unresolved identity (``target_identity_unavailable``, as in
+        ``_launch_readiness``) and a newer request or claim epoch each name a
+        reason.
+        """
+        try:
+            status = self.manager.status(str(identity["target_request_id"]))
+        except Exception as exc:  # noqa: BLE001 -- unreadable never launches
+            return "target_status_unavailable:" + type(exc).__name__
+        if not _target_status_review_ready(status):
+            state = str(status.get("state") or "") if isinstance(status, Mapping) else ""
+            return "target_not_review_ready:" + (state[:40] or "unknown")
+        resolved = resolve_target_identity(status)
+        if resolved["conflict"]:
+            return "target_identity_conflict:" + str(resolved["conflict"])[:80]
+        observed = resolved["identity"]
+        if not observed:
+            # Mirrors _launch_readiness: an unresolved identity never launches.
+            return "target_identity_unavailable"
+        if observed["target_task_id"] != str(identity["target_task_id"]):
+            return "target_task_identity_invalid"
+        return _identity_superseded_reason(observed, identity)
+
+    def _cancel_orphaned_reviewer(self, request_id: str) -> str:
+        """Cancel a reviewer launched for a target that left review_ready."""
+        cancel = getattr(self.manager, "cancel", None)
+        if not callable(cancel):
+            return "cancel_unavailable"
+        try:
+            result = cancel(request_id, "parent_candidate_rejected")
+        except Exception as exc:  # noqa: BLE001 -- the reject sweep still owns it
+            return "cancel_failed:" + type(exc).__name__
+        if not isinstance(result, Mapping):
+            return "cancel_unknown"
+        return str(result.get("state") or ("cancelled" if result.get("ok") else "cancel_refused"))
 
     @staticmethod
     def _readiness_receipt(

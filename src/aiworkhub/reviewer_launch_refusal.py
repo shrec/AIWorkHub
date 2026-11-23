@@ -223,10 +223,30 @@ def launch_failure_skip_reason(
     if not launch_class_retirement(route_failure):
         return route_failure
 
-    def _field(value: Any) -> str:
-        return _SKIP_FIELD_UNSAFE.sub("", str(value or ""))[:SKIP_FIELD_LIMIT]
+    return (
+        f"{route_failure}:adapter={_skip_field(adapter_id) or 'unknown'}"
+        f":reviewer_request={_skip_field(receipt.get('request_id')) or 'unallocated'}"
+    )
+
+
+def _skip_field(value: Any) -> str:
+    """``value`` reduced to the closed skip character set and field limit."""
+
+    return _SKIP_FIELD_UNSAFE.sub("", str(value or ""))[:SKIP_FIELD_LIMIT]
+
+
+ADAPTER_UNPINNABLE = "adapter_unpinnable"
+
+
+def adapter_unpinnable_reason(runner: Any, adapter_id: Any, cause: str) -> str:
+    """The skip reason of a reviewer route whose adapter cannot be pinned.
+
+    NF-2026-02388: recorded instead of a launch, never after one. Every field
+    is reduced to the closed skip character set so the ``:``-separated reason
+    stays parseable and can never spell a route-hold marker.
+    """
 
     return (
-        f"{route_failure}:adapter={_field(adapter_id) or 'unknown'}"
-        f":reviewer_request={_field(receipt.get('request_id')) or 'unallocated'}"
+        f"{ADAPTER_UNPINNABLE}:{_skip_field(cause) or 'unknown'}"
+        f":runner={_skip_field(runner) or 'unknown'}:adapter={_skip_field(adapter_id) or 'unknown'}"
     )
