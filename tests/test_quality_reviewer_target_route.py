@@ -146,11 +146,25 @@ def test_a_target_without_a_callback_origin_grants_nothing(repo, origin):
     assert result["stderr"] == "callback_route_pending:codex_thread_id_not_observed"
 
 
-def test_a_review_target_never_replaces_the_manager_identity_gate(repo, monkeypatch):
+def test_a_resolvable_review_target_stands_in_for_an_absent_manager(repo, monkeypatch):
+    # NF-2026-02372: a read-only, no-writes quality_review card naming a
+    # resolvable target runs under the target's route; other shapes stay
+    # refused (tests/test_system_reviewer_create_identity_nf02372.py).
     _insert_target(repo, "TARGET_01095")
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
 
     result = _create_reviewer("QUALITY_REVIEW_01095_NO_MANAGER", "TARGET_01095")
+
+    assert result["ok"] is True, result.get("stderr")
+    card = task_store.get_task(repo, "QUALITY_REVIEW_01095_NO_MANAGER")
+    assert card["origin_thread_id"] == _CLAUDE_SESSION
+    assert card["coordinator_provider"] == "claude"
+
+
+def test_a_review_target_without_a_route_keeps_the_manager_identity_gate(repo, monkeypatch):
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
+
+    result = _create_reviewer("QUALITY_REVIEW_01095_NO_MANAGER", "TARGET_01095_MISSING")
 
     assert result["ok"] is False
     assert result["stderr"] == "manager_identity_required:task_create"

@@ -4386,10 +4386,16 @@ def create_task(
 
     ``review_target_task_id`` is internal (no MCP tool passes it): a system
     quality reviewer card names its target and inherits that target's
-    callback route instead of the live one (NF-2026-01095). The manager
-    identity and capability gates still apply.
+    callback route instead of the live one (NF-2026-01095). With no live
+    manager identity, only a read-only, no-writes ``quality_review`` card
+    whose target binding resolves runs under that route (NF-2026-02372);
+    the write and capability gates still apply.
     """
-    identity = _live_manager_identity()
+    from .system_reviewer_identity import system_reviewer_identity
+    identity = _live_manager_identity() or system_reviewer_identity(
+        _review_target_callback_binding(review_target_task_id),
+        review_target_task_id=review_target_task_id,
+        topic=topic, read_only=read_only, allowed_writes=allowed_writes)
     if identity is None:
         return _lifecycle_error("manager_identity_required:task_create", 126)
     # Creation has no pre-existing card whose runner/topic could authorize the
