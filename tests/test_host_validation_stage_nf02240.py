@@ -974,8 +974,9 @@ def test_pytest_scratch_and_fallback_home_stay_outside_the_candidate_tree(tmp_pa
 
 
 def test_the_stage_wires_its_scratch_into_each_tree_runner_and_removes_it(tmp_path, monkeypatch):
-    # NF-2026-02381: workspace_tree_ops hands each tree runner the stage
-    # directory's scratch, and a finished stage removes that scratch.
+    # NF-2026-02381: workspace_tree_ops hands each tree runner the stage's
+    # scratch, and a finished stage removes that scratch. NF-2026-02394: the
+    # scratch is the neutral <repo>/.aiworkhub/temp/host_stage/<request_id>.
     from aiworkhub import worker_workspace as ww
     from aiworkhub import workspace_prepare
 
@@ -985,14 +986,15 @@ def test_the_stage_wires_its_scratch_into_each_tree_runner_and_removes_it(tmp_pa
     monkeypatch.setattr(ww, "create_combined_validation_workspace", lambda *_a, **_kw: (tree, {}))
     monkeypatch.setattr(workspace_prepare, "prepare_once", lambda *_a, **_kw: "prepared")
     directory = hvs.stage_dir(tmp_path, REQUEST)
+    scratch = hvs.neutral_scratch_root(tmp_path, REQUEST)
     ops = hvs.workspace_tree_ops(
         SimpleNamespace(repo=tmp_path, base_oid="b" * 40), {}, [], state_dir=directory
     )
     ops.build_candidate()
-    assert seen == [directory / hvs.HOST_STAGE_SCRATCH]
+    assert seen == [scratch]
 
     candidate_root, _cand, _bases, runner, fake_ops, db = _setup(tmp_path)
-    leftover = directory / hvs.HOST_STAGE_SCRATCH / "home" / "left.txt"
+    leftover = scratch / "home" / "left.txt"
 
     def run(argv, cwd):
         leftover.parent.mkdir(parents=True, exist_ok=True)
@@ -1002,7 +1004,7 @@ def test_the_stage_wires_its_scratch_into_each_tree_runner_and_removes_it(tmp_pa
     spec = _spec({"host_commands": [["git", "diff", "--check"]]})
     result = _run(tmp_path, spec, fake_ops, run, candidate_root, db)
     assert result["state"] == "passed", result
-    assert not (directory / hvs.HOST_STAGE_SCRATCH).exists()
+    assert not scratch.exists()
 
 
 def test_a_sweep_test_outside_the_tree_is_a_final_failure_not_an_error(tmp_path, monkeypatch):

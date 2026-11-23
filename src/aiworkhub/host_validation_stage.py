@@ -84,9 +84,10 @@ RUNNING_FILE = "running.lock"
 MARKER_LOCK_FILE = "running.guard"
 # Guard only: no per-command scratch lives in the candidate tree any more.
 HOST_SCRATCH_DIR = ".aiwh-host-stage"
-# Per-command pytest basetemp and fallback HOME: under the stage directory
-# (``stage_dir(...) / HOST_STAGE_SCRATCH``), never inside the candidate tree.
-HOST_STAGE_SCRATCH = "scratch"
+# Per-command pytest basetemp and fallback HOME: the repository's neutral temp
+# area, ``<repo>/.aiworkhub/temp/host_stage/<request_id>`` (``neutral_scratch_root``),
+# never inside the candidate tree or ``.aiworkhub/runtime``.
+HOST_STAGE_SCRATCH = "host_stage"
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _DRIVE = re.compile(r"^[A-Za-z]:")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -1026,6 +1027,18 @@ def stage_dir(repo_root: str | os.PathLike[str], request_id: str) -> Path:
     return Path(repo_root) / ".aiworkhub" / "runtime" / "host_stage" / request_id
 
 
+def neutral_scratch_root(repo_root: str | os.PathLike[str], request_id: str) -> Path:
+    """The stage's per-command scratch: ``<repo>/.aiworkhub/temp/host_stage/<request_id>``.
+
+    The repository's neutral temp area, never under ``.aiworkhub/runtime`` and
+    never inside a candidate tree, so a test's own AIWORKHUB_WORKTREE_ROOT is
+    not a foreign worktree root (NF-2026-02394). Removed by the stage.
+    """
+    if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
+        raise HostStageError("host_stage_request_id_invalid")
+    return Path(repo_root) / ".aiworkhub" / "temp" / HOST_STAGE_SCRATCH / request_id
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}")
@@ -1222,6 +1235,7 @@ def run_host_stage(
     try:
         return _run_host_stage_claimed(
             directory=directory,
+            scratch_root=neutral_scratch_root(repo_root, request_id),
             request_id=request_id,
             task_id=task_id,
             spec=spec,
@@ -1243,6 +1257,7 @@ def run_host_stage(
 def _run_host_stage_claimed(
     *,
     directory: Path,
+    scratch_root: Path,
     request_id: str,
     task_id: str,
     spec: HostStageSpec,
@@ -1341,9 +1356,10 @@ def _run_host_stage_claimed(
         result["state"] = "error"
         result["error"] = f"{type(exc).__name__}:{exc}"[:500]
     result["finished_at"] = _now()
-    # The per-command scratch and fallback HOME live under the stage directory,
-    # outside the candidate tree; the stage owns their removal.
-    shutil.rmtree(directory / HOST_STAGE_SCRATCH, ignore_errors=True)
+    # The per-command scratch and fallback HOME live in the repository's neutral
+    # temp area (``neutral_scratch_root``), outside the candidate tree and the
+    # runtime; the stage owns their removal.
+    shutil.rmtree(scratch_root, ignore_errors=True)
     _write_json(directory / RESULT_FILE, result)
     return result
 
@@ -1369,7 +1385,7 @@ def workspace_tree_ops(
             record=record,
             changed=lambda: list(ww.changed_paths(tree)),
             cleanup=lambda: ww.cleanup_workspace(tree.repo, tree.path, tree.home),
-            runner=host_runner(tree, state_dir / HOST_STAGE_SCRATCH),
+            runner=host_runner(tree, neutral_scratch_root(workspace.repo, state_dir.name)),
         )
 
     def discard(state: Mapping[str, Any]) -> str | None:
