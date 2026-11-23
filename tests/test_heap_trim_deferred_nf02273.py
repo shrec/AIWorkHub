@@ -253,6 +253,11 @@ class _RecordingStream(io.BytesIO):
         return super().write(data)
 
 
+def _leaked_threads(before: set[threading.Thread]) -> list[threading.Thread]:
+    """Threads started after ``before`` was taken that are still alive (identity, not a count)."""
+    return [thread for thread in threading.enumerate() if thread not in before and thread.is_alive()]
+
+
 def test_dashboard_reader_trims_synchronously_after_each_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     monkeypatch.setattr(dashboard_reader, "drain_deferred_work", lambda: events.append("drain"))
@@ -266,13 +271,14 @@ def test_dashboard_reader_trims_synchronously_after_each_reply(monkeypatch: pyte
 
     monkeypatch.setattr(platform_io, "trim_process_heap", trim)
     monkeypatch.setattr(platform_io, "schedule_heap_trim", no_schedule)
-    threads_before = threading.active_count()
+    threads_before = set(threading.enumerate())
     stdout = _RecordingStream(events)
     code = dashboard_reader._serve_loop(io.BytesIO(b"{bad\n\n[1]\n"), stdout, {})
     assert code == 0
     assert events == ["write", "drain", "trim", "write", "drain", "trim"]
     assert len(stdout.getvalue().splitlines()) == 2
-    assert threading.active_count() == threads_before
+    leaked = _leaked_threads(threads_before)
+    assert leaked == [], leaked
 
 
 _CHILD = r"""

@@ -213,6 +213,46 @@ class _TimedStream(io.RawIOBase):
         return len(data)
 
 
+def _leaked_threads(before: set[threading.Thread]) -> list[threading.Thread]:
+    """Threads started after ``before`` was taken that are still alive.
+
+    Identity-based, not ``threading.active_count()``: a foreign thread (an
+    earlier test's worker, a pytest/interpreter helper) exiting or starting
+    outside the measured code never changes the result.
+    """
+    return [thread for thread in threading.enumerate() if thread not in before and thread.is_alive()]
+
+
+def test_leak_check_ignores_a_foreign_thread_exiting_and_still_catches_a_real_leak() -> None:
+    release_foreign = threading.Event()
+    foreign = threading.Thread(target=release_foreign.wait, args=(10.0,), daemon=True)
+    foreign.start()
+    try:
+        before = set(threading.enumerate())
+        assert foreign in before
+        # The foreign thread exits inside the measured window: the process
+        # thread count drops, yet nothing started in the window is alive.
+        release_foreign.set()
+        foreign.join(10.0)
+        assert not foreign.is_alive()
+        leaked = _leaked_threads(before)
+        assert leaked == [], leaked
+
+        # A thread started inside the window that stays alive is a real leak.
+        release_leak = threading.Event()
+        leak = threading.Thread(target=release_leak.wait, args=(10.0,), daemon=True)
+        leak.start()
+        try:
+            assert _leaked_threads(before) == [leak]
+        finally:
+            release_leak.set()
+            leak.join(10.0)
+        assert _leaked_threads(before) == []
+    finally:
+        release_foreign.set()
+        foreign.join(10.0)
+
+
 def test_serve_answers_the_next_request_while_the_probe_child_runs(
     reader_repo: Path, tmp_path: Path
 ) -> None:
@@ -223,10 +263,11 @@ def test_serve_answers_the_next_request_while_the_probe_child_runs(
         json.dumps({"id": index, "tool": "probe"}).encode("utf-8") + b"\n" for index in (1, 2)
     )
     stdout = _TimedStream()
-    threads_before = threading.active_count()
+    threads_before = set(threading.enumerate())
     started = time.monotonic()
     assert dashboard_reader.serve(io.BytesIO(requests), stdout, tools) == 0  # type: ignore[arg-type]
-    assert threading.active_count() == threads_before
+    leaked = _leaked_threads(threads_before)
+    assert leaked == [], leaked
     assert [reply["id"] for _, reply in stdout.lines] == [1, 2]
     (_, first), (second_at, second) = stdout.lines
     # The drain after reply 1 started the child; reply 2 came while it ran,

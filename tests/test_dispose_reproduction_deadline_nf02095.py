@@ -507,6 +507,11 @@ def _waiters() -> int:
         return sum(run.waiters for run in registry._running.values())
 
 
+def _leaked_threads(before: set[threading.Thread]) -> list[threading.Thread]:
+    """Threads started after ``before`` was taken that are still alive (identity, not a count)."""
+    return [thread for thread in threading.enumerate() if thread not in before and thread.is_alive()]
+
+
 def test_past_the_run_cap_with_abandoned_runs_no_new_run_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -518,14 +523,15 @@ def test_past_the_run_cap_with_abandoned_runs_no_new_run_starts(
         for finding in ("finding-1", "finding-2"):
             _assert_deadline_receipt(_call(reproduce, finding), finding)
         assert fr._DISPOSE_RUNS.abandoned_count() == 2
-        threads_before = threading.active_count()
+        threads_before = set(threading.enumerate())
         began = time.monotonic()
         capped = _call(reproduce, "finding-3")
         # Answered at once, with no thread, no target resolution, no run.
         assert time.monotonic() - began < DEADLINE / 2
         _assert_deadline_receipt(capped, "finding-3")
         # An earlier test's finished worker may still exit; none may start.
-        assert threading.active_count() <= threads_before
+        leaked = _leaked_threads(threads_before)
+        assert leaked == [], leaked
         assert fr._DISPOSE_RUNS.started == 2 and sandbox.resolved == 2
         assert calls == ["reviewer:correctness:finding-1", "reviewer:correctness:finding-2"]
     finally:
