@@ -2002,7 +2002,10 @@ def test_validation_replay_binds_exact_reviewer_transport_event(
             task_id,
             feedback_reason="rerun retained validation",
             validation_only_replay=True,
-        ) == (False, "validation_only_replay_candidate_invalid")
+        ) == (
+            False,
+            "validation_only_replay_candidate_invalid:read_failed:src/result.py",
+        )
         blocked_card = _get_card(repo, task_id)
         assert blocked_card["status"] == "blocked"
         assert "validation_only_replay_authorization" not in blocked_card

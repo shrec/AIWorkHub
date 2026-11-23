@@ -6935,14 +6935,56 @@ def record_allowed_writes_amendment(
 
 
 def _candidate_path_in_scope(path: object, allowed_writes: Sequence[object]) -> bool:
+    # Membership reuses _write_path_touches: an exact entry or a directory
+    # entry ("src/") covers the path.  A shape-valid path never ends in "/",
+    # so only the entry-side directory prefix can match.
     return (
         isinstance(path, str)
         and bool(path)
         and not path.startswith("/")
         and "\\" not in path
         and not any(part in {"", ".", ".."} for part in path.split("/"))
-        and path in allowed_writes
+        and any(
+            isinstance(entry, str) and _write_path_touches(entry, path)
+            for entry in allowed_writes
+        )
     )
+
+
+def _replay_path_has_symlink_parent(
+    resolved_workspace: Path, parts: Sequence[str]
+) -> bool:
+    """True when any parent directory of ``parts`` under the workspace is a symlink."""
+    return any(
+        resolved_workspace.joinpath(*parts[:index]).is_symlink()
+        for index in range(1, len(parts))
+    )
+
+
+def _replay_sealed_absent_refusal(
+    resolved_workspace: Path, candidate: Path, shown: str
+) -> str | None:
+    """Refusal for a path sealed as deleted (None hash); None while it stays absent.
+
+    ``Path.is_symlink`` misses NTFS directory junctions, so the candidate's
+    parent is resolved and must stay inside the workspace before the
+    unresolved path is probed, mirroring the containment the hashed branch
+    applies to the resolved candidate.
+    """
+    prefix = "validation_only_replay_candidate_invalid:"
+    try:
+        parent_resolved = candidate.parent.resolve(strict=False)
+    except OSError:
+        return f"{prefix}unreadable:{shown}"
+    if not parent_resolved.is_relative_to(resolved_workspace):
+        return f"{prefix}parent_outside_workspace:{shown}"
+    try:
+        candidate.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return f"{prefix}unreadable:{shown}"
+    return f"{prefix}present_expected_absent:{shown}"
 
 
 def _recorded_baseline_hash(recorded_baseline: object) -> str | None:
@@ -8626,7 +8668,13 @@ def recover_blocked_rework(
                             **carried_hashes,
                             **predecessor_changed_path_hashes,
                         }
+                        # NF-2026-02380: every refusal names the failing rule
+                        # and path.  A None hash is a path sealed as deleted
+                        # (process_launcher_acceptance.changed_path_hashes);
+                        # it must still be absent.  Candidate rules read as
+                        # <observed>_expected_<sealed>.
                         for raw_path, expected_hash in lineage_hashes.items():
+                            shown = str(raw_path)[:300]
                             if (
                                 not isinstance(raw_path, str)
                                 or not raw_path
@@ -8636,24 +8684,63 @@ def recover_blocked_rework(
                                     part in {"", ".", ".."}
                                     for part in raw_path.split("/")
                                 )
-                                or raw_path not in allowed_writes
-                                or not isinstance(expected_hash, str)
+                            ):
+                                return (
+                                    False,
+                                    "validation_only_replay_manifest_invalid:"
+                                    f"key_shape:{shown}",
+                                )
+                            if not _candidate_path_in_scope(raw_path, allowed_writes):
+                                return (
+                                    False,
+                                    "validation_only_replay_manifest_invalid:"
+                                    f"not_in_allowed_writes:{shown}",
+                                )
+                            if expected_hash is not None and (
+                                not isinstance(expected_hash, str)
                                 or len(expected_hash) != 64
                                 or any(
                                     ch not in "0123456789abcdef"
                                     for ch in expected_hash
                                 )
                             ):
-                                return False, "validation_only_replay_manifest_invalid"
-                            candidate = resolved_workspace.joinpath(
-                                *raw_path.split("/")
-                            )
+                                return (
+                                    False,
+                                    "validation_only_replay_manifest_invalid:"
+                                    f"hash_shape:{shown}",
+                                )
+                            path_parts = raw_path.split("/")
+                            if _replay_path_has_symlink_parent(
+                                resolved_workspace, path_parts
+                            ):
+                                return (
+                                    False,
+                                    "validation_only_replay_candidate_invalid:"
+                                    f"symlink_parent:{shown}",
+                                )
+                            candidate = resolved_workspace.joinpath(*path_parts)
+                            if expected_hash is None:
+                                absent_refusal = _replay_sealed_absent_refusal(
+                                    resolved_workspace, candidate, shown
+                                )
+                                if absent_refusal is not None:
+                                    return False, absent_refusal
+                                continue
                             try:
                                 candidate_stat = candidate.lstat()
                                 resolved_candidate = candidate.resolve(strict=True)
-                                candidate_bytes = candidate.read_bytes()
+                            except FileNotFoundError:
+                                return (
+                                    False,
+                                    "validation_only_replay_candidate_invalid:"
+                                    f"absent_expected_present:{shown}",
+                                )
                             except OSError:
-                                return False, "validation_only_replay_candidate_invalid"
+                                return (
+                                    False,
+                                    "validation_only_replay_candidate_invalid:"
+                                    f"unreadable:{shown}",
+                                )
                             if (
                                 candidate.is_symlink()
                                 or not candidate.is_file()
@@ -8661,19 +8748,29 @@ def recover_blocked_rework(
                                 or not resolved_candidate.is_relative_to(
                                     resolved_workspace
                                 )
-                                or any(
-                                    resolved_workspace.joinpath(
-                                        *raw_path.split("/")[:index]
-                                    ).is_symlink()
-                                    for index in range(1, len(raw_path.split("/")))
-                                )
                             ):
-                                return False, "validation_only_replay_candidate_invalid"
+                                return (
+                                    False,
+                                    "validation_only_replay_candidate_invalid:"
+                                    f"not_regular_file:{shown}",
+                                )
+                            try:
+                                candidate_bytes = candidate.read_bytes()
+                            except OSError:
+                                return (
+                                    False,
+                                    "validation_only_replay_candidate_invalid:"
+                                    f"read_failed:{shown}",
+                                )
                             if (
                                 hashlib.sha256(candidate_bytes).hexdigest()
                                 != expected_hash
                             ):
-                                return False, "validation_only_replay_hash_mismatch"
+                                return (
+                                    False,
+                                    "validation_only_replay_hash_mismatch:"
+                                    f"hash_mismatch:{shown}",
+                                )
                         predecessor_changed_path_hashes = lineage_hashes
                         predecessor["changed_path_hashes"] = dict(lineage_hashes)
                         predecessor["changed_paths"] = list(lineage_hashes)
@@ -9025,41 +9122,83 @@ def recover_blocked_rework(
                 )
             ):
                 return False, "validation_only_replay_workspace_invalid"
+            # NF-2026-02380: same rules as the sealed-lineage loop above.
             for raw_path, expected_hash in predecessor_hashes.items():
+                shown = str(raw_path)[:300]
                 if (
                     not isinstance(raw_path, str)
                     or not raw_path
                     or raw_path.startswith("/")
                     or "\\" in raw_path
                     or any(part in {"", ".", ".."} for part in raw_path.split("/"))
-                    or not isinstance(expected_hash, str)
+                ):
+                    return (
+                        False,
+                        f"validation_only_replay_manifest_invalid:key_shape:{shown}",
+                    )
+                if expected_hash is not None and (
+                    not isinstance(expected_hash, str)
                     or len(expected_hash) != 64
                     or any(ch not in "0123456789abcdef" for ch in expected_hash)
                 ):
-                    return False, "validation_only_replay_manifest_invalid"
-                candidate = resolved_workspace.joinpath(*raw_path.split("/"))
+                    return (
+                        False,
+                        f"validation_only_replay_manifest_invalid:hash_shape:{shown}",
+                    )
+                path_parts = raw_path.split("/")
+                if _replay_path_has_symlink_parent(resolved_workspace, path_parts):
+                    return (
+                        False,
+                        "validation_only_replay_candidate_invalid:"
+                        f"symlink_parent:{shown}",
+                    )
+                candidate = resolved_workspace.joinpath(*path_parts)
+                if expected_hash is None:
+                    absent_refusal = _replay_sealed_absent_refusal(
+                        resolved_workspace, candidate, shown
+                    )
+                    if absent_refusal is not None:
+                        return False, absent_refusal
+                    continue
                 try:
                     candidate_stat = candidate.lstat()
                     resolved_candidate = candidate.resolve(strict=True)
+                except FileNotFoundError:
+                    return (
+                        False,
+                        "validation_only_replay_candidate_invalid:"
+                        f"absent_expected_present:{shown}",
+                    )
                 except OSError:
-                    return False, "validation_only_replay_candidate_invalid"
+                    return (
+                        False,
+                        "validation_only_replay_candidate_invalid:"
+                        f"unreadable:{shown}",
+                    )
                 if (
                     candidate.is_symlink()
                     or not candidate.is_file()
                     or candidate_stat.st_nlink != 1
                     or not resolved_candidate.is_relative_to(resolved_workspace)
-                    or any(
-                        resolved_workspace.joinpath(*raw_path.split("/")[:index]).is_symlink()
-                        for index in range(1, len(raw_path.split("/")))
-                    )
                 ):
-                    return False, "validation_only_replay_candidate_invalid"
+                    return (
+                        False,
+                        "validation_only_replay_candidate_invalid:"
+                        f"not_regular_file:{shown}",
+                    )
                 try:
                     candidate_bytes = candidate.read_bytes()
                 except OSError:
-                    return False, "validation_only_replay_candidate_invalid"
+                    return (
+                        False,
+                        "validation_only_replay_candidate_invalid:"
+                        f"read_failed:{shown}",
+                    )
                 if hashlib.sha256(candidate_bytes).hexdigest() != expected_hash:
-                    return False, "validation_only_replay_hash_mismatch"
+                    return (
+                        False,
+                        f"validation_only_replay_hash_mismatch:hash_mismatch:{shown}",
+                    )
 
             terminal_row = None
             for candidate_row in terminal_rows:

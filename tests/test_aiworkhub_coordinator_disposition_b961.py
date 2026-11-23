@@ -2382,6 +2382,373 @@ def test_recover_blocked_rework_validation_only_replay_persists_authorization(tm
     assert "authorized_at" in auth
 
 
+# NF-2026-02380: process_launcher_acceptance.changed_path_hashes seals a
+# deleted path as None.  Both replay manifest loops accept it while the path
+# stays absent, and every refusal names its rule and path.
+
+
+def _direct_replay_with_hashes(root, task_id, request_id, files, hashes):
+    workspace = _configured_retained_workspace(
+        root, task_id, request_id, list(hashes)
+    )
+    for relative, content in files.items():
+        target = Path(workspace["path"], *relative.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    _make_blocked_rework_task_with_terminal_review(
+        root,
+        task_id=task_id,
+        request_id=request_id,
+        changed_path_hashes=hashes,
+    )
+    _bind_blocked_reviewer_transport(root, task_id, request_id, workspace, hashes)
+    return task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="replay sealed deletion",
+        validation_only_replay=True,
+    )
+
+
+_KEPT_PATH = "src/example.py"
+_KEPT_CONTENT = b"kept predecessor\n"
+_KEPT_HASH = hashlib.sha256(_KEPT_CONTENT).hexdigest()
+_DELETED_PATH = "src/deleted.py"
+
+
+@pytest.mark.parametrize(
+    ("files", "hashes", "expected"),
+    [
+        (
+            {_KEPT_PATH: _KEPT_CONTENT},
+            {_KEPT_PATH: _KEPT_HASH, _DELETED_PATH: None},
+            (True, "recovered"),
+        ),
+        (
+            {_KEPT_PATH: _KEPT_CONTENT, _DELETED_PATH: b"reappeared\n"},
+            {_KEPT_PATH: _KEPT_HASH, _DELETED_PATH: None},
+            (
+                False,
+                "validation_only_replay_candidate_invalid:"
+                f"present_expected_absent:{_DELETED_PATH}",
+            ),
+        ),
+        (
+            {_KEPT_PATH: _KEPT_CONTENT},
+            {_KEPT_PATH: "Z" * 64},
+            (
+                False,
+                "validation_only_replay_manifest_invalid:"
+                f"hash_shape:{_KEPT_PATH}",
+            ),
+        ),
+    ],
+    ids=["deleted_absent_replays", "deleted_present_refuses", "malformed_hash"],
+)
+def test_validation_only_replay_direct_predecessor_sealed_deletion(
+    tmp_path, files, hashes, expected
+):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    request_id = "e" * 32
+    task_id = "nf-02380-direct-sealed-deletion"
+    try:
+        result = _direct_replay_with_hashes(
+            root, task_id, request_id, files, hashes
+        )
+        assert result == expected
+        card = task_store.get_task(root, task_id)
+        assert card["status"] == ("pending" if expected[0] else "blocked")
+    finally:
+        _remove_configured_request(root, request_id)
+
+
+def _lineage_replay_with_predecessor(
+    root,
+    predecessor_hashes,
+    files,
+    allowed_writes=("a.py", "b.py"),
+    before_replay=None,
+):
+    first_request = "a" * 32
+    second_request = "b" * 32
+    first_content = b"first generation\n"
+    first_hash = hashlib.sha256(first_content).hexdigest()
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root,
+        request_id=first_request,
+        changed_path_hashes={"a.py": first_hash},
+        terminal_failure=True,
+    )
+    assert task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="run validation",
+        validation_only_replay=True,
+    ) == (True, "recovered")
+    card = task_store.get_task(root, task_id)
+    assert card is not None
+    card.pop("validation_only_replay_authorization")
+    card["claim_epoch"] = 3
+    workspace = _configured_retained_workspace(
+        root, task_id, second_request, list(allowed_writes)
+    )
+    Path(workspace["path"], "a.py").write_bytes(first_content)
+    for relative, content in files.items():
+        target = Path(workspace["path"], *relative.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    if before_replay is not None:
+        before_replay(Path(workspace["path"]))
+    card["allowed_writes"] = list(allowed_writes)
+    card["rework_predecessor"] = {
+        "schema_id": "aiworkhub.rework_predecessor.v1",
+        "request_id": second_request,
+        "task_id": task_id,
+        "claim_epoch": 3,
+        "allowed_writes": list(allowed_writes),
+        "changed_path_hashes": predecessor_hashes,
+        "workspace": workspace,
+    }
+    card["operational_blocker"] = {
+        "kind": "launch_blocked",
+        "reason": "validation_only_replay_predecessor_mismatch",
+    }
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                task_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        result = task_store.recover_blocked_rework(
+            root,
+            task_id,
+            actor="coordinator",
+            feedback_reason="replay sealed lineage",
+            validation_only_replay=True,
+        )
+        return task_id, first_hash, result
+    finally:
+        _remove_configured_request(root, second_request)
+
+
+def test_validation_only_replay_lineage_accepts_sealed_deleted_absent_path(
+    tmp_path,
+):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id, first_hash, result = _lineage_replay_with_predecessor(
+        root, {"b.py": None}, {}
+    )
+    assert result == (True, "recovered_validation_only_replay")
+    auth = task_store.get_task(root, task_id)["validation_only_replay_authorization"]
+    assert auth["changed_path_hashes"] == {"a.py": first_hash, "b.py": None}
+
+
+@pytest.mark.parametrize(
+    ("predecessor_hashes", "files", "expected_reason"),
+    [
+        (
+            {"b.py": None},
+            {"b.py": b"reappeared\n"},
+            "validation_only_replay_candidate_invalid:present_expected_absent:b.py",
+        ),
+        (
+            {"b.py": "Z" * 64},
+            {"b.py": b"second generation\n"},
+            "validation_only_replay_manifest_invalid:hash_shape:b.py",
+        ),
+        (
+            {"c.py": None},
+            {},
+            "validation_only_replay_manifest_invalid:not_in_allowed_writes:c.py",
+        ),
+    ],
+    ids=["deleted_present_refuses", "malformed_hash", "outside_allowed_writes"],
+)
+def test_validation_only_replay_lineage_refusal_names_rule_and_path(
+    tmp_path, predecessor_hashes, files, expected_reason
+):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    _task_id, _first_hash, result = _lineage_replay_with_predecessor(
+        root, predecessor_hashes, files
+    )
+    assert result == (False, expected_reason)
+
+
+def test_validation_only_replay_lineage_directory_allowed_writes_entry_replays(
+    tmp_path,
+):
+    # A directory entry ("src/") covers "src/example.py": the lineage loop
+    # uses _candidate_path_in_scope, not exact list membership.
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id, first_hash, result = _lineage_replay_with_predecessor(
+        root,
+        {_KEPT_PATH: _KEPT_HASH},
+        {_KEPT_PATH: _KEPT_CONTENT},
+        allowed_writes=("a.py", "src/"),
+    )
+    assert result == (True, "recovered_validation_only_replay")
+    auth = task_store.get_task(root, task_id)["validation_only_replay_authorization"]
+    assert auth["changed_path_hashes"] == {"a.py": first_hash, _KEPT_PATH: _KEPT_HASH}
+
+
+def _symlink_parent_to(outside: Path):
+    def link(workspace: Path) -> None:
+        outside.mkdir(parents=True, exist_ok=True)
+        try:
+            (workspace / "src").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+
+    return link
+
+
+def test_validation_only_replay_lineage_sealed_deletion_symlink_parent_refuses(
+    tmp_path,
+):
+    # The absent target sits outside the workspace behind a symlinked parent;
+    # the absence check must not look through it.
+    root = tmp_path / "repo"
+    root.mkdir()
+    task_store.initialize_repository(root)
+    _task_id, _first_hash, result = _lineage_replay_with_predecessor(
+        root,
+        {_DELETED_PATH: None},
+        {},
+        allowed_writes=("a.py", "src/"),
+        before_replay=_symlink_parent_to(tmp_path / "outside"),
+    )
+    assert result == (
+        False,
+        f"validation_only_replay_candidate_invalid:symlink_parent:{_DELETED_PATH}",
+    )
+
+
+def test_validation_only_replay_direct_sealed_deletion_symlink_parent_refuses(
+    tmp_path,
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    task_store.initialize_repository(root)
+    request_id = "e" * 32
+    task_id = "nf-02380-direct-symlink-parent"
+    workspace = worker_workspace.configured_worktree_root(root) / request_id / "worktree"
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        _symlink_parent_to(tmp_path / "outside")(workspace)
+        result = _direct_replay_with_hashes(
+            root,
+            task_id,
+            request_id,
+            {"kept.py": _KEPT_CONTENT},
+            {"kept.py": _KEPT_HASH, _DELETED_PATH: None},
+        )
+        assert result == (
+            False,
+            f"validation_only_replay_candidate_invalid:symlink_parent:{_DELETED_PATH}",
+        )
+        assert task_store.get_task(root, task_id)["status"] == "blocked"
+    finally:
+        _remove_configured_request(root, request_id)
+
+
+_JUNCTION_DELETED_PATH = "junctioned/deleted.py"
+
+
+def _resolve_parent_outside(monkeypatch, outside: Path) -> None:
+    # Path.is_symlink is False for an NTFS directory junction, so simulate one
+    # by resolving the deleted path's parent outside the workspace.
+    original_resolve = Path.resolve
+
+    def resolve(self, strict=False):
+        if self.name == "junctioned":
+            return outside
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+
+def test_validation_only_replay_lineage_sealed_deletion_junction_parent_refuses(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    task_store.initialize_repository(root)
+    _resolve_parent_outside(monkeypatch, tmp_path / "outside")
+    _task_id, _first_hash, result = _lineage_replay_with_predecessor(
+        root,
+        {_JUNCTION_DELETED_PATH: None},
+        {},
+        allowed_writes=("a.py", "junctioned/"),
+    )
+    assert result == (
+        False,
+        "validation_only_replay_candidate_invalid:"
+        f"parent_outside_workspace:{_JUNCTION_DELETED_PATH}",
+    )
+
+
+def test_validation_only_replay_direct_sealed_deletion_junction_parent_refuses(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    task_store.initialize_repository(root)
+    request_id = "e" * 32
+    task_id = "nf-02380-direct-junction-parent"
+    _resolve_parent_outside(monkeypatch, tmp_path / "outside")
+    try:
+        result = _direct_replay_with_hashes(
+            root,
+            task_id,
+            request_id,
+            {"kept.py": _KEPT_CONTENT},
+            {"kept.py": _KEPT_HASH, _JUNCTION_DELETED_PATH: None},
+        )
+        assert result == (
+            False,
+            "validation_only_replay_candidate_invalid:"
+            f"parent_outside_workspace:{_JUNCTION_DELETED_PATH}",
+        )
+        assert task_store.get_task(root, task_id)["status"] == "blocked"
+    finally:
+        _remove_configured_request(root, request_id)
+
+
+@pytest.mark.parametrize(
+    ("path", "allowed_writes", "expected"),
+    [
+        ("src/x.py", ["src/x.py"], True),
+        ("src/x.py", ["src/"], True),
+        ("src/x.py", ["src"], False),
+        ("src/x.py", ["src/*.py"], False),
+        ("src/x.py", [None, 7, Path("src/x.py")], False),
+    ],
+    ids=["exact", "directory_entry", "bare_dir_name", "glob_entry", "non_str_entry"],
+)
+def test_candidate_path_in_scope_matches_exact_and_directory_entries_only(
+    path, allowed_writes, expected
+):
+    assert task_store._candidate_path_in_scope(path, allowed_writes) is expected
+
+
 def test_pending_rework_rebinds_validation_only_replay_to_latest_episode(tmp_path):
     root = tmp_path
     task_store.initialize_repository(root)
@@ -2655,7 +3022,10 @@ def test_pending_replay_recovery_preserves_authenticated_lineage(
         actor=core.CODEX_RUNNER,
         feedback_reason="must fail closed",
         validation_only_replay=True,
-    ) == (False, "validation_only_replay_hash_mismatch")
+    ) == (
+        False,
+        f"validation_only_replay_hash_mismatch:hash_mismatch:{paths[0]}",
+    )
     _remove_configured_request(root, latest_request)
 
 

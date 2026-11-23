@@ -50,3 +50,35 @@ def test_the_other_bindings_still_apply_to_a_claude_grant() -> None:
         validation_only_replay_authorization(card, "T1")
     with pytest.raises(ValueError, match="validation_only_replay_task_mismatch"):
         validation_only_replay_authorization(_card(core.CLAUDE_MANAGER_RUNNER), "T2")
+
+
+def _card_with_hashes(hashes: dict) -> dict:
+    card = _card(core.CLAUDE_MANAGER_RUNNER)
+    card["rework_predecessor"]["changed_path_hashes"] = dict(hashes)
+    card["validation_only_replay_authorization"]["changed_path_hashes"] = dict(hashes)
+    return card
+
+
+def test_a_sealed_deleted_none_digest_is_authorized() -> None:
+    # NF-2026-02380: a None digest is a path sealed as deleted; the task store
+    # verifies it is still absent, so the launch guard must let it through.
+    hashes = {"src/a.py": "0" * 64, "src/deleted.py": None}
+    grant = validation_only_replay_authorization(_card_with_hashes(hashes), "T1")
+    assert grant is not None and grant["changed_path_hashes"] == hashes
+
+
+@pytest.mark.parametrize(
+    "hashes",
+    [
+        {"src/a.py": "abc"},
+        {"src/a.py": "g" * 64},
+        {"src/a.py": "A" * 64},
+        {"src/a.py": 0},
+        {"": None},
+        {"   ": None},
+    ],
+    ids=["short", "non_hex", "upper_hex", "non_str", "empty_path", "blank_path"],
+)
+def test_malformed_digest_or_empty_path_still_refuses(hashes: dict) -> None:
+    with pytest.raises(ValueError, match="validation_only_replay_hash_manifest_invalid"):
+        validation_only_replay_authorization(_card_with_hashes(hashes), "T1")

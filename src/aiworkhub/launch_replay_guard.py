@@ -152,11 +152,19 @@ def validation_only_replay_authorization(
         or authorized_hashes != predecessor_hashes
     ):
         raise ValueError("validation_only_replay_hash_manifest_mismatch")
+    # A None digest means the predecessor sealed the path as deleted
+    # (process_launcher_acceptance.changed_path_hashes); the task store
+    # requires it to still be absent before the replay finalizes.
     if not all(
         isinstance(path, str)
         and path.strip()
-        and isinstance(digest, str)
-        and re.fullmatch(r"[a-f0-9]{64}", digest)
+        and (
+            digest is None
+            or (
+                isinstance(digest, str)
+                and re.fullmatch(r"[a-f0-9]{64}", digest) is not None
+            )
+        )
         for path, digest in authorized_hashes.items()
     ):
         raise ValueError("validation_only_replay_hash_manifest_invalid")
