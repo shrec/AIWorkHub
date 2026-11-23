@@ -94,10 +94,11 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.9
+## What's new in 0.13.10
 
-- Linux: the bundled AIWorkHub server no longer grows to gigabytes of memory, and worker sessions inside the bubblewrap sandbox get their AIWorkHub tools again.
-- Includes the Manager Chat and Dashboard fixes of 0.13.6–0.13.8, which were tagged but not published because Linux CI failed; 0.13.9 fixes that.
+- Linux: the bundled server no longer peaks at gigabytes under review traffic; the 0.13.9 memory fix covered only part of it.
+- Reviewers read new, large and unindexed files; a worker still producing output is never killed by the deadline; the Manager Chat Claude seat can close review callbacks; the dashboard's first snapshot appears sooner.
+- Includes all of 0.13.9, which was cut but not published.
 
 ## Get started
 

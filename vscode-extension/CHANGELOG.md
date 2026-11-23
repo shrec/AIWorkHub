@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.13.10 — 2026-11-23
+
+### Fixed
+
+- Bundles runtime 0.13.10: on Linux the MCP server no longer peaks at 5–6.9 GB under review traffic (card evidence stops storing the full-repository tree baseline and card scans stream rows); reviewers read new, large and unindexed files; a worker still producing output is never killed by the deadline; the Manager Chat Claude seat gets the manager tools it needs to close review callbacks. Includes all of 0.13.9, which was cut but not published.
+- Dashboard: the first snapshot appears sooner — the reader reuses unchanged cost and history series, never waits on CLI readiness probes, resumes transcript usage from its cache and shares the in-flight launch preflight; a late snapshot reply after a timeout is painted.
+
 ## 0.13.9 — 2026-11-22
 
 ### Fixed

@@ -6,6 +6,39 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.10] - 2026-11-23
+
+0.13.9 was cut but not published: on a long-running Linux host its MCP server still peaked at 5–6.9 GB under review traffic, and a set of review-chain and worker-supervisor defects measured on the same host were fixed first. 0.13.10 carries all of 0.13.9 plus these fixes.
+
+### Fixed
+
+- Linux server memory, correction: the 0.13.9 entry overstated its fix. Capping glibc arenas removed the per-thread arena growth, but accept/reject/reviewer bursts still drove the server to 5–6.9 GB. The remaining causes are fixed: card evidence, rework predecessors and events no longer persist the full-repository `tree_baseline` (existing rows are folded) (NF-2026-02350), and card-table scans stream rows instead of materializing every `card_json` at once (NF-2026-02351).
+- Reviewer packets byte-bound the `prior_review` section, so a packet no longer grows with every rework round (NF-2026-02353); `review_packet` honours `max_bytes` and `citation_drift` splits rows outside allowed_writes (NF-2026-02361); `agent_task_status(detail=summary)` folds every evidence body and Source Graph `diff` pages stay within their byte cap (NF-2026-02362).
+- Skill/recipe mining runs off the accept path and skips an unchanged result, so an accept reply no longer waits on it (NF-2026-02366).
+- Validation `pytest -n` is capped by the observed cores and available memory with headroom, never taken from argv unchecked (NF-2026-02369).
+- Windows: ctypes `Structure` classes are defined once at module scope; per-call classes leaked through the ctypes pointer-type cache (NF-2026-02348).
+- Reviewer candidate-overlay replies carry freshness for new, unindexed and large files, and large hunks are readable in pages, so a reviewer no longer returns `reviewer_could_not_inspect` on a big or new file (NF-2026-02356).
+- A reviewer successor route that cannot start falls back to a route that starts, instead of parking the lens.
+- A required reviewer lens counts only a reviewer that ran: a never-launched or failed reviewer is not coverage, and transient or credential failures relaunch on the same route (NF-2026-02277).
+- A queued reviewer re-checks that its target is still the current review request before it starts; a stale one finalizes as superseded, and a reject cancels queued reviewers (NF-2026-02357).
+- System quality reviewer cards are created without a live manager identity when they name a resolvable review target, so reconciler-driven reviewers stop failing with `manager_identity_required` (NF-2026-02372).
+- The review-ready quality gate inherits the canonical repository policy when a sparse candidate does not change it (NF-2026-02344).
+- `review_queue` lists every review card and names the real manager; `agent_task_status` never returns `state: null` (NF-2026-02358).
+- `reject_review(relaunch=true)` at the reject depth cap continues the capped card and launches its successor in the same call (NF-2026-02368).
+- The supervisor deadline is stall-gated: a worker still producing output is never killed by the wall clock; only a worker idle for the stall window past the deadline times out (NF-2026-02354).
+- A timeout or `worker_failed` terminal records the measured workspace delta and required-output presence, and the launch reply names the timeout policy (NF-2026-02373).
+- An admission-queued launch replies `ok: true` with its queue position and what it waits for, instead of reading as a failure (NF-2026-02367).
+- A worker's Source Graph sees its own new and untracked files and reads all repository source; writes stay limited to allowed_writes (NF-2026-02363).
+- An environment skip in a candidate-changed test file routes to the accept-time host stage instead of a deterministic lane replay (NF-2026-02374), and a canonical test that self-skips in the AppContainer lane no longer leaves a card permanently `validation_failed` (NF-2026-02371).
+- Linux validation sandbox: every landlock validation launch gets the `/dev/shm` SemLock rule (NF-2026-02355), and the full-snapshot validation lane works under Landlock, with a failure reason naming step, errno and path (NF-2026-02364).
+- Semantic edit apply preserves the edited file's permission bits even where chmod is forbidden (NF-2026-02365).
+- Manager Chat (claude_cli) serves the manager MCP profile, so the seat has bootstrap, Source Graph, session and review/accept/reject tools and can close review callbacks (NF-2026-02352).
+- Dashboard startup: a fresh reader does not recompute the cost ledger and history series when their inputs are unchanged (NF-2026-02346), never waits on Claude/Codex CLI readiness probes (NF-2026-02338), resumes transcript usage parsing from its cache (NF-2026-02142), reads only the payloads its decision and outcome queries use (NF-2026-02339), shares the in-flight Windows launch preflight (NF-2026-02340) and precompiles a new runtime generation beside the reader (NF-2026-02345).
+- Dashboard: the late reply of a timed-out no-retry full snapshot is painted instead of dropped (NF-2026-02349).
+- The SDLC attribution walk is bounded by the pass deadline and resumes across passes (NF-2026-02342).
+- `release_cut` narrows host tests on base-matching map digests instead of always falling back to the full suite (NF-2026-02335), and its narrowing base accepts only `vMAJOR.MINOR.PATCH` tags (NF-2026-02343).
+- Three load-flaky Windows host tests are deterministic (NF-2026-02337).
+
 ## [0.13.9] - 2026-11-22
 
 0.13.6, 0.13.7 and 0.13.8 were tagged but never published: GitHub's `ubuntu-latest` runner moved to Ubuntu 26.04, where bubblewrap is usable, so Linux CI switched from the landlock sandbox to bubblewrap and each release hit a different bubblewrap gap. 0.13.9 carries all of 0.13.6–0.13.8 plus these fixes.

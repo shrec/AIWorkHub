@@ -177,12 +177,14 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.9
+## What's new in 0.13.10
 
-- Linux: the AIWorkHub MCP server no longer grows to many gigabytes of memory. glibc kept every tool thread's freed memory in its own arena; the server now caps the arenas and trims the heap after each request (same load measured: about 100 MB instead of 1 GB).
-- Linux sandbox: worker sessions inside bubblewrap get their AIWorkHub tools again when Python lives in a venv or toolcache outside `/usr`.
-- Doctor: `aiworkhub_doctor_diagnose heap_census=true` attributes a large server process to Python objects, the C allocator or swap, and no longer freezes on a large heap.
-- 0.13.9 includes everything in 0.13.6, 0.13.7 and 0.13.8 (the Manager Chat and Dashboard fixes among them), which were tagged but not published because Linux CI failed on GitHub's Ubuntu 26.04 runner; 0.13.9 fixes those failures.
+- Linux memory: 0.13.9 removed the glibc thread-arena growth but overstated the result; under review traffic a long-running server still peaked at 5–6.9 GB. Card evidence no longer stores a full-repository tree baseline, and card scans stream rows instead of loading every card at once.
+- Review chain: reviewers read new, unindexed and large files (large hunks page); a reviewer route that cannot start falls back to one that can; a stale queued reviewer stops instead of running against a rejected round.
+- Workers: a worker still producing output is never killed by the wall-clock deadline, and a timeout records what the worker actually wrote.
+- Manager Chat: the Claude seat gets the full manager toolset and can close review callbacks.
+- Dashboard: the first snapshot appears sooner; the reader reuses unchanged series and no longer waits on CLI probes.
+- 0.13.10 includes everything in 0.13.9, which was cut but not published.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation
