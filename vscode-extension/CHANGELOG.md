@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.11 — 2026-11-23
+
+### Fixed
+
+- Bundles runtime 0.13.11, which carries all of 0.13.10 (tagged but not published after one Python 3.14 CI test failed) plus that test's fix.
+
 ## 0.13.10 — 2026-11-23
 
 ### Fixed

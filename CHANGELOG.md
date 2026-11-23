@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.11] - 2026-11-23
+
+0.13.10 was tagged but not published: its CI failed on Python 3.14 in a test that counted process-wide threads. 0.13.11 carries all of 0.13.10 (and 0.13.9) plus the fix below.
+
+### Fixed
+
+- Thread-leak tests compare the threads the measured call started, by identity, instead of `threading.active_count()`; an unrelated thread exiting during the call no longer fails them on Python 3.14 (NF-2026-02377).
+- The manager seat and the Source Graph self-check keep repository-wide read authority, so worker read scoping does not refuse their dot-path reads (NF-2026-02375).
+
 ## [0.13.10] - 2026-11-23
 
 0.13.9 was cut but not published: on a long-running Linux host its MCP server still peaked at 5–6.9 GB under review traffic, and a set of review-chain and worker-supervisor defects measured on the same host were fixed first. 0.13.10 carries all of 0.13.9 plus these fixes.
