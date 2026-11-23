@@ -32,7 +32,7 @@ from . import (
 )
 from . import accept_failure_cause
 from . import base_drift_proof as base_drift_proof_module
-from . import manager_route_probe
+from . import manager_console_identity, manager_route_probe
 from . import platform_io
 from . import repository_state
 from . import runtime_generation
@@ -377,26 +377,10 @@ def _codex_extension_route_manager_identity() -> dict[str, str] | None:
     callback-required tasks until a real thread UUID is persisted.
     """
 
-    window_id = os.environ.get("AIWORKHUB_WINDOW_ID", "").strip()
-    if not window_id:
+    bound = manager_console_identity.bound_window_route("codex")  # NF-2026-02393: one binding owner
+    if bound is None:
         return None
-    try:
-        root = repo_root()
-        readiness = task_store.storage_readiness(root)
-        if not readiness.ready or not readiness.repo_id:
-            return None
-        target = read_selected_coordinator_target(root)
-    except (OSError, RuntimeError, task_store.TaskStoreError, KeyError, TypeError, ValueError):
-        return None
-    if str(target.get("selected_provider") or "").strip().lower() != "codex":
-        return None
-    if str(target.get("repo_id") or "").strip() != str(readiness.repo_id):
-        return None
-    if str(target.get("window_id") or "").strip() != window_id:
-        return None
-    extension_host_pid = int(target.get("extension_host_pid") or 0)
-    if extension_host_pid <= 1 or not _pid_in_same_uid_ancestor_chain(extension_host_pid, max_depth=4):
-        return None
+    window_id, repo_id, target = bound
     codex_target = target.get("targets", {}).get("codex", {})
     if not isinstance(codex_target, dict):
         return None
@@ -408,7 +392,7 @@ def _codex_extension_route_manager_identity() -> dict[str, str] | None:
         return None
     thread_id = str(route.get("thread_id") or "").strip()
     session_id = str(route.get("session_id") or target.get("claim_episode") or window_id).strip()
-    if str(route.get("repo_id") or readiness.repo_id).strip() != str(readiness.repo_id):
+    if str(route.get("repo_id") or repo_id).strip() != repo_id:
         return None
     if str(route.get("window_id") or window_id).strip() != window_id:
         return None
@@ -849,8 +833,9 @@ def _manager_chat_seat_identity() -> dict[str, str] | None:
 
 
 def _live_manager_identity() -> dict[str, str] | None:
-    """This process's own route, seat first (NF-2026-01383): what bootstrap starts from."""
-    return _manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
+    """This process's own route, seat first (NF-2026-01383); the panel's console last (NF-2026-02393)."""
+    return (_manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
+            or manager_console_identity.verified_identity())
 
 
 def _manager_chat_route(chat: Mapping[str, str], previous: Mapping[str, Any] | None) -> dict[str, Any]:
