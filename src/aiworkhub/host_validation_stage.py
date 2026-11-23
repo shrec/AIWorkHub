@@ -38,6 +38,7 @@ import math
 import os
 import posixpath
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -81,8 +82,11 @@ TREE_FILE = "tree.json"
 RUNNING_FILE = "running.lock"
 # OS advisory lock serializing every judge-and-remove of RUNNING_FILE.
 MARKER_LOCK_FILE = "running.guard"
-# Per-command scratch (pytest basetemp) inside the tree; never a generated file.
+# Guard only: no per-command scratch lives in the candidate tree any more.
 HOST_SCRATCH_DIR = ".aiwh-host-stage"
+# Per-command pytest basetemp and fallback HOME: under the stage directory
+# (``stage_dir(...) / HOST_STAGE_SCRATCH``), never inside the candidate tree.
+HOST_STAGE_SCRATCH = "scratch"
 _REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _DRIVE = re.compile(r"^[A-Za-z]:")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -506,7 +510,9 @@ def run_argv(
     return row
 
 
-def validation_command(workspace: Any, argv: Sequence[str]) -> tuple[list[str], dict[str, str]]:
+def validation_command(
+    workspace: Any, argv: Sequence[str], scratch_root: Path
+) -> tuple[list[str], dict[str, str]]:
     """``(argv, env)`` for one host command exactly as the card validation lane builds it.
 
     Same owner helpers, same order as ``worker_workspace.run_validations``:
@@ -515,7 +521,7 @@ def validation_command(workspace: Any, argv: Sequence[str]) -> tuple[list[str], 
     the trusted pytest runtime root plus the candidate ``src`` and the tree
     itself on ``PYTHONPATH`` (absolute, rooted in ``workspace.path``), the
     trusted-executable resolver that injects ``-P``, a fresh pytest basetemp
-    inside the tree's own scratch, and the lane's ``sanitized_env("validation")``.
+    under ``scratch_root`` (the stage's scratch, outside the tree), and the lane's ``sanitized_env("validation")``.
     """
     from . import runtime_temp, worker_workspace as ww
 
@@ -525,7 +531,7 @@ def validation_command(workspace: Any, argv: Sequence[str]) -> tuple[list[str], 
     components: tuple[str, ...] = ()
     if is_pytest:
         components = (str(ww.resolve_trusted_pytest_runtime_root()),)
-        scratch = tree / HOST_SCRATCH_DIR / uuid.uuid4().hex[:12]
+        scratch = scratch_root / uuid.uuid4().hex[:12]
         scratch.mkdir(parents=True)
         tokens = runtime_temp.pytest_basetemp_argv(
             ww._normalize_pytest_validation_argv(tokens), scratch
@@ -541,7 +547,7 @@ def validation_command(workspace: Any, argv: Sequence[str]) -> tuple[list[str], 
     # ``os.environ``: no provider key, token or inherited PYTEST_ADDOPTS reaches
     # a host command. HOME is the tree's request HOME, else a private one in
     # the stage scratch (never reported as generated).
-    home = getattr(workspace, "home", None) or tree / HOST_SCRATCH_DIR / "home"
+    home = getattr(workspace, "home", None) or scratch_root / "home"
     env = ww.sanitized_env(
         "validation", home=Path(home), repo=Path(workspace.repo), isolated_task_queue_db=True
     )
@@ -559,12 +565,15 @@ def validation_command(workspace: Any, argv: Sequence[str]) -> tuple[list[str], 
     return tokens, env
 
 
-def host_runner(workspace: Any) -> Runner:
-    """The runner of one tree: lane-built argv/env, then :func:`run_argv`."""
+def host_runner(workspace: Any, scratch_root: Path) -> Runner:
+    """The runner of one tree: lane-built argv/env, then :func:`run_argv`.
+
+    ``scratch_root`` is the stage's own scratch, outside the candidate tree.
+    """
 
     def run(argv: Sequence[str], cwd: Path) -> Row:
         try:
-            built, env = validation_command(workspace, argv)
+            built, env = validation_command(workspace, argv, scratch_root)
         except Exception as exc:  # noqa: BLE001 -- a failed row naming the cause, never a pass
             return {
                 "argv": list(argv),
@@ -1332,6 +1341,9 @@ def _run_host_stage_claimed(
         result["state"] = "error"
         result["error"] = f"{type(exc).__name__}:{exc}"[:500]
     result["finished_at"] = _now()
+    # The per-command scratch and fallback HOME live under the stage directory,
+    # outside the candidate tree; the stage owns their removal.
+    shutil.rmtree(directory / HOST_STAGE_SCRATCH, ignore_errors=True)
     _write_json(directory / RESULT_FILE, result)
     return result
 
@@ -1357,7 +1369,7 @@ def workspace_tree_ops(
             record=record,
             changed=lambda: list(ww.changed_paths(tree)),
             cleanup=lambda: ww.cleanup_workspace(tree.repo, tree.path, tree.home),
-            runner=host_runner(tree),
+            runner=host_runner(tree, state_dir / HOST_STAGE_SCRATCH),
         )
 
     def discard(state: Mapping[str, Any]) -> str | None:

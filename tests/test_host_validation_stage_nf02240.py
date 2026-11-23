@@ -571,15 +571,16 @@ def test_a_pytest_host_command_runs_with_the_lane_interpreter_safe_path_and_tree
     )
     workspace = SimpleNamespace(path=tree, repo=tree)
     declared = ["pytest", "-q", "-p", "no:cacheprovider", "tests/test_probe.py"]
-    argv, env = hvs.validation_command(workspace, declared)
+    scratch_root = tmp_path / "stage" / "scratch"
+    argv, env = hvs.validation_command(workspace, declared, scratch_root)
     assert Path(argv[0]).is_absolute() and argv[1:4] == ["-P", "-m", "pytest"]
     (basetemp,) = [token for token in argv if token.startswith("--basetemp=")]
-    assert Path(basetemp.split("=", 1)[1]).parent.parent == tree / hvs.HOST_SCRATCH_DIR
+    assert Path(basetemp.split("=", 1)[1]).parent.parent == scratch_root
     assert str(tree) in env["PYTHONPATH"].split(os.pathsep)
     # ``-P`` binds only the lane interpreter; the env carries safe-path to
     # every interpreter the command spawns (xdist workers included).
     assert env["PYTHONSAFEPATH"] == "1"
-    row = hvs.host_runner(workspace)(declared, tree)
+    row = hvs.host_runner(workspace, scratch_root)(declared, tree)
     output = (row.get("stdout_tail") or "")[-1500:] + (row.get("stderr_tail") or "")[-800:]
     assert row["returncode"] == 0, output
     assert row["declared_argv"] == declared and row["argv"][1:4] == ["-P", "-m", "pytest"]
@@ -594,7 +595,7 @@ def test_a_lane_build_failure_is_a_failed_row_naming_its_cause(tmp_path, monkeyp
         raise worker_workspace.WorkspaceError("validation_environment:interpreter_missing")
 
     monkeypatch.setattr(worker_workspace, "_normalize_validation_interpreter_argv", refuse)
-    row = hvs.host_runner(SimpleNamespace(path=tmp_path, repo=tmp_path))(["git", "status"], tmp_path)
+    row = hvs.host_runner(SimpleNamespace(path=tmp_path, repo=tmp_path), tmp_path / "scratch")(["git", "status"], tmp_path)
     assert row["returncode"] is None and "interpreter_missing" in row["argv_error"]
     assert hvs._row_summary(row)["argv_error"] == row["argv_error"]
 
@@ -947,10 +948,61 @@ def test_the_host_env_is_the_lane_sanitized_env_not_the_hub_environment(tmp_path
     tree = tmp_path / "tree"
     tree.mkdir()
     workspace = SimpleNamespace(path=tree, repo=tree)
-    _argv, env = hvs.validation_command(workspace, ["pytest", "-q", "tests"])
+    scratch_root = tmp_path / "stage" / "scratch"
+    _argv, env = hvs.validation_command(workspace, ["pytest", "-q", "tests"], scratch_root)
     assert "ANTHROPIC_API_KEY" not in env and "PYTEST_ADDOPTS" not in env
-    assert Path(env["HOME"]) == (tree / hvs.HOST_SCRATCH_DIR / "home").resolve()
+    assert Path(env["HOME"]) == (scratch_root / "home").resolve()
     assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_pytest_scratch_and_fallback_home_stay_outside_the_candidate_tree(tmp_path, monkeypatch):
+    # NF-2026-02381: a candidate tree under a configured worktree root must not
+    # receive the pytest basetemp or the fallback HOME; both live in the stage.
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
+    tree = tmp_path / "worktrees" / "union2_probe" / "worktree"
+    tree.mkdir(parents=True)
+    scratch_root = tmp_path / "repo" / ".aiworkhub" / "runtime" / "host_stage" / REQUEST / "scratch"
+    workspace = SimpleNamespace(path=tree, repo=tree)
+    argv, env = hvs.validation_command(workspace, ["pytest", "-q", "tests"], scratch_root)
+    (basetemp,) = [token for token in argv if token.startswith("--basetemp=")]
+    basetemp_path = Path(basetemp.split("=", 1)[1]).resolve()
+    home = Path(env["HOME"]).resolve()
+    assert scratch_root.resolve() in basetemp_path.parents
+    assert home == (scratch_root / "home").resolve()
+    assert tree.resolve() not in basetemp_path.parents
+    assert tree.resolve() not in home.parents
+
+
+def test_the_stage_wires_its_scratch_into_each_tree_runner_and_removes_it(tmp_path, monkeypatch):
+    # NF-2026-02381: workspace_tree_ops hands each tree runner the stage
+    # directory's scratch, and a finished stage removes that scratch.
+    from aiworkhub import worker_workspace as ww
+    from aiworkhub import workspace_prepare
+
+    seen: list = []
+    monkeypatch.setattr(hvs, "host_runner", lambda _tree, root: seen.append(root) or _Runner())
+    tree = SimpleNamespace(repo=tmp_path, path=tmp_path / "cand", home=tmp_path / "home")
+    monkeypatch.setattr(ww, "create_combined_validation_workspace", lambda *_a, **_kw: (tree, {}))
+    monkeypatch.setattr(workspace_prepare, "prepare_once", lambda *_a, **_kw: "prepared")
+    directory = hvs.stage_dir(tmp_path, REQUEST)
+    ops = hvs.workspace_tree_ops(
+        SimpleNamespace(repo=tmp_path, base_oid="b" * 40), {}, [], state_dir=directory
+    )
+    ops.build_candidate()
+    assert seen == [directory / hvs.HOST_STAGE_SCRATCH]
+
+    candidate_root, _cand, _bases, runner, fake_ops, db = _setup(tmp_path)
+    leftover = directory / hvs.HOST_STAGE_SCRATCH / "home" / "left.txt"
+
+    def run(argv, cwd):
+        leftover.parent.mkdir(parents=True, exist_ok=True)
+        leftover.write_text("x")
+        return runner(argv, cwd)
+
+    spec = _spec({"host_commands": [["git", "diff", "--check"]]})
+    result = _run(tmp_path, spec, fake_ops, run, candidate_root, db)
+    assert result["state"] == "passed", result
+    assert not (directory / hvs.HOST_STAGE_SCRATCH).exists()
 
 
 def test_a_sweep_test_outside_the_tree_is_a_final_failure_not_an_error(tmp_path, monkeypatch):
@@ -1009,7 +1061,7 @@ def test_a_tree_without_a_runner_never_reaches_run_argv_with_env_none(tmp_path, 
     lane = tmp_path / "lane"
     lane.mkdir()
     workspace = SimpleNamespace(path=lane, repo=lane)
-    hvs.host_runner(workspace)(["pytest", "-q", "tests"], lane)
+    hvs.host_runner(workspace, tmp_path / "stage" / "scratch")(["pytest", "-q", "tests"], lane)
     assert envs and all(env is not None for env in envs)
 
 
