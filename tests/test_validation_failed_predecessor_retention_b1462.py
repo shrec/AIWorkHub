@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from aiworkhub import process_launcher
+from aiworkhub import process_launcher_evidence
 from aiworkhub import successful_rework_recovery
 from aiworkhub import worker_workspace
 from aiworkhub.worker_workspace import WorkerWorkspace
@@ -52,7 +53,7 @@ def test_validation_failed_candidate_carries_pin_capable_request_identity(
     }
     workspace_metadata = dict(evidence["workspace"])
     nested_candidate_authority = workspace_metadata.pop("python_candidate_authority")
-    assert workspace_metadata == workspace.as_metadata()
+    assert workspace_metadata == process_launcher_evidence.card_workspace_metadata(workspace)
     assert nested_candidate_authority == evidence["python_candidate_authority"]
     assert evidence["python_candidate_authority"]["sources"] == [
         {

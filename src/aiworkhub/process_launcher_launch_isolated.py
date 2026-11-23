@@ -99,6 +99,7 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "create_quality_review_workspace",
     "create_workspace",
     "exception_text_with_site",
+    "finalize_superseded_reviewer",
     "hashlib",
     "json",
     "kilo_auth",
@@ -111,12 +112,14 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
     "project_context",
     "provision_opencode_worker_config",
     "quality_review",
+    "recheck_reviewer_target",
     "relaunch_input_paths",
     "reviewer_prewarm_capacity",
     "runtime_adapters",
     "sandbox_argv",
     "spawn_with_stdin_payload",
     "subprocess",
+    "superseded_reviewer_result",
     "sys",
     "task_engine",
     "threading",
@@ -136,11 +139,15 @@ LAUNCH_ISOLATED_SEAM_NAMES: tuple[str, ...] = (
 # and it is expected to already be an attribute of this module -- both things
 # that would be drift for every other seam in ``LAUNCH_ISOLATED_SEAM_NAMES``.
 # The two NF-2026-01354 helpers are the same kind: ``ProcessManager`` imports
-# them from here for the Claude auth relaunch and the direct launch path.
+# them from here for the Claude auth relaunch and the direct launch path, and
+# so are the three superseded-reviewer helpers defined in this module.
 LAUNCH_ISOLATED_LOCAL_SEAM_NAMES: tuple[str, ...] = (
     "_appcontainer_supervisor_identity",
+    "finalize_superseded_reviewer",
+    "recheck_reviewer_target",
     "relaunch_input_paths",
     "spawn_with_stdin_payload",
+    "superseded_reviewer_result",
 )
 
 

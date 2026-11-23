@@ -213,16 +213,22 @@ def test_extension_first_snapshot_precedes_background_convergence():
     routing_convergence = _slice(_EXTENSION_JS, "if (this.backgroundConvergencePromise) return", 600)
     # The first snapshot posts a bounded summary before the full payload;
     # retain enough of the function to reach the deliberately later
-    # convergence call (NF-2026-02323's late-reply path grew it past 5200).
+    # convergence call (measured at ~5430 chars once the full post moved into
+    # paintFullSnapshot; NF-2026-02323's late-reply path grew it past 5200).
     snapshot = _slice(_EXTENSION_JS, "async function pushSnapshotOnce(view)", 8000)
+    # The full-snapshot post itself lives in paintFullSnapshot.
+    full_paint = _slice(
+        _EXTENSION_JS, "function paintFullSnapshot(view, client, payload, options)", 600
+    )
     assert "this._convergeBackgroundServices()" not in handshake
     assert "convergeRoutingServicesInBackground();" in dashboard_convergence
     assert routing_entry.index("client.ensureStarted()") < routing_entry.index(
         "client._convergeBackgroundServices()"
     )
     assert "this.ensureDispatcherStarted(5000)" in routing_convergence
+    assert "type: OUTBOUND_TYPES.snapshot," in full_paint
     summary_post = snapshot.index("type: OUTBOUND_TYPES.snapshotSummary")
-    full_post = snapshot.index("type: OUTBOUND_TYPES.snapshot,")
+    full_post = snapshot.index("paintFullSnapshot(view, client, payload, { requestSeq })")
     convergence_call = snapshot.index("client._convergeBackgroundServices()")
     assert summary_post < full_post < convergence_call
 
