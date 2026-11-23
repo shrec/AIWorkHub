@@ -6,6 +6,13 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.13] - 2026-11-24
+
+### Fixed
+
+- Manager Chat panel works when Claude is the selected coordinator: a message sent from the panel no longer fails with `verified_manager_identity_required`. The panel is verified through the window's own bound route (window id, repository, selected provider and the extension-host process in its ancestry) and runs as a `manager_console` identity without callback rights; a Claude Code session keeps its own identity and lane (NF-2026-02393).
+- The accept-time host validation stage keeps its per-command pytest scratch and fallback HOME under `.aiworkhub/temp/host_stage/<request_id>` instead of `.aiworkhub/runtime/host_stage`, which the worktree ownership guard treats as foreign, so tests that set their own worktree root no longer fail with `gc_workspace_shape_mismatch`; the scratch is removed when the stage finishes (NF-2026-02394).
+
 ## [0.13.12] - 2026-11-23
 
 ### Fixed

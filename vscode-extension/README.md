@@ -94,12 +94,10 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.12
+## What's new in 0.13.13
 
-- Automatic reviewers: no duplicate reviewer for a lens that already has one, the adapter is checked before a process starts, and a reviewer never runs against a rejected candidate.
-- Concurrent reviewers of one candidate keep their Source Graph overlay; `review_packet` stays within `max_bytes`; an oversized rework overlay no longer fails the relaunch.
-- Windows: `dotnet run` works in the AppContainer worker.
-- A byte-identical rework replay reuses its predecessor's verified reviewers; the reconciler reports memory peaks per scan phase.
+- Manager Chat panel: messages sent with Claude selected as the coordinator no longer fail with `verified_manager_identity_required`.
+- The accept-time host validation stage keeps its scratch under `.aiworkhub/temp`, so host-stage runs no longer fail with `gc_workspace_shape_mismatch`.
 
 ## Get started
 

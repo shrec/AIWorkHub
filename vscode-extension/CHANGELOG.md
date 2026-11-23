@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.13.13 — 2026-11-24
+
+### Fixed
+
+- Manager Chat panel works when Claude is the selected coordinator: messages no longer fail with `verified_manager_identity_required`, because the panel is verified through its window's bound route.
+- Bundles runtime 0.13.13: the accept-time host validation stage keeps its pytest scratch under `.aiworkhub/temp`, so host-stage runs no longer fail with `gc_workspace_shape_mismatch`.
+
 ## 0.13.12 — 2026-11-23
 
 ### Fixed

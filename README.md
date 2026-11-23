@@ -177,15 +177,10 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.12
+## What's new in 0.13.13
 
-- Review chain: an automatic quality reviewer is not launched for a lens that already holds a live or verified reviewer; the route's adapter is checked before any process starts (an unpinnable adapter is recorded, not launched); a reviewer never runs against a rejected or superseded candidate, and one launched while a reject landed is cancelled.
-- Concurrent reviewers of one candidate keep their candidate Source Graph overlay across a concurrent pin and a canonical republish.
-- `review_packet` honours `max_bytes`, dropping passed diff rows before findings; a rework whose overlay exceeds the size limit carries oversized files hash-only instead of failing.
-- Windows: `dotnet run` and the .NET environment work in the AppContainer worker.
-- Validation replay and the accept-time host stage: deleted predecessor paths verify, and host-stage scratch stays outside the candidate tree.
-- A byte-identical rework replay reuses its predecessor's verified reviewers instead of reviewing the same bytes twice; the sparse toolchain fill no longer leaves files in the sealed review worktree.
-- Linux memory: the task reconciler now reports its RSS high-water mark per scan phase, so the periodic memory peak can be traced to its phase.
+- Manager Chat panel: messages sent with Claude selected as the coordinator no longer fail with `verified_manager_identity_required`; the panel is verified through its window's bound route.
+- Accept-time host validation stage: its pytest scratch moved under `.aiworkhub/temp`, so host-stage runs no longer fail with `gc_workspace_shape_mismatch`.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation
