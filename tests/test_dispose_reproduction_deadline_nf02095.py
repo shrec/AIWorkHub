@@ -445,9 +445,20 @@ def test_a_replay_after_the_abandoned_run_finished_returns_its_receipt(
     finally:
         sandbox.drain()
     _wait_until_idle()
-    began = time.monotonic()
-    late = _dispose(driver, reproduce, "finding-1", reason="sandbox recovered")
-    assert time.monotonic() - began < DEADLINE
+    # The late replay must answer from the finished run's cached receipt. That
+    # is asserted by behaviour (no second reproduce call, no second run, a
+    # REPRODUCED receipt), not by a wall-clock bound a loaded host can miss;
+    # the join ceiling only catches a hang, as the sibling replay test does.
+    outcome: dict[str, Any] = {}
+
+    def late_replay() -> None:
+        outcome["late"] = _dispose(driver, reproduce, "finding-1", reason="sandbox recovered")
+
+    worker = threading.Thread(target=late_replay, daemon=True)
+    worker.start()
+    worker.join(BOUND + 1.0)
+    assert not worker.is_alive(), "the late replay hung"
+    late = outcome["late"]
     assert calls == ["reviewer:correctness:finding-1"]
     assert sandbox.resolved == 1 and fr._DISPOSE_RUNS.started == 1
     receipt = late["reproduction_receipt"]

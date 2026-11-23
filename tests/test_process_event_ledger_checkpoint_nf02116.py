@@ -17,7 +17,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import tracemalloc
+import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -151,11 +153,23 @@ def _checkpoint_file(path: Path) -> Path:
     return files[0]
 
 
-def _spy_segments(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+def _spy_segments(monkeypatch: pytest.MonkeyPatch, path: Path) -> dict[str, int]:
+    """Count rows decoded per segment of THIS test's ledger, on this thread.
+
+    ``_iter_ledger_file`` is module-global, so a background thread in the same
+    worker (e.g. the retention preview) reading its own ledger would otherwise
+    land in the counts. Only segments beside ``path`` read by the measuring
+    thread are counted.
+    """
     decoded: dict[str, int] = {}
     original = pel._iter_ledger_file
+    own_dir = path.parent.resolve()
+    own_thread = threading.get_ident()
 
     def counting(segment: Path):
+        if threading.get_ident() != own_thread or Path(segment).parent.resolve() != own_dir:
+            yield from original(segment)
+            return
         decoded.setdefault(Path(segment).name, 0)
         for row in original(segment):
             decoded[Path(segment).name] += 1
@@ -163,6 +177,25 @@ def _spy_segments(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
 
     monkeypatch.setattr(pel, "_iter_ledger_file", counting)
     return decoded
+
+
+def _own_checkpoint_outcomes(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Checkpoint outcomes counted on the measuring thread only.
+
+    ``latest_event_checkpoint_stats`` is process-global; another thread loading
+    a checkpoint during the measured call must not change this test's count.
+    """
+    outcomes: dict[str, int] = {}
+    original = pel._count_checkpoint
+    own_thread = threading.get_ident()
+
+    def counting(outcome: str) -> None:
+        if threading.get_ident() == own_thread:
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        original(outcome)
+
+    monkeypatch.setattr(pel, "_count_checkpoint", counting)
+    return outcomes
 
 
 def _segment_names(path: Path) -> set[str]:
@@ -173,7 +206,9 @@ def _segment_names(path: Path) -> set[str]:
 
 
 @pytest.mark.parametrize("variant", sorted(VARIANTS))
-def test_checkpointed_cold_read_equals_full_replay(tmp_path: Path, variant: str) -> None:
+def test_checkpointed_cold_read_equals_full_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
     options = VARIANTS[variant]
     path = _build_ledger(tmp_path)
     expected = _full_replay(path, options)
@@ -186,10 +221,12 @@ def test_checkpointed_cold_read_equals_full_replay(tmp_path: Path, variant: str)
     assert first == expected
     assert _checkpoint_file(path).is_file()
 
-    before = pel.latest_event_checkpoint_stats()["loaded"]
+    # Count this thread's checkpoint loads and this ledger's decodes only: the
+    # process-global stats also move when a foreign thread loads a checkpoint.
+    outcomes = _own_checkpoint_outcomes(monkeypatch)
     second = _cold_read(path, options)
     assert second == expected
-    assert pel.latest_event_checkpoint_stats()["loaded"] == before + 1
+    assert outcomes.get("loaded", 0) == 1, outcomes
     if "keep_fields" not in options:
         pel.reset_latest_event_cache()
         assert pel.latest_events(path, **options) == expected
@@ -198,7 +235,7 @@ def test_checkpointed_cold_read_equals_full_replay(tmp_path: Path, variant: str)
 def test_checkpoint_survives_further_rotations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _build_ledger(tmp_path)
     _cold_read(path, LAUNCHER)
-    decoded = _spy_segments(monkeypatch)
+    decoded = _spy_segments(monkeypatch, path)
     for index in range(ARCHIVES, ARCHIVES + 3):
         _rotate(path, index, _segment_rows(100 + index))
         expected = _full_replay(path, LAUNCHER)
@@ -216,7 +253,7 @@ def test_cold_read_decodes_only_checkpoint_and_newer_segments(
 ) -> None:
     path = _build_ledger(tmp_path)
     expected = _full_replay(path, LAUNCHER)
-    decoded = _spy_segments(monkeypatch)
+    decoded = _spy_segments(monkeypatch, path)
 
     assert _cold_read(path, LAUNCHER) == expected
     assert set(decoded) == _segment_names(path), "first cold read is the full replay"
@@ -244,24 +281,54 @@ def test_janitor_style_projection_is_not_decoded_twice_after_checkpoint(
     }
     expected = _full_replay(path, options)
     assert pel.latest_events(path, **options) == expected
-    decoded = _spy_segments(monkeypatch)
+    decoded = _spy_segments(monkeypatch, path)
     for _ in range(2):
         pel.reset_latest_event_cache()
         assert pel.latest_events(path, **options) == expected
     assert set(decoded) == {path.name}
 
 
-def _measure(path: Path) -> int:
-    """tracemalloc peak of one cold launcher-projection read."""
-
+# tracemalloc is process-global: in a pytest worker it also counts every other
+# thread's allocations (background janitors, retention previews), which once
+# inflated a ~470 KB peak to ~4 MB. The peaks are therefore measured in a fresh
+# interpreter that runs nothing but the two cold reads.
+_MEASURE_SCRIPT = """
+import json, sys, tracemalloc
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from aiworkhub import process_event_ledger as pel
+path = Path(sys.argv[2])
+options = json.loads(sys.argv[3])
+options["skip_event_kinds"] = tuple(options["skip_event_kinds"])
+options["drop_fields"] = tuple(options["drop_fields"])
+peaks = []
+for _ in range(2):  # full replay (publishes the checkpoint), then checkpointed
     pel.reset_latest_event_cache()
     tracemalloc.start()
     try:
-        pel._latest_view(path, keep_fields=(), **LAUNCHER)
+        pel._latest_view(path, keep_fields=(), **options)
         _current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    return peak
+    peaks.append(peak)
+print(json.dumps({"full_peak": peaks[0], "checkpoint_peak": peaks[1]}))
+"""
+
+
+def _measure_isolated(path: Path) -> dict[str, int]:
+    """tracemalloc peaks of a full then a checkpointed cold launcher read, taken
+    in a child interpreter no other thread of this worker can allocate in."""
+
+    src = Path(pel.__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [sys.executable, "-c", _MEASURE_SCRIPT, str(src), str(path), json.dumps(LAUNCHER)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
 def test_cold_read_peak_is_bounded_by_checkpoint_not_history(
@@ -289,9 +356,11 @@ def test_cold_read_peak_is_bounded_by_checkpoint_not_history(
             ]
             target.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         history = sum(path.with_name(_archive_name(i)).stat().st_size for i in range(archives))
-        full_peak = _measure(path)  # full replay; publishes the checkpoint
-        decoded = _spy_segments(monkeypatch)
-        checkpoint_peak = _measure(path)
+        peaks = _measure_isolated(path)  # publishes the checkpoint
+        # Decode work is checked in-process, counting this ledger only.
+        decoded = _spy_segments(monkeypatch, path)
+        pel.reset_latest_event_cache()
+        pel._latest_view(path, keep_fields=(), **LAUNCHER)
         monkeypatch.undo()
         results[archives] = {
             "history_bytes": history,
@@ -299,8 +368,8 @@ def test_cold_read_peak_is_bounded_by_checkpoint_not_history(
             "checkpoint_bytes": _checkpoint_file(path).stat().st_size,
             # Header + one line per projected key + trailer.
             "checkpoint_rows": len(_checkpoint_file(path).read_bytes().splitlines()) - 2,
-            "full_peak": full_peak,
-            "checkpoint_peak": checkpoint_peak,
+            "full_peak": peaks["full_peak"],
+            "checkpoint_peak": peaks["checkpoint_peak"],
             "decoded_segments": len(decoded),
         }
         assert decoded == {path.name: len(_segment_rows(99, requests=4))}
@@ -380,7 +449,7 @@ def test_invalid_checkpoint_falls_back_to_full_replay(
     if case == "archive_changed":
         assert expected["req-archived"]["state"] == "late"
 
-    decoded = _spy_segments(monkeypatch)
+    decoded = _spy_segments(monkeypatch, path)
     assert _cold_read(path, LAUNCHER) == expected
     assert set(decoded) == _segment_names(path), "fail-closed: full replay"
 

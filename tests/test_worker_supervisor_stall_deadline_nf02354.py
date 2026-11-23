@@ -96,8 +96,21 @@ def _wrap_terminate(
     return calls
 
 
-def _silent_child_spec(tmp_path: Path) -> dict:
-    script = "print('only-line', flush=True)\nimport time\ntime.sleep(600)\n"
+def _silent_child_spec(tmp_path: Path, go_file: Path | None = None) -> dict:
+    """A child that prints one line, then stays silent.
+
+    With ``go_file`` the child prints only once that file exists, so the test
+    decides when the line may appear relative to the fake clock.
+    """
+    gate = ""
+    if go_file is not None:
+        gate = (
+            "import pathlib, time\n"
+            f"go = pathlib.Path({str(go_file)!r})\n"
+            "while not go.exists():\n"
+            "    time.sleep(0.005)\n"
+        )
+    script = gate + "print('only-line', flush=True)\nimport time\ntime.sleep(600)\n"
     _, spec = _spec(tmp_path, [sys.executable, "-c", script], timeout=_TIMEOUT_SECONDS)
     spec["heartbeat_interval_seconds"] = 0.05
     spec["stall_window_seconds"] = _STALL_WINDOW_SECONDS
@@ -174,15 +187,21 @@ def test_silent_child_is_timed_out_after_stall_window(
     """(b) idle for stall_window past the deadline -> timed_out."""
     clock = _FakeClock()
     _install_fake_clock(monkeypatch, clock)
-    spec = _silent_child_spec(tmp_path)
+    go_file = tmp_path / "child.go"
+    spec = _silent_child_spec(tmp_path, go_file)
     stdout_path = Path(spec["stdout_path"])
     started_mono = clock.mono
     calls = _wrap_terminate(monkeypatch, clock)
 
     def fake_sleep(seconds: float) -> None:
+        # Deterministic ordering: the child may print only after fake time
+        # has advanced past the start epoch, so its one line can never be
+        # stamped at started_at_epoch however the supervisor's polls race it.
+        clock.sleep(1.0)
+        if not go_file.exists():
+            go_file.write_text("go", encoding="utf-8")
         # Freeze fake time until the single line is captured.
         _wait_for_output(stdout_path)
-        clock.sleep(1.0)
         _REAL_SLEEP(0.001)
 
     monkeypatch.setattr(worker_supervisor.time, "sleep", fake_sleep)
