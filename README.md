@@ -177,14 +177,15 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.11
+## What's new in 0.13.12
 
-- Linux memory: 0.13.9 removed the glibc thread-arena growth but overstated the result; under review traffic a long-running server still peaked at 5–6.9 GB. Card evidence no longer stores a full-repository tree baseline, and card scans stream rows instead of loading every card at once.
-- Review chain: reviewers read new, unindexed and large files (large hunks page); a reviewer route that cannot start falls back to one that can; a stale queued reviewer stops instead of running against a rejected round.
-- Workers: a worker still producing output is never killed by the wall-clock deadline, and a timeout records what the worker actually wrote.
-- Manager Chat: the Claude seat gets the full manager toolset and can close review callbacks.
-- Dashboard: the first snapshot appears sooner; the reader reuses unchanged series and no longer waits on CLI probes.
-- 0.13.11 includes everything in 0.13.10 and 0.13.9; neither was published (one 0.13.10 CI test failed on Python 3.14).
+- Review chain: an automatic quality reviewer is not launched for a lens that already holds a live or verified reviewer; the route's adapter is checked before any process starts (an unpinnable adapter is recorded, not launched); a reviewer never runs against a rejected or superseded candidate, and one launched while a reject landed is cancelled.
+- Concurrent reviewers of one candidate keep their candidate Source Graph overlay across a concurrent pin and a canonical republish.
+- `review_packet` honours `max_bytes`, dropping passed diff rows before findings; a rework whose overlay exceeds the size limit carries oversized files hash-only instead of failing.
+- Windows: `dotnet run` and the .NET environment work in the AppContainer worker.
+- Validation replay and the accept-time host stage: deleted predecessor paths verify, and host-stage scratch stays outside the candidate tree.
+- A byte-identical rework replay reuses its predecessor's verified reviewers instead of reviewing the same bytes twice; the sparse toolchain fill no longer leaves files in the sealed review worktree.
+- Linux memory: the task reconciler now reports its RSS high-water mark per scan phase, so the periodic memory peak can be traced to its phase.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

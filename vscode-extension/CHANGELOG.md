@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.12 — 2026-11-23
+
+### Fixed
+
+- Bundles runtime 0.13.12: automatic quality reviewers no longer launch a second reviewer for a lens that already has one, check the adapter before starting a process, and never run against a rejected candidate; concurrent reviewers of one candidate keep their Source Graph overlay; `dotnet run` works in the Windows AppContainer worker; `review_packet` stays within `max_bytes`; an oversized rework overlay no longer fails the relaunch; a byte-identical rework replay reuses its predecessor's verified reviewers; the sparse toolchain fill leaves no files in the sealed review worktree; the task reconciler reports memory peaks per scan phase.
+
 ## 0.13.11 — 2026-11-23
 
 ### Fixed

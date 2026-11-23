@@ -94,11 +94,12 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.11
+## What's new in 0.13.12
 
-- Linux: the bundled server no longer peaks at gigabytes under review traffic; the 0.13.9 memory fix covered only part of it.
-- Reviewers read new, large and unindexed files; a worker still producing output is never killed by the deadline; the Manager Chat Claude seat can close review callbacks; the dashboard's first snapshot appears sooner.
-- Includes all of 0.13.10 and 0.13.9, neither of which was published.
+- Automatic reviewers: no duplicate reviewer for a lens that already has one, the adapter is checked before a process starts, and a reviewer never runs against a rejected candidate.
+- Concurrent reviewers of one candidate keep their Source Graph overlay; `review_packet` stays within `max_bytes`; an oversized rework overlay no longer fails the relaunch.
+- Windows: `dotnet run` works in the AppContainer worker.
+- A byte-identical rework replay reuses its predecessor's verified reviewers; the reconciler reports memory peaks per scan phase.
 
 ## Get started
 

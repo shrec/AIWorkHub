@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.12] - 2026-11-23
+
+### Fixed
+
+- Automatic quality reviewers: a lens that already holds a live or verified reviewer is skipped instead of launched again; the route's adapter is checked before launch, and one that cannot be pinned is recorded as `adapter_unpinnable` without starting a process; a reviewer is never started against a rejected or superseded candidate, and one launched while a reject landed is cancelled (NF-2026-02388).
+- Concurrent quality reviewers of one candidate keep their candidate Source Graph overlay: the composed base pin survives a concurrent pin and a canonical republish, and a pin still in use is never pruned (NF-2026-02385). On Linux the second reviewer no longer loses its changed files to a shared writer lock: each candidate overlay database takes its own lease, and the canonical `index.lock` is unchanged (NF-2026-02391).
+- Windows AppContainer worker: `dotnet run` works in the validation lane and the worker shell gets the request-scoped .NET environment (NF-2026-02383).
+- `review_packet` honours `max_bytes` by compacting passed `destructive_diff` and `citation_drift` rows first; reviewer findings, observations and the finding ids a dispose needs are dropped last (NF-2026-02386).
+- A rework whose overlay exceeds the size limit carries oversized inherited files hash-only instead of failing the relaunch, and the predecessor workspace stays alive when a successor launch fails (NF-2026-02384).
+- A validation-only replay verifies paths the predecessor sealed as deleted (NF-2026-02380).
+- The accept-time host validation stage keeps its pytest scratch and fallback HOME outside the candidate tree, so tests that set their own worktree root no longer fail with `gc_workspace_shape_mismatch`.
+- Three load-flaky host tests measure only their own work (NF-2026-02378).
+- A byte-identical rework replay carries its predecessor's verified reviewer receipts forward instead of paying for a second reviewer pass; the carry needs the same candidate digest and the same contract identity, both sealed at reject time, and an amended contract or a one-byte difference still needs fresh reviewers (NF-2026-02293).
+- The sparse toolchain fill no longer leaves copied files in the sealed review worktree, so a later accept does not fail on a hash mismatch; a failed fill cleans up after itself without masking the original error (NF-2026-02294).
+- The task reconciler reports its memory high-water mark per scan phase (`phase_rss_peak_bytes`, scan start/end RSS and a short phase history in `task_reconciler_status.json`), so a periodic memory peak can be traced to the phase that causes it (NF-2026-02382).
+
 ## [0.13.11] - 2026-11-23
 
 0.13.10 was tagged but not published: its CI failed on Python 3.14 in a test that counted process-wide threads. 0.13.11 carries all of 0.13.10 (and 0.13.9) plus the fix below.
