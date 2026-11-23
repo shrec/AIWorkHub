@@ -716,31 +716,49 @@ def test_pin_refuses_symlinked_missing_or_unverified_base(tmp_path: Path) -> Non
     assert _pins(forged_dir) == [], "an unverified generation stayed pinned"
 
 
-def test_pin_refuses_generation_republished_during_link(
+def test_pin_resnapshots_generation_republished_once_during_link(
     tmp_path: Path, monkeypatch
 ) -> None:
+    """NF-2026-02385: one republish between stat and link is re-snapshotted.
+
+    The first link names an unverified inode; that private link is dropped,
+    the NEW generation is snapshotted and pinned, and no pin of the raced
+    generation is left behind.
+    """
+
     repo = tmp_path / "repo"
     repo.mkdir()
     base_db = _build_base(repo, {"m.py": "def s():\n    return 1\n"})
     (repo / "m.py").write_text("def s2():\n    return 2\n", encoding="utf-8")
     real_link = os.link
     newer = tmp_path / "newer.sqlite"
-    newer.write_bytes(base_db.read_bytes() + b"\x00" * 512)
+    newer.write_bytes(base_db.read_bytes())
+    republished: list[int] = []
 
     def racing_link(src, dst, *args, **kwargs):
         # The canonical path is atomically republished between the generation
-        # stat and the link: the link now names an unverified generation.
-        os.replace(newer, base_db)
+        # stat and the FIRST link only.
+        if not republished:
+            os.replace(newer, base_db)
+            republished.append(os.stat(base_db).st_ino)
         return real_link(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(sgp.os, "link", racing_link)
     overlay = tmp_path / "overlay"
     overlay.mkdir()
-    with pytest.raises(sgp.PartitionBasePinError, match="composed_base_pin_raced"):
-        sgp.build_partition(
-            repo, _changed(repo, ["m.py"]), overlay / "p.sqlite", base_db_path=base_db,
-        )
-    assert _pins(overlay) == []
+    partition = overlay / "p.sqlite"
+    report = sgp.build_partition(
+        repo, _changed(repo, ["m.py"]), partition, base_db_path=base_db,
+    )
+    assert report.base_pin == "pinned"
+    (pin,) = _pins(overlay)
+    current = os.stat(base_db)
+    assert os.stat(pin).st_ino == current.st_ino == republished[0]
+    marker = sgp.read_composed_marker(partition)
+    assert marker is not None
+    assert marker["base"]["ino"] == current.st_ino
+    assert marker["base"]["pin"]["name"] == pin.name
+    assert list(overlay.glob(".sg-base-link.*")) == []
 
 
 def test_pin_unsupported_filesystem_is_recorded_and_fails_explicitly(

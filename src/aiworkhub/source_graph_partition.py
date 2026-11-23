@@ -420,6 +420,29 @@ def _store_marker(partition_db_path: Path, payload: Mapping[str, Any]) -> None:
         conn.close()
 
 
+# Wall-clock budget for re-snapshotting a canonical base that was republished
+# between the generation stat and the pin link (NF-2026-02385). Not an attempt
+# count: every retry must observe a NEW generation (progress), and only a base
+# still moving after this long fails closed with the measured reason.
+_BASE_PIN_RACE_BUDGET_SECONDS = 10.0
+
+
+class _BasePinRaced(PartitionBasePinError):
+    """The base moved between the generation snapshot and the pin; retryable.
+
+    ``generation_name`` is the pin name of the snapshot that raced, so the
+    retry loop can tell a publisher making progress from a race that repeats.
+    """
+
+    def __init__(self, reason: str, generation_name: str) -> None:
+        super().__init__(reason)
+        self.generation_name = generation_name
+
+
+def _errno_name(exc: OSError) -> str:
+    return errno.errorcode.get(exc.errno or 0, str(exc.errno))
+
+
 def _link_base_pin(
     source: Path, pin_path: Path, generation: Mapping[str, int]
 ) -> str | None:
@@ -428,40 +451,86 @@ def _link_base_pin(
     Returns an errno name when the filesystem, platform or sandbox cannot hard
     link. ``EXDEV`` is returned so the caller can fall back to a verified byte
     copy; every other unsupported errno is recorded as unsupported rather than
-    pretending to pin. ``link`` follows the canonical PATH, so if the base was
-    republished after ``generation`` was taken the new link names an unverified
-    inode and is refused as ``composed_base_pin_raced``; a stale or forged entry
-    squatting the canonical pin name is replaced once.
+    pretending to pin.
+
+    ``link`` follows the canonical PATH, so the inode is first linked under a
+    PRIVATE name no other caller touches and its identity checked there. If
+    the base was republished after ``generation`` was taken, only that private
+    link is removed and :class:`_BasePinRaced` asks the caller to re-snapshot.
+    The verified inode is then published under the canonical pin name. The
+    name encodes the generation, so an existing entry with the same identity
+    IS the same inode -- a concurrent pinner's valid pin -- and is joined,
+    never unlinked (NF-2026-02385). Only an entry squatting the name with a
+    different identity is atomically replaced by the verified inode.
     """
 
-    for _attempt in range(2):
-        created = False
+    private = pin_path.with_name(
+        f".sg-base-link.{os.getpid()}.{os.urandom(8).hex()}.pinlink"
+    )
+    try:
         try:
-            os.link(source, pin_path)
-            created = True
-        except FileExistsError:
-            pass
+            os.link(source, private)
         except NotImplementedError:
             return "link_unsupported"
         except OSError as exc:
-            code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
             if exc.errno in _BASE_PIN_UNSUPPORTED_ERRNOS:
-                return code
-            raise PartitionBasePinError(f"composed_base_pin_failed:{code}") from exc
+                return _errno_name(exc)
+            raise PartitionBasePinError(
+                f"composed_base_pin_failed:{_errno_name(exc)}"
+            ) from exc
         try:
-            observed = os.stat(pin_path, follow_symlinks=False)
+            linked = os.stat(private, follow_symlinks=False)
         except OSError as exc:
             raise PartitionBasePinError(
-                f"composed_base_pin_missing:{pin_path.name}"
+                f"composed_base_pin_missing:{private.name}"
             ) from exc
-        if stat_mod.S_ISREG(observed.st_mode) and _generation(observed) == generation:
+        if not stat_mod.S_ISREG(linked.st_mode) or _generation(linked) != generation:
+            raise _BasePinRaced(
+                f"composed_base_pin_raced:{pin_path.name}", pin_path.name
+            )
+        try:
+            os.link(private, pin_path)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise PartitionBasePinError(
+                f"composed_base_pin_failed:{_errno_name(exc)}"
+            ) from exc
+        if _pin_matches(pin_path, generation):
             return None
-        if stat_mod.S_ISDIR(observed.st_mode):
-            raise PartitionBasePinError(f"composed_base_pin_not_file:{pin_path.name}")
-        pin_path.unlink(missing_ok=True)
-        if created:
-            raise PartitionBasePinError(f"composed_base_pin_raced:{pin_path.name}")
-    raise PartitionBasePinError(f"composed_base_pin_raced:{pin_path.name}")
+        # Absent (a squatter removed concurrently) or squatted by another
+        # identity: atomically install the verified inode under the name.
+        try:
+            os.replace(private, pin_path)
+        except OSError as exc:
+            raise PartitionBasePinError(
+                f"composed_base_pin_failed:{_errno_name(exc)}"
+            ) from exc
+        if _pin_matches(pin_path, generation):
+            return None
+        raise _BasePinRaced(f"composed_base_pin_raced:{pin_path.name}", pin_path.name)
+    finally:
+        _discard_uncommitted_pin(private)
+
+
+def _pin_matches(pin_path: Path, generation: Mapping[str, int]) -> bool:
+    """True when ``pin_path`` is a regular file of exactly ``generation``.
+
+    A directory squatting the name is refused as ``composed_base_pin_not_file``
+    because it can be neither joined nor replaced.
+    """
+
+    try:
+        observed = os.stat(pin_path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise PartitionBasePinError(
+            f"composed_base_pin_missing:{pin_path.name}"
+        ) from exc
+    if stat_mod.S_ISDIR(observed.st_mode):
+        raise PartitionBasePinError(f"composed_base_pin_not_file:{pin_path.name}")
+    return stat_mod.S_ISREG(observed.st_mode) and _generation(observed) == generation
 
 
 def _write_pin_copy(source: Path, dest: Path) -> None:
@@ -486,6 +555,45 @@ def _discard_uncommitted_pin(path: Path | None) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         return
+
+
+# Windows refuses to rename a file another handle holds without delete
+# sharing: ERROR_ACCESS_DENIED (5) / ERROR_SHARING_VIOLATION (32). SQLite opens
+# without delete sharing, so a concurrent reviewer's pin prune reading this
+# partition's marker for a few milliseconds makes the publish fail transiently.
+_PUBLISH_SHARING_WINERRORS = frozenset({5, 32})
+_PARTITION_PUBLISH_BUDGET_SECONDS = 5.0
+
+
+def publish_partition(temporary: Path, final: Path) -> None:
+    """Atomically publish a built partition: ``os.replace(temporary, final)``.
+
+    A Windows sharing violation from a concurrent marker reader is retried
+    within ``_PARTITION_PUBLISH_BUDGET_SECONDS`` of wall clock (NF-2026-02385);
+    every other error propagates unchanged, and a sharing violation outlasting
+    the budget raises ``PermissionError`` whose message names the measured
+    attempts and elapsed time.
+    """
+
+    started = time.monotonic()
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            os.replace(temporary, final)
+            return
+        except PermissionError as exc:
+            elapsed = time.monotonic() - started
+            if getattr(exc, "winerror", None) not in _PUBLISH_SHARING_WINERRORS:
+                raise
+            if elapsed >= _PARTITION_PUBLISH_BUDGET_SECONDS:
+                raise PermissionError(
+                    exc.errno,
+                    f"partition_publish_sharing_violation:attempts={attempts}"
+                    f":elapsed_ms={int(elapsed * 1000)}:{exc.strerror}",
+                    str(final),
+                ) from exc
+        time.sleep(min(0.005 * attempts, 0.1))
 
 
 def _copy_base_pin(source: Path, pin_dir: Path) -> tuple[Path, dict[str, int]]:
@@ -534,7 +642,12 @@ def _copy_base_pin(source: Path, pin_dir: Path) -> tuple[Path, dict[str, int]]:
             or after.st_ino != before.st_ino
             or after.st_mtime_ns != before.st_mtime_ns
         ):
-            raise PartitionBasePinError(f"composed_base_pin_raced:{source.name}")
+            # The source moved during the copy: transient, so the caller
+            # re-snapshots the generation it moved to (NF-2026-02385).
+            raise _BasePinRaced(
+                f"composed_base_pin_raced:{source.name}",
+                _pin_name(_generation(before)),
+            )
         generation = _generation(observed)
         final_path = pin_dir / _pin_name(generation)
         try:
@@ -616,6 +729,81 @@ def _verify_pinned_generation(pin_path: Path) -> None:
         )
 
 
+# SQLite primary result codes for a marker that exists but cannot be read
+# right now (BUSY, LOCKED, IOERR, CANTOPEN, PROTOCOL): its pin references are
+# UNKNOWN, never "none".
+_MARKER_TRANSIENT_SQLITE_CODES = frozenset({5, 6, 10, 14, 15})
+_MARKER_TRANSIENT_TEXT = ("locked", "busy", "unable to open", "disk i/o")
+
+
+def _marker_pin_reference(db_path: Path) -> tuple[bool, str | None]:
+    """``(known, pin_name)`` for one partition file in a pin directory.
+
+    ``known`` is ``False`` when the marker could not be read for a transient
+    reason, e.g. a concurrent build holds the partition's write lock: what it
+    references is then unknown and no pin may be treated as unreferenced on
+    its account (fail closed, NF-2026-02385). A file that is not a database or
+    has no marker references nothing.
+    """
+
+    try:
+        row = _select_marker_row(db_path)
+    except sqlite3.OperationalError as exc:
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int):
+            transient = (code & 0xFF) in _MARKER_TRANSIENT_SQLITE_CODES
+        else:
+            text = str(exc).lower()
+            transient = any(word in text for word in _MARKER_TRANSIENT_TEXT)
+        return (not transient), None
+    except (OSError, sqlite3.Error):
+        return True, None
+    marker = _parse_marker_row(row)
+    base = (marker or {}).get("base")
+    pin = base.get("pin") if isinstance(base, dict) else None
+    if isinstance(pin, dict) and isinstance(pin.get("name"), str):
+        return True, pin["name"]
+    return True, None
+
+
+def _scan_pin_references(
+    pin_dir: Path, *, exclude: str = ""
+) -> tuple[list[os.DirEntry[str]], set[str], bool]:
+    """``(pins, referenced, complete)`` for ``pin_dir``.
+
+    ``referenced`` holds the pin names named by the marker of a live
+    ``*.sqlite`` partition or an in-flight ``*.tmp`` build (other than
+    ``exclude``); ``complete`` is ``False`` when any such marker could not be
+    read, or the directory could not be listed, so callers must not remove a
+    pin on the strength of an incomplete scan.
+    """
+
+    try:
+        entries = list(os.scandir(pin_dir))
+    except OSError:
+        return [], set(), False
+    referenced: set[str] = set()
+    pins: list[os.DirEntry[str]] = []
+    complete = True
+    for entry in entries:
+        if _BASE_PIN_NAME.fullmatch(entry.name):
+            pins.append(entry)
+            continue
+        if entry.name == exclude or not entry.name.endswith((".sqlite", ".tmp")):
+            continue
+        try:
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        known, name = _marker_pin_reference(Path(entry.path))
+        if not known:
+            complete = False
+        elif name is not None:
+            referenced.add(name)
+    return pins, referenced, complete
+
+
 def _prune_base_pins(pin_dir: Path, *, keep: str) -> int:
     """Remove pins in ``pin_dir`` that no partition there still references.
 
@@ -623,32 +811,16 @@ def _prune_base_pins(pin_dir: Path, *, keep: str) -> int:
     by the marker of a live ``*.sqlite`` partition or an in-flight ``*.tmp``
     build in the same directory (markers are written BEFORE the link, so an
     in-flight build is never pruned), and the directory owner's cleanup removes
-    both together. Best effort: a pin that cannot be removed now is retried on
-    the next marker write. Returns the number of pins removed.
+    both together. A marker that cannot be read right now -- a concurrent
+    reviewer's build holding its lock -- makes the whole scan inconclusive and
+    nothing is pruned this round. Best effort: a pin that cannot be removed now
+    is retried on the next marker write. Returns the number of pins removed.
     """
 
-    try:
-        entries = list(os.scandir(pin_dir))
-    except OSError:
+    pins, referenced, complete = _scan_pin_references(pin_dir)
+    if not complete:
         return 0
-    referenced = {keep}
-    pins: list[os.DirEntry[str]] = []
-    for entry in entries:
-        if _BASE_PIN_NAME.fullmatch(entry.name):
-            pins.append(entry)
-            continue
-        if not entry.name.endswith((".sqlite", ".tmp")):
-            continue
-        try:
-            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
-                continue
-        except OSError:
-            continue
-        marker = read_composed_marker(Path(entry.path))
-        base = (marker or {}).get("base")
-        pin = base.get("pin") if isinstance(base, dict) else None
-        if isinstance(pin, dict) and isinstance(pin.get("name"), str):
-            referenced.add(pin["name"])
+    referenced.add(keep)
     removed = 0
     for entry in pins:
         if entry.name in referenced:
@@ -661,6 +833,16 @@ def _prune_base_pins(pin_dir: Path, *, keep: str) -> int:
         except OSError:
             continue
     return removed
+
+
+def _discard_unshared_pin(pin_dir: Path, name: str, *, own: str) -> bool:
+    """Remove pin ``name`` only when no other partition may reference it."""
+
+    _pins, referenced, complete = _scan_pin_references(pin_dir, exclude=own)
+    if not complete or name in referenced:
+        return False
+    _discard_uncommitted_pin(pin_dir / name)
+    return True
 
 
 def write_composed_marker(
@@ -679,6 +861,15 @@ def write_composed_marker(
     recorded generation is the pin file's, not the source inode. Any other
     unsupported link errno is recorded with that reason. A symlinked, missing,
     empty or raced base fails closed.
+
+    A canonical base republished between the generation snapshot and the link
+    is a transient race, not a failure (NF-2026-02385): the base is
+    re-snapshotted and the NEW generation pinned. Liveness is by progress --
+    each retry must observe a generation the publisher actually moved to, and
+    a race that repeats an already-raced generation fails at once -- bounded
+    by ``_BASE_PIN_RACE_BUDGET_SECONDS`` of wall clock. Only a base still
+    moving past that budget fails closed, and its reason keeps the measured
+    attempts and elapsed time.
     """
 
     partition_db_path = Path(partition_db_path)
@@ -693,6 +884,33 @@ def write_composed_marker(
     if raw_base.is_symlink():
         raise PartitionBasePinError(f"composed_base_symlink:{raw_base}")
     resolved = raw_base.resolve()
+    started = time.monotonic()
+    raced: set[str] = set()
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return _pin_base_generation(partition_db_path, resolved, scope_list)
+        except _BasePinRaced as exc:
+            elapsed = time.monotonic() - started
+            measured = (
+                f":attempts={attempts}:elapsed_ms={int(elapsed * 1000)}"
+                f":budget_ms={int(_BASE_PIN_RACE_BUDGET_SECONDS * 1000)}"
+            )
+            if exc.generation_name in raced:
+                raise PartitionBasePinError(
+                    f"{exc}:no_progress{measured}"
+                ) from exc
+            if elapsed >= _BASE_PIN_RACE_BUDGET_SECONDS:
+                raise PartitionBasePinError(f"{exc}{measured}") from exc
+            raced.add(exc.generation_name)
+
+
+def _pin_base_generation(
+    partition_db_path: Path, resolved: Path, scope_list: list[str]
+) -> dict[str, Any]:
+    """One snapshot-and-pin attempt; raises :class:`_BasePinRaced` to retry."""
+
     try:
         observed = os.stat(resolved, follow_symlinks=False)
     except OSError as exc:
@@ -722,7 +940,11 @@ def write_composed_marker(
         try:
             _verify_pinned_generation(pin_path)
         except PartitionBasePinError:
-            pin_path.unlink(missing_ok=True)
+            # The pin name is shared by every partition in this directory
+            # that pinned the same generation; a concurrent pinner may have
+            # verified and recorded it already, so only an unshared pin is
+            # removed here (an unknown reference keeps it for the next prune).
+            _discard_unshared_pin(pin_dir, name, own=partition_db_path.name)
             raise
     elif unsupported == "EXDEV":
         # Cross-device only. EPERM, EACCES and the other unsupported link
@@ -785,21 +1007,9 @@ def write_composed_marker(
     return pin
 
 
-def read_composed_marker(db_path: Path) -> dict[str, Any] | None:
-    """Read the composed-view marker; ``None`` when absent or unreadable."""
+def _parse_marker_row(row: Any) -> dict[str, Any] | None:
+    """Decode one ``meta`` marker row; ``None`` when absent or malformed."""
 
-    try:
-        conn = sqlite3.connect(
-            f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True
-        )
-        try:
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key=?", (COMPOSED_VIEW_META_KEY,)
-            ).fetchone()
-        finally:
-            conn.close()
-    except (OSError, sqlite3.Error):
-        return None
     if row is None:
         return None
     try:
@@ -807,6 +1017,28 @@ def read_composed_marker(db_path: Path) -> dict[str, Any] | None:
     except (json.JSONDecodeError, TypeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _select_marker_row(db_path: Path) -> Any:
+    """Read the raw marker row read-only. Raises ``OSError``/``sqlite3.Error``."""
+
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        return conn.execute(
+            "SELECT value FROM meta WHERE key=?", (COMPOSED_VIEW_META_KEY,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def read_composed_marker(db_path: Path) -> dict[str, Any] | None:
+    """Read the composed-view marker; ``None`` when absent or unreadable."""
+
+    try:
+        row = _select_marker_row(db_path)
+    except (OSError, sqlite3.Error):
+        return None
+    return _parse_marker_row(row)
 
 
 def _verify_base_unshifted(base: Mapping[str, Any]) -> Path:

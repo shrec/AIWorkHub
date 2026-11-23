@@ -1403,7 +1403,11 @@ def prewarm_quality_review_source_graph(
             )
             if failure is not None:
                 raise _candidate_source_graph_empty_error(failure)
-            os.replace(temporary, db_path)
+            # NF-2026-02385: a concurrent reviewer's pin prune may hold this
+            # partition open for a moment (a Windows sharing violation); the
+            # owner retries that transient within its budget, and only a
+            # persistent failure surfaces with its measured reason.
+            _source_graph_partition.publish_partition(temporary, db_path)
         finally:
             temporary.unlink(missing_ok=True)
         failure = _candidate_db_readiness_failure(
