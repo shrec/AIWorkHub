@@ -158,3 +158,56 @@ def queued_receipt_fields(reason: str) -> dict[str, Any]:
         "retry_after_seconds": DEFERRED_RETRY_AFTER_SECONDS,
         "admission_reason": admission_reason(reason),
     }
+
+
+QUEUED_STATE = "admission_queued"
+QUEUE_POSITION_BASIS = "retry_not_before_order"
+RELAUNCH_RECONCILER = "transient_retry_reconciler"
+START_NOTIFICATION_TOOL = "aiworkhub_agent_task_status"
+
+
+def waits_for(reason: str) -> dict[str, str]:
+    """The admission resource a capacity refusal ``reason`` waits on; ``unknown`` otherwise."""
+    if reason == CONCURRENCY_REFUSAL:
+        resource = "concurrency_slot"
+    elif reason.startswith(MEMORY_REFUSAL_PREFIX):
+        resource = "host_memory"
+    else:
+        resource = "unknown"
+    return {"resource": resource, "reason": admission_reason(reason)}
+
+
+def queue_position(repo: Path | str, task_id: str) -> tuple[int | None, int, str]:
+    """``(1-based position, queue length, error)``; position ``None`` when unknown."""
+    try:
+        queue = task_store.admission_deferred_queue(repo)
+    except (task_store.TaskStoreError, sqlite3.Error, OSError, ValueError) as exc:
+        return None, 0, f"admission_queue_unreadable:{type(exc).__name__}"
+    for index, entry in enumerate(queue, start=1):
+        if entry["task_id"] == task_id:
+            return index, len(queue), ""
+    return None, len(queue), "task_not_in_admission_queue"
+
+
+def normalize_queued_reply(repo: Path | str, reply: dict[str, Any]) -> dict[str, Any]:
+    """An ``admission_queued`` launch reply as a non-failure; others unchanged."""
+    if reply.get("state") != QUEUED_STATE:
+        return reply
+    task_id = str(reply.get("task_id") or "")
+    position, length, error = queue_position(repo, task_id)
+    return {
+        **reply,
+        "ok": True,
+        "queued": True,
+        "waits_for": waits_for(str(reply.get("blocked_reason") or "")),
+        "queue_position": position,
+        "queue_length": length,
+        "queue_position_basis": QUEUE_POSITION_BASIS,
+        **({"queue_position_error": error} if error else {}),
+        "relaunch": {
+            "automatic": True,
+            "by": RELAUNCH_RECONCILER,
+            "interval_seconds": DEFERRED_RETRY_AFTER_SECONDS,
+        },
+        "start_notification": {"tool": START_NOTIFICATION_TOOL, "task_id": task_id},
+    }

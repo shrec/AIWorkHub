@@ -7627,6 +7627,11 @@ def _launch_task_internal(
     if isinstance(result, dict):
         result["timeout_seconds"] = timeout_seconds
         result["timeout_enforced"] = False
+        # NF-2026-02367: a capacity deferral is queued, not failed.
+        if result.get("state") == "admission_queued":
+            from . import launch_admission
+
+            result = launch_admission.normalize_queued_reply(manager.repo, result)
     return result
 
 

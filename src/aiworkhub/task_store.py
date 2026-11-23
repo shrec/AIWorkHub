@@ -4762,6 +4762,31 @@ def mark_admission_deferred(
         return True, "pending"
 
 
+def admission_deferred_queue(root: str | Path) -> list[dict[str, str]]:
+    """Pending/unclaimed admission-deferred cards in relaunch order.
+
+    Ordered by ``retry_not_before`` (the transient-retry reconciler's due time),
+    ties by ``task_id``; each entry is ``{"task_id", "retry_not_before"}``.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, "
+            "COALESCE(json_extract(card_json, '$.retry_not_before'), '') AS due "
+            "FROM tasks WHERE status='pending' AND worker_status='unclaimed' "
+            "AND json_valid(card_json) "
+            "AND json_extract(card_json, '$.transient_retry.kind')='admission_deferred' "
+            "ORDER BY due, task_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {"task_id": str(row["task_id"]), "retry_not_before": str(row["due"])}
+        for row in rows
+    ]
+
+
 # Post-launch failure substatuses this function accepts, routed to the
 # canonical ``blocked`` bucket. Owned by ``task_fsm``; imported here rather than
 # restated (NF-2026-00339).
