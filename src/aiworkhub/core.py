@@ -7393,15 +7393,33 @@ def reject_review(
             and isinstance(pred_changed_hashes, dict)
             and pred_changed_hashes
         ):
+            # NF-2026-02293: task, epoch and contract identity go on every link so a
+            # byte-identical replay can prove what its predecessor was reviewed
+            # against; the digest is THIS card's, before any later amendment.
+            from .review_orchestrator import contract_identity_digest
+
+            pred_claim_epoch = (
+                identity.get("claim_epoch")
+                if isinstance(identity, dict)
+                and str(identity.get("request_id") or "").strip() == pred_request_id
+                else (resolved_predecessor or {}).get("claim_epoch")
+            )
             card["rework_predecessor"] = {
                 "schema_id": "aiworkhub.rework_predecessor.v1",
                 "request_id": pred_request_id,
+                "task_id": task_id,
                 "workspace": pred_workspace,
                 "changed_path_hashes": pred_changed_hashes,
                 "residual_identities": (
                     normalized_residuals if disposition == "pending" else []
                 ),
                 "pinned_at": now,
+                "contract_identity_sha256": contract_identity_digest(card),
+                **(
+                    {"claim_epoch": pred_claim_epoch}
+                    if type(pred_claim_epoch) is int and pred_claim_epoch >= 1
+                    else {}
+                ),
             }
             # NF-2026-01556: mirror task_store.recover_blocked_rework by pinning
             # terminal_substatus when the review's request matches pred_request_id.

@@ -247,7 +247,11 @@ def _accept_manager_identity(core: Any) -> dict[str, Any]:
 
 
 def bound_reviewer_rows(
-    repo: Any, parent_task_id: str, parent_request_id: str
+    repo: Any,
+    parent_task_id: str,
+    parent_request_id: str,
+    *,
+    with_sealed_binding: bool = False,
 ) -> list[dict[str, Any]]:
     """One scan over the quality-review children bound to this exact request.
 
@@ -328,15 +332,20 @@ def bound_reviewer_rows(
             if not task_id:
                 continue
             receipt = terminal_evidence.get("quality_review_receipt")
-            bound.append(
-                {
-                    "task_id": task_id,
-                    "lens": str(binding.get("lens") or ""),
-                    "packet_sha256": str(binding.get("packet_sha256") or ""),
-                    "terminal_substatus": str(terminal.get("substatus") or ""),
-                    "receipt": receipt if isinstance(receipt, dict) else None,
-                }
-            )
+            bound_row: dict[str, Any] = {
+                "task_id": task_id,
+                "lens": str(binding.get("lens") or ""),
+                "packet_sha256": str(binding.get("packet_sha256") or ""),
+                "terminal_substatus": str(terminal.get("substatus") or ""),
+                "receipt": receipt if isinstance(receipt, dict) else None,
+            }
+            if with_sealed_binding:
+                # NF-2026-02293: opt-in, so only a predecessor carry pays for
+                # the packet read; every other caller's rows are unchanged.
+                bound_row["sealed_binding"] = retained_sealed_binding(
+                    binding, terminal_evidence.get("workspace"), receipt
+                )
+            bound.append(bound_row)
     finally:
         try:
             conn.close()
@@ -379,7 +388,11 @@ def bound_reviewer_request_ids(
 
 
 def reviewer_evidence(
-    self, parent_task_id: str, parent_request_id: str
+    self,
+    parent_task_id: str,
+    parent_request_id: str,
+    *,
+    with_sealed_binding: bool = False,
 ) -> list[dict[str, Any]]:
     """Resolve, per bound reviewer task, its current attempt and what it proved.
 
@@ -401,7 +414,10 @@ def reviewer_evidence(
     ``state_unknown_cause`` -- never a ``running`` False dressed up as
     knowledge -- which blocks acceptance (NF-2026-01164).
     """
-    rows = bound_reviewer_rows(self.repo, parent_task_id, parent_request_id)
+    rows = bound_reviewer_rows(
+        self.repo, parent_task_id, parent_request_id,
+        with_sealed_binding=with_sealed_binding,
+    )
     live_lens_reviewers = getattr(self, "_live_lens_reviewers", None)
     try:
         latest = self._latest_by_request()
@@ -501,6 +517,122 @@ def reviewer_evidence(
             }
         )
     return sorted(resolved, key=lambda entry: (entry["lens"], entry["task_id"]))
+
+
+def retained_sealed_binding(
+    binding: Any, workspace: Any, receipt: Any
+) -> dict[str, Any]:
+    """The sealed target of one STORED reviewer receipt, or ``{}``.
+
+    NF-2026-02293: the packet is recovered exactly as the accept loop
+    recovers it (:func:`sealed_review_packet`: inside the reviewer's own home,
+    hashing to its own digest, that digest the receipt's), from the binding
+    and workspace the supervisor wrote on the reviewer's card. A collected
+    home, a missing path or any disagreement is ``{}``, which carries nothing.
+    """
+    from types import SimpleNamespace
+
+    from . import review_orchestrator
+
+    home = workspace.get("home") if isinstance(workspace, Mapping) else None
+    if (
+        not isinstance(binding, Mapping)
+        or not isinstance(receipt, Mapping)
+        or not isinstance(home, str)
+        or not home
+    ):
+        return {}
+    packet = sealed_review_packet(
+        {"quality_review": binding}, SimpleNamespace(home=home), receipt
+    )
+    return review_orchestrator.sealed_reviewer_binding(receipt, packet)
+
+
+def carried_reviewer_evidence(
+    self, card: Any, task_id: str, request_id: str
+) -> list[dict[str, Any]]:
+    """The identical-bytes predecessor's usable, receipted reviewer rows.
+
+    NF-2026-02293: a validation-only replay or rework of the SAME task whose
+    candidate bytes and contract are identical to its authenticated predecessor
+    keeps that predecessor's reviewers. Each row is admitted on its OWN sealed
+    receipt binding by :func:`review_orchestrator.identical_bytes_predecessor`
+    (the one definition): the receipt must be sealed to the predecessor
+    request, its claim epoch and the identical candidate digest. Only usable
+    rows carrying such a receipt are carried; every other predecessor row is
+    no evidence and is dropped, so a lens it would have covered stays
+    ``required_reviewer_missing`` exactly as before. The accept loop still
+    re-verifies each carried receipt like any other.
+    """
+    from . import review_orchestrator
+
+    link_request_id = review_orchestrator.predecessor_link_request_id(card)
+    if not link_request_id or link_request_id == request_id:
+        return []
+    carried_rows: list[dict[str, Any]] = []
+    for row in reviewer_evidence(
+        self, task_id, link_request_id, with_sealed_binding=True
+    ):
+        if not (
+            row.get("usable") is True
+            and str(row.get("request_id") or "")
+            and str(row.get("lens") or "")
+            and isinstance(row.get("receipt"), Mapping)
+        ):
+            continue
+        carried = review_orchestrator.identical_bytes_predecessor(
+            card, request_id, row.get("sealed_binding")
+        )
+        if carried.get("request_id") != link_request_id:
+            continue
+        carried_rows.append({**row, "carried_from_request_id": link_request_id})
+    return carried_rows
+
+
+def _admitted_reviewer_target(
+    card: Any, request_id: str, receipt: Any, sealed_binding: Any
+) -> str:
+    """The ONE target request a verified reviewer receipt is admitted against.
+
+    This request, unless the receipt is sealed to the identical-bytes
+    predecessor that :func:`review_orchestrator.identical_bytes_predecessor`
+    admits for ``sealed_binding`` -- then that predecessor. The caller requires
+    the receipt's target AND the reviewer's metadata binding to equal this
+    same value, so a receipt sealed to one request whose binding names the
+    other still meets ``quality_reviewer_target_mismatch``.
+    """
+    from . import review_orchestrator
+
+    target = receipt.get("target") if isinstance(receipt, Mapping) else None
+    receipt_target = (
+        str(target.get("request_id") or "") if isinstance(target, Mapping) else ""
+    )
+    if not receipt_target or receipt_target == request_id:
+        return request_id
+    carried = review_orchestrator.identical_bytes_predecessor(
+        card, request_id, sealed_binding
+    )
+    if carried.get("request_id") == receipt_target:
+        return receipt_target
+    return request_id
+
+
+def _reviewer_target_split(
+    bound_target_request_id: str, receipt: Any, admitted_target_request_id: str
+) -> bool:
+    """Whether the metadata binding or the verified receipt names another target.
+
+    NF-2026-02293: both must equal the ONE admitted target -- a receipt sealed
+    to the predecessor whose metadata names this request, or the reverse, is a
+    split admission and the caller raises ``quality_reviewer_target_mismatch``.
+    """
+    target = receipt.get("target") if isinstance(receipt, Mapping) else None
+    return (
+        not admitted_target_request_id
+        or bound_target_request_id != admitted_target_request_id
+        or not isinstance(target, Mapping)
+        or str(target.get("request_id") or "") != admitted_target_request_id
+    )
 
 
 def _latest_request_identity_event(
@@ -2832,7 +2964,9 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
             intents = int((snapshot.get("counts") or {}).get("pending") or 0)
     except Exception:  # noqa: BLE001 -- an unreadable snapshot blocks nothing here
         intents = 0
-    preview_reviewers = reviewer_evidence(self, task_id, request_id)
+    preview_reviewers = reviewer_evidence(
+        self, task_id, request_id
+    ) + carried_reviewer_evidence(self, card, task_id, request_id)
     preview_dispositions = bound_finding_dispositions(
         self,
         task_id,
@@ -4167,7 +4301,11 @@ def accept_review(
             # ``accept_preview`` runs the identical function and is where a
             # manager meets them: the point is that the two surfaces answer
             # from one implementation, not two that drift.
-            reviewers = reviewer_evidence(self, task_id, request_id)
+            # NF-2026-02293: plus the identical-bytes predecessor's receipted
+            # reviewers, so the fold selects them under the one shared rule.
+            reviewers = reviewer_evidence(
+                self, task_id, request_id
+            ) + carried_reviewer_evidence(self, card, task_id, request_id)
             # Bound against the SEALED receipts here; the gate below re-binds
             # against the receipts it re-verifies, so a disposition that no
             # longer matches is dropped there and the finding blocks again.
@@ -4496,6 +4634,14 @@ def accept_review(
             # only value a stored finding disposition may be bound to.
             verified_receipt_sha256: dict[str, str] = {}
             overlay_unreachable_ids: set[str] = set()
+            # NF-2026-02293: the request the task store's predecessor link names
+            # -- a pre-filter only. A reviewer bound to it is admitted solely by
+            # _admitted_reviewer_target on its own sealed receipt binding.
+            from . import review_orchestrator as _carry_rules
+
+            linked_predecessor_request_id = _carry_rules.predecessor_link_request_id(
+                card
+            )
             for reviewer_request_id in reviewer_ids:
                 reviewer_events = self._request_events(reviewer_request_id)
                 if not reviewer_events:
@@ -4519,17 +4665,51 @@ def accept_review(
                         reviewer_card = _parse_card(
                             self._show_task(reviewer_task_id), reviewer_task_id
                         )
+                        accepted_terminal = reviewer_card.get("terminal_review")
+                        accepted_evidence = (
+                            accepted_terminal.get("evidence")
+                            if isinstance(accepted_terminal, Mapping)
+                            else None
+                        )
+                        if not isinstance(accepted_evidence, Mapping):
+                            accepted_evidence = {}
+                        accepted_binding = accepted_evidence.get("quality_review")
+                        accepted_receipt = reviewer_latest.get("quality_review_receipt")
+                        # ONE admitted target for both the receipt (checked by
+                        # the verifier below) and the retained binding.
+                        accepted_admitted = _admitted_reviewer_target(
+                            card,
+                            request_id,
+                            accepted_receipt,
+                            retained_sealed_binding(
+                                accepted_binding,
+                                accepted_evidence.get("workspace"),
+                                accepted_receipt,
+                            ),
+                        )
                         receipt = _verified_accepted_quality_review_receipt(
                             reviewer_latest,
                             reviewer_card,
                             reviewer_request_id,
-                            request_id,
+                            accepted_admitted,
                             task_id,
                         )
                     except (LaunchRejected, WorkspaceError) as exc:
                         raise WorkspaceError(
                             f"quality_reviewer_accepted_invalid:{reviewer_request_id}:{exc}"
                         ) from exc
+                    accepted_bound_target = (
+                        str(accepted_binding.get("target_request_id") or "")
+                        if isinstance(accepted_binding, Mapping)
+                        else ""
+                    )
+                    if (
+                        accepted_admitted != request_id
+                        and accepted_bound_target != accepted_admitted
+                    ) or accepted_bound_target not in {"", accepted_admitted}:
+                        raise WorkspaceError(
+                            f"quality_reviewer_target_mismatch:{reviewer_request_id}"
+                        )
                     verified_reviewer_reports.append(
                         reviewer_hub_inspection.stamp_report(
                             receipt["report"], reviewer_request_id, reviewer_unreachable
@@ -4572,8 +4752,16 @@ def accept_review(
                         f"quality_reviewer_metadata_unreadable:{reviewer_request_id}"
                     ) from exc
                 reviewer_binding = reviewer_metadata.get("quality_review") or {}
+                bound_target_request_id = str(
+                    reviewer_binding.get("target_request_id") or ""
+                )
+                # NF-2026-02293: a cheap pre-filter -- this request, or the
+                # request the predecessor link names. Whether the latter is
+                # admitted is decided below on the verified receipt alone.
                 if (
-                    str(reviewer_binding.get("target_request_id") or "") != request_id
+                    not bound_target_request_id
+                    or bound_target_request_id
+                    not in {request_id, linked_predecessor_request_id}
                     or str(reviewer_binding.get("target_task_id") or "") != task_id
                 ):
                     raise WorkspaceError(
@@ -4595,6 +4783,28 @@ def accept_review(
                     reviewer_workspace,
                     reviewer_request_id,
                 )
+                # Recovered from the reviewer's own home and bound to the
+                # receipt just verified above, so the gate decides the
+                # supplemental question from the packet ITSELF rather than from
+                # the report's account of it. Unprovable packets return None
+                # and are simply absent.
+                reviewer_packet = sealed_review_packet(
+                    reviewer_metadata, reviewer_workspace, receipt
+                )
+                # NF-2026-02293: ONE admitted target, and both the receipt's
+                # sealed target and the metadata binding must equal it.
+                admitted_target_request_id = _admitted_reviewer_target(
+                    card,
+                    request_id,
+                    receipt,
+                    _carry_rules.sealed_reviewer_binding(receipt, reviewer_packet),
+                )
+                if _reviewer_target_split(
+                    bound_target_request_id, receipt, admitted_target_request_id
+                ):
+                    raise WorkspaceError(
+                        f"quality_reviewer_target_mismatch:{reviewer_request_id}"
+                    )
                 verified_reviewer_reports.append(
                     reviewer_hub_inspection.stamp_report(
                         receipt["report"], reviewer_request_id, reviewer_unreachable
@@ -4607,14 +4817,6 @@ def accept_review(
                         reviewer_workspace,
                         False,
                     )
-                )
-                # Recovered from the reviewer's own home and bound to the
-                # receipt just verified above, so the gate decides the
-                # supplemental question from the packet ITSELF rather than from
-                # the report's account of it. Unprovable packets return None
-                # and are simply absent.
-                reviewer_packet = sealed_review_packet(
-                    reviewer_metadata, reviewer_workspace, receipt
                 )
                 reviewer_report_lens = str(
                     (receipt.get("report") or {}).get("lens") or ""

@@ -7606,12 +7606,17 @@ def retained_terminal_rework_predecessor(
             committed_drift_proof, base_oid, path, baseline_hash
         ):
             return None, "retained_terminal_candidate_baseline_mismatch"
+    # NF-2026-02293: the contract this terminal attempt was reviewed against,
+    # taken from the predecessor card before any amendment, by its one owner.
+    from .review_orchestrator import contract_identity_digest
+
     return {
         "schema_id": "aiworkhub.rework_predecessor.v1",
         "request_id": request_id,
         "task_id": task_id,
         "repo": str(expected_repo),
         "claim_epoch": terminal_claim_epoch,
+        "contract_identity_sha256": contract_identity_digest(card),
         "allowed_writes": list(allowed_writes),
         "changed_paths": list(changed_paths),
         "changed_path_hashes": dict(changed_hashes),
@@ -8774,6 +8779,10 @@ def recover_blocked_rework(
                         predecessor_changed_path_hashes = lineage_hashes
                         predecessor["changed_path_hashes"] = dict(lineage_hashes)
                         predecessor["changed_paths"] = list(lineage_hashes)
+                        # NF-2026-02293: the contract the replayed bytes were
+                        # reviewed against, by the one owner of that rule.
+                        from .review_orchestrator import contract_identity_digest
+
                         card["validation_only_replay_lineage"] = {
                             "schema_id": "aiworkhub.validation_only_replay_lineage.v1",
                             "task_id": task_id,
@@ -8781,6 +8790,7 @@ def recover_blocked_rework(
                             "predecessor_request_id": predecessor_request_id,
                             "predecessor_claim_epoch": claim_epoch,
                             "changed_path_hashes": dict(lineage_hashes),
+                            "contract_identity_sha256": contract_identity_digest(card),
                         }
 
                     # A task can complete a validation-only replay, be rejected
@@ -9706,6 +9716,10 @@ def recover_blocked_rework(
         card["recovery_feedback"] = bounded_feedback
 
         if validation_only_replay:
+            # NF-2026-02293: the contract the replayed bytes were reviewed
+            # against, by the one owner of that rule.
+            from .review_orchestrator import contract_identity_digest
+
             card["validation_only_replay_lineage"] = {
                 "schema_id": "aiworkhub.validation_only_replay_lineage.v1",
                 "task_id": task_id,
@@ -9713,6 +9727,7 @@ def recover_blocked_rework(
                 "predecessor_request_id": predecessor_request_id,
                 "predecessor_claim_epoch": claim_epoch,
                 "changed_path_hashes": dict(predecessor_changed_path_hashes),
+                "contract_identity_sha256": contract_identity_digest(card),
             }
             card["validation_only_replay_authorization"] = {
                 "task_id": task_id,

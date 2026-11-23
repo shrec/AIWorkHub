@@ -1378,6 +1378,213 @@ def contract_identity_digest(card: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+# NF-2026-02293: the two task-store records that link a replay or rework
+# episode to the attempt it re-presents. Both are written only by the task
+# store onto the card it owns; nothing a caller supplies is ever read as one.
+REWORK_PREDECESSOR_SCHEMA = "aiworkhub.rework_predecessor.v1"
+VALIDATION_REPLAY_LINEAGE_SCHEMA = "aiworkhub.validation_only_replay_lineage.v1"
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def predecessor_link_request_id(card: Any) -> str:
+    """The request the task store's predecessor link NAMES -- a lookup key only.
+
+    Callers use it to find the predecessor's reviewer evidence. It decides
+    nothing: whether that evidence carries is :func:`identical_bytes_predecessor`
+    alone, which re-reads the same link and cross-checks it against the sealed
+    receipt binding.
+    """
+    link = card.get("rework_predecessor") if isinstance(card, Mapping) else None
+    return str(link.get("request_id") or "") if isinstance(link, Mapping) else ""
+
+
+def sealed_reviewer_binding(receipt: Any, packet: Any) -> dict[str, Any]:
+    """The target one reviewer receipt is SEALED to, or ``{}``.
+
+    ``receipt`` is a reviewer receipt the supervisor verified and stored
+    (``quality_reviewer.verify_reviewer_receipt`` copies its ``target`` from
+    the packet it checked); ``packet`` is the exact packet that receipt is
+    bound to. Neither is worker-authored. Every one of these has to hold:
+
+    * the receipt names a non-empty target request and task, and a
+      bool-safe ``claim_epoch`` >= 1;
+    * the packet's own ``packet_sha256`` is the receipt's;
+    * the packet's target names the same request, task and epoch;
+    * the packet's ``candidate.changed_paths`` rows give the candidate digest
+      (:func:`candidate_digest` over ``{path: sha256}``).
+
+    Anything missing or disagreeing is ``{}``, which never carries.
+    """
+    if not isinstance(receipt, Mapping) or not isinstance(packet, Mapping):
+        return {}
+    target = receipt.get("target")
+    packet_target = packet.get("target")
+    candidate = packet.get("candidate")
+    if not (
+        isinstance(target, Mapping)
+        and isinstance(packet_target, Mapping)
+        and isinstance(candidate, Mapping)
+    ):
+        return {}
+    digest = str(receipt.get("packet_sha256") or "")
+    epoch = target.get("claim_epoch")
+    request = str(target.get("request_id") or "")
+    task = str(target.get("task_id") or "")
+    if (
+        _SHA256_HEX.fullmatch(digest) is None
+        or str(packet.get("packet_sha256") or "") != digest
+        or not request
+        or not task
+        or type(epoch) is not int
+        or epoch < 1
+        or str(packet_target.get("request_id") or "") != request
+        or str(packet_target.get("task_id") or "") != task
+        or packet_target.get("claim_epoch") != epoch
+    ):
+        return {}
+    rows = candidate.get("changed_paths")
+    if not isinstance(rows, list) or not rows:
+        return {}
+    hashes: dict[str, Any] = {}
+    for row in rows:
+        path = row.get("path") if isinstance(row, Mapping) else None
+        if not isinstance(path, str) or not path or path in hashes:
+            return {}
+        hashes[path] = row.get("sha256")
+    return {
+        "request_id": request,
+        "task_id": task,
+        "claim_epoch": epoch,
+        "candidate_sha256": candidate_digest(hashes),
+    }
+
+
+def identical_bytes_predecessor(
+    card: Any, request_id: str, sealed_binding: Any
+) -> dict[str, str]:
+    """The authenticated predecessor whose reviewed bytes ``request_id`` re-presents.
+
+    ONE definition (NF-2026-02293), read by the accept fold, the accept
+    reviewer loop and recovery's lens coverage, so "the predecessor's verified
+    reviewer receipts still count" means the same thing in all three places.
+
+    It mirrors the hash-keyed replay rule of
+    ``quality_evidence.fold_quality_verdict`` (``replay_binding``): BOTH the
+    candidate digest and the contract identity must match, and both must be
+    known. Here they are compared between this request's own sealed terminal
+    evidence, the predecessor link the task store recorded on ``card``, and
+    -- because a card dict alone is never sufficient -- the ``sealed_binding``
+    of one predecessor reviewer receipt (:func:`sealed_reviewer_binding`):
+
+    * ``card["rework_predecessor"]`` (``aiworkhub.rework_predecessor.v1``) of
+      the SAME task names a different, non-empty predecessor request and a
+      bool-safe ``claim_epoch``;
+    * when the card carries a ``validation_only_replay_lineage`` it is the
+      v1 schema, of this task, and names that same predecessor request,
+      ``predecessor_claim_epoch`` and hashes;
+    * this request's ``changed_path_hashes`` equal the predecessor's exactly,
+      and so their ``candidate_digest`` values are equal;
+    * the predecessor's recorded ``contract_identity_sha256`` (on the link or
+      the lineage; when both carry one they must agree) equals
+      :func:`contract_identity_digest` of this card;
+    * the sealed receipt binding names that predecessor request, this task,
+      the link's claim epoch and that same candidate digest.
+
+    Returns ``{}`` on anything else -- a byte difference, another task, an
+    absent or malformed link, an unknown contract, a receipt sealed to other
+    bytes, another request or another epoch. Empty is never a carry, so every
+    caller keeps its pre-existing refusal. Whether the receipt itself verifies
+    is NOT decided here: each caller still verifies it exactly as it verifies
+    this request's own.
+    """
+    if not isinstance(card, Mapping) or not request_id:
+        return {}
+    task_id = str(card.get("task_id") or "")
+    predecessor = card.get("rework_predecessor")
+    terminal = card.get("terminal_review")
+    evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
+    identity = (
+        evidence.get("request_identity") if isinstance(evidence, Mapping) else None
+    )
+    if not (
+        task_id
+        and isinstance(predecessor, Mapping)
+        and isinstance(evidence, Mapping)
+        and isinstance(identity, Mapping)
+        and isinstance(sealed_binding, Mapping)
+    ):
+        return {}
+    predecessor_request_id = str(predecessor.get("request_id") or "")
+    predecessor_epoch = predecessor.get("claim_epoch")
+    if (
+        predecessor.get("schema_id") != REWORK_PREDECESSOR_SCHEMA
+        or not predecessor_request_id
+        or predecessor_request_id == request_id
+        or str(predecessor.get("task_id") or "") != task_id
+        or type(predecessor_epoch) is not int
+        or predecessor_epoch < 1
+        or str(identity.get("request_id") or "") != request_id
+        or str(identity.get("task_id") or "") != task_id
+    ):
+        return {}
+    predecessor_hashes = predecessor.get("changed_path_hashes")
+    current_hashes = evidence.get("changed_path_hashes")
+    if (
+        not isinstance(predecessor_hashes, Mapping)
+        or not predecessor_hashes
+        or not isinstance(current_hashes, Mapping)
+        or dict(current_hashes) != dict(predecessor_hashes)
+    ):
+        return {}
+    recorded_contracts = {str(predecessor.get("contract_identity_sha256") or "")}
+    lineage = card.get("validation_only_replay_lineage")
+    if lineage is not None:
+        lineage_hashes = (
+            lineage.get("changed_path_hashes") if isinstance(lineage, Mapping) else None
+        )
+        lineage_epoch = (
+            lineage.get("predecessor_claim_epoch")
+            if isinstance(lineage, Mapping)
+            else None
+        )
+        if (
+            not isinstance(lineage, Mapping)
+            or lineage.get("schema_id") != VALIDATION_REPLAY_LINEAGE_SCHEMA
+            or str(lineage.get("task_id") or "") != task_id
+            or str(lineage.get("predecessor_request_id") or "") != predecessor_request_id
+            or type(lineage_epoch) is not int
+            or lineage_epoch != predecessor_epoch
+            or not isinstance(lineage_hashes, Mapping)
+            or dict(lineage_hashes) != dict(predecessor_hashes)
+        ):
+            return {}
+        recorded_contracts.add(str(lineage.get("contract_identity_sha256") or ""))
+    recorded_contracts.discard("")
+    current_contract = contract_identity_digest(card)
+    current_candidate = candidate_digest(current_hashes)
+    sealed_epoch = sealed_binding.get("claim_epoch")
+    if (
+        len(recorded_contracts) != 1
+        or not current_contract
+        or next(iter(recorded_contracts)) != current_contract
+        or _SHA256_HEX.fullmatch(current_contract) is None
+        or current_candidate != candidate_digest(predecessor_hashes)
+        or str(sealed_binding.get("request_id") or "") != predecessor_request_id
+        or str(sealed_binding.get("task_id") or "") != task_id
+        or type(sealed_epoch) is not int
+        or sealed_epoch != predecessor_epoch
+        or str(sealed_binding.get("candidate_sha256") or "") != current_candidate
+    ):
+        return {}
+    return {
+        "request_id": predecessor_request_id,
+        "task_id": task_id,
+        "claim_epoch": str(predecessor_epoch),
+        "candidate_sha256": current_candidate,
+        "contract_identity_sha256": current_contract,
+    }
+
+
 def target_identity_from_card(card: Any) -> dict[str, str]:
     """Read the candidate identity from where the finalizer actually writes it.
 
@@ -2180,6 +2387,7 @@ def _reviewer_lens_coverage(
     status_of: Callable[[str], Any] | None = None,
     now: datetime | None = None,
     existing_of: Callable[[str], Any] | None = None,
+    carried_of: Callable[[str], Any] | None = None,
 ) -> dict[str, str]:
     """Classify each planned lens as covered, unusable, exhausted or absent.
 
@@ -2259,15 +2467,28 @@ def _reviewer_lens_coverage(
                 existing_of, lens
             ):
                 coverage[lens] = _COVERAGE_COVERED
+    if callable(carried_of):
+        # NF-2026-02293: a byte-identical replay of the SAME task carries its
+        # authenticated predecessor's VERIFIED lens report. Only a sealed one:
+        # a predecessor reviewer still running, or one whose report did not
+        # verify, is no receipt and carries nothing.
+        for lens in lenses:
+            if coverage[lens] != _COVERAGE_COVERED and _lens_held_elsewhere(
+                carried_of, lens, sealed_only=True
+            ):
+                coverage[lens] = _COVERAGE_COVERED
     return coverage
 
 
-def _lens_held_elsewhere(existing_of: Callable[[str], Any], lens: str) -> bool:
+def _lens_held_elsewhere(
+    existing_of: Callable[[str], Any], lens: str, *, sealed_only: bool = False,
+) -> bool:
     """Whether the shared reuse rule names a reviewer this lens already has.
 
     The answer is :func:`existing_lens_reviewer`'s, supplied by the manager
     from its own ledger. An unreadable lookup holds nothing, so the lens is
     ensured exactly as before and the launcher's reservation still decides.
+    ``sealed_only`` admits only a verified report (``state == "sealed"``).
     """
     try:
         found = existing_of(lens)
@@ -2275,7 +2496,39 @@ def _lens_held_elsewhere(existing_of: Callable[[str], Any], lens: str) -> bool:
         return False
     return isinstance(found, Mapping) and bool(
         str(found.get("task_id") or "") and str(found.get("request_id") or "")
-    )
+    ) and (not sealed_only or str(found.get("state") or "") == "sealed")
+
+
+def _carried_lens_lookup(
+    manager: Any, card: Any, task_id: str, request_id: str
+) -> Callable[[str], Any] | None:
+    """Per lens, the predecessor reviewer whose receipt this replay carries.
+
+    NF-2026-02293: the rows are exactly the accept fold's
+    ``carried_reviewer_evidence`` -- usable, receipted, and each admitted by
+    :func:`identical_bytes_predecessor` against its own sealed binding -- so
+    seeding skips a lens only when accept would count it. A row so admitted
+    is reported ``sealed``. Unreadable evidence carries nothing (``None``),
+    and the lens is ensured exactly as before.
+    """
+    from . import process_launcher_accept_review
+
+    try:
+        rows = process_launcher_accept_review.carried_reviewer_evidence(
+            manager, card, task_id, request_id
+        )
+    except Exception:  # noqa: BLE001 -- unreadable evidence carries nothing
+        return None
+    by_lens: dict[str, dict[str, str]] = {}
+    for row in rows:
+        lens = str(row.get("lens") or "")
+        if lens and lens not in by_lens:
+            by_lens[lens] = {
+                "task_id": str(row.get("task_id") or ""),
+                "request_id": str(row.get("request_id") or ""),
+                "state": "sealed",
+            }
+    return by_lens.get if by_lens else None
 
 
 def _manager_lens_lookup(
@@ -2637,11 +2890,18 @@ def recover_review_ready_targets(
         # NF-2026-02277: coverage is a LIVE reviewer or a verified report. A
         # child reserved or left pending with no live process past the settle
         # window is not one, so this pass ensures the lens instead of skipping it.
+        # NF-2026-02293: the predecessor is read only from the task store's own
+        # card, never from a caller, and a lens carries only through the SAME
+        # fold the accept path uses -- each predecessor receipt cross-checked
+        # by identical_bytes_predecessor against its own sealed binding.
         coverage = _reviewer_lens_coverage(
             repo, identity, planned,
             status_of=getattr(manager, "status", None),
             now=datetime.now(timezone.utc),
             existing_of=_manager_lens_lookup(manager, identity),
+            carried_of=_carried_lens_lookup(
+                manager, card, identity["target_task_id"], request_id
+            ),
         )
         missing = tuple(
             lens for lens in planned if coverage[lens] != _COVERAGE_COVERED
