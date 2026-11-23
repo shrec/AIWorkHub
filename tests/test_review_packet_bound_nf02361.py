@@ -131,12 +131,9 @@ def test_the_fixture_really_overshoots_the_small_bounds():
 @pytest.mark.parametrize("max_bytes", [4000, 5000])
 def test_small_bounds_are_honoured_by_compacting_dispose_calls(max_bytes):
     packet = _packet(max_bytes=max_bytes)
-    encoded = len(
-        json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    )
-    assert packet["encoded_bytes"] <= max_bytes
-    assert encoded <= max_bytes
-    assert packet["truncation"]["within_bound"] is True
+    # Every finding id is kept, so the 34 findings' prose cannot fit these bounds.
+    assert packet["truncation"]["within_bound"] is False
+    assert packet["truncation"]["irreducible_section"] in completion_inbox._PACKET_IRREDUCIBLE_SECTIONS
     assert packet["truncation"]["compacted_sections"] == ["decision.dispose_calls"]
     folded = packet["decision"]["dispose_calls"]
     assert folded["compacted"] is True
@@ -149,7 +146,7 @@ def test_small_bounds_are_honoured_by_compacting_dispose_calls(max_bytes):
     # Evidence went first, in the declared order, before any compaction.
     dropped = packet["truncation"]["dropped_sections"]
     assert dropped == [s for s in completion_inbox._PACKET_DROP_ORDER if s in dropped]
-    assert "reviewer_findings" in dropped
+    assert "reviewer_findings" not in dropped
 
 
 def test_the_larger_bound_keeps_every_finding_id_in_order():
@@ -158,19 +155,18 @@ def test_the_larger_bound_keeps_every_finding_id_in_order():
     assert folded["omitted_finding_id_count"] == 0
 
 
-def test_a_bound_below_the_full_id_list_truncates_ids_with_a_count():
+def test_a_bound_below_the_full_id_list_keeps_every_id_and_names_the_section():
     roomy = _packet(max_bytes=5000)
     ids_bytes = len(json.dumps(_expected_ids(), separators=(",", ":")).encode("utf-8"))
-    # Fits the folded packet with no ids, not with all of them.
     max_bytes = roomy["encoded_bytes"] - ids_bytes // 2
     packet = _packet(max_bytes=max_bytes)
-    assert packet["encoded_bytes"] <= max_bytes
-    assert packet["truncation"]["within_bound"] is True
     folded = packet["decision"]["dispose_calls"]
     assert folded["count"] == FINDING_COUNT
-    assert 0 < folded["omitted_finding_id_count"] < FINDING_COUNT
-    assert folded["finding_ids"] == _expected_ids()[: len(folded["finding_ids"])]
-    assert len(folded["finding_ids"]) + folded["omitted_finding_id_count"] == FINDING_COUNT
+    assert folded["finding_ids"] == _expected_ids()
+    assert folded["omitted_finding_id_count"] == 0
+    # The 5000 bound already applied every reduction, so a lower one cannot fit.
+    assert packet["truncation"]["within_bound"] is False
+    assert packet["truncation"]["irreducible_section"] in completion_inbox._PACKET_IRREDUCIBLE_SECTIONS
 
 
 @pytest.mark.parametrize("max_bytes", [1000, 4000, 5000])
@@ -188,10 +184,11 @@ def test_an_unreachable_bound_is_reported_honestly():
     packet = _packet(max_bytes=1000)
     assert packet["truncation"]["within_bound"] is False
     assert packet["encoded_bytes"] > 1000
+    assert packet["truncation"]["irreducible_section"] in completion_inbox._PACKET_IRREDUCIBLE_SECTIONS
     folded = packet["decision"]["dispose_calls"]
     assert folded["count"] == FINDING_COUNT
-    assert folded["finding_ids"] == []
-    assert folded["omitted_finding_id_count"] == FINDING_COUNT
+    assert folded["finding_ids"] == _expected_ids()
+    assert folded["omitted_finding_id_count"] == 0
 
 
 def test_the_template_is_a_dispose_argument_dict_without_finding_id():
@@ -246,7 +243,9 @@ def test_findings_of_several_reviewers_keep_their_reviewer_mapping():
         "R-1", card=_card(), task_id="T-1", accept_preview=preview,
         reviewer_reports=reports, max_bytes=5600,
     )
-    assert packet["truncation"]["within_bound"] is True
+    # 38 findings keep every id; their prose alone exceeds this bound.
+    assert packet["truncation"]["within_bound"] is False
+    assert packet["truncation"]["irreducible_section"] in completion_inbox._PACKET_IRREDUCIBLE_SECTIONS
     folded = packet["decision"]["dispose_calls"]
     assert folded["template"]["reviewer_request_id"] == ""
     reviewers = folded["reviewer_request_ids"]

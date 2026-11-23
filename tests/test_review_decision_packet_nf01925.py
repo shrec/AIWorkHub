@@ -250,10 +250,10 @@ def test_decision_survives_a_tight_bound_and_evidence_is_dropped_first():
     assert "decision" not in completion_inbox._PACKET_DROP_ORDER
     assert dropped == [s for s in completion_inbox._PACKET_DROP_ORDER if s in dropped]
     assert dropped[0] == "validation_output_tails"
-    assert "reviewer_findings" in dropped
+    assert "reviewer_findings" not in dropped
     # The evidence went; the decision built from it did not. Still over the
     # bound, only its per-finding dispose calls fold (NF-2026-02361).
-    assert tight["review"]["findings"] == []
+    assert [f["id"] for f in tight["review"]["findings"]] == [f["id"] for f in full["review"]["findings"]]
     decision = dict(tight["decision"])
     folded = decision.pop("dispose_calls")
     expected = dict(full["decision"])
@@ -262,8 +262,8 @@ def test_decision_survives_a_tight_bound_and_evidence_is_dropped_first():
     assert tight["truncation"]["compacted_sections"] == ["decision.dispose_calls"]
     assert folded["count"] == len(full_calls)
     kept = folded["finding_ids"]
-    assert kept == [c["arguments"]["finding_id"] for c in full_calls][: len(kept)]
-    assert folded["omitted_finding_id_count"] == len(full_calls) - len(kept)
+    assert kept == [c["arguments"]["finding_id"] for c in full_calls]
+    assert folded["omitted_finding_id_count"] == 0
     assert "compacted_sections" not in full["truncation"]
 
 

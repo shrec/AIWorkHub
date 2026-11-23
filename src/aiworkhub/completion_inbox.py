@@ -872,18 +872,38 @@ REVIEW_PACKET_MAX_BYTES = 90_000
 _PACKET_TAIL_CHARS = 2_000
 _PACKET_TEXT_CHARS = 600
 _PACKET_MAX_ROWS = 60
+# Text kept on a finding or observation once its prose must shrink; the id and
+# the dispose id are never touched.
+_PACKET_SHORT_TEXT_CHARS = 120
+# Citation-drift statuses that do not block: collapsed to counts before any
+# blocking row is considered.
+_PACKET_NON_BLOCKING_CITATION = ("moved", "ok")
 
-# Dropped in this order while the encoded packet exceeds the bound. Least
-# decisive first: an output tail can be re-read from the artifact bundle, a
-# blocker cannot be re-derived from anything the manager has open.
+# Dropped or collapsed in this order while the finalized packet exceeds the
+# bound. Least decisive first: passing gate rows collapse to counts, then the
+# output tails (re-readable from the artifact bundle), then gate evidence. The
+# blockers (failed destructive diff, broken citation) are never removed here.
+# Reviewer observations and findings are never dropped: only their prose
+# shrinks, so no finding id or dispose id is ever lost.
 _PACKET_DROP_ORDER = (
+    "gate_rows_non_blocking",
     "validation_output_tails",
     "gate_checks_passed",
-    "reviewer_observations",
     "changed_paths",
     "validation",
     "gate_checks",
-    "reviewer_findings",
+    "reviewer_observations_prose",
+    "reviewer_findings_prose",
+)
+# Sections no declared drop reduces further. When the packet cannot fit, the
+# packet names the largest one still standing (dotted "section.child").
+_PACKET_IRREDUCIBLE_SECTIONS = (
+    "review.findings",
+    "review.observations",
+    "decision.dispose_calls",
+    "decision",
+    "gates.destructive_diff_checks",
+    "gates.citation_drift",
 )
 
 
@@ -1106,8 +1126,93 @@ def _packet_encoded_bytes(packet: dict[str, Any]) -> int:
     )
 
 
+def _packet_collapse_gate_rows(
+    gates: dict[str, Any],
+    rows_key: str,
+    summary_key: str,
+    collapsible: tuple[str, ...],
+) -> bool:
+    """Collapse the rows of ``gates[rows_key]`` whose status is non-blocking to counts.
+
+    Rows with any other status (a failed destructive diff, a broken citation)
+    stay whole. The collapsed rows become ``gates[summary_key]``, one count per
+    status plus ``rows_omitted``. Returns whether any row was collapsed.
+    """
+    rows = gates.get(rows_key) or []
+    kept: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("status") or "")
+        if status in collapsible:
+            counts[status] = counts.get(status, 0) + 1
+        else:
+            kept.append(row)
+    if not counts:
+        return False
+    gates[rows_key] = kept
+    gates[summary_key] = {**dict(sorted(counts.items())), "rows_omitted": sum(counts.values())}
+    return True
+
+
+def _packet_shorten_prose(rows: Any) -> bool:
+    """Shorten the prose fields of finding or observation rows. Ids are never touched.
+
+    A shortened value is its first ``_PACKET_SHORT_TEXT_CHARS`` characters plus
+    an ellipsis. A value already in that form is left alone, so a second pass
+    reports no change.
+    """
+    changed = False
+    for row in rows if isinstance(rows, list) else []:
+        for key in ("summary", "evidence", "claim", "reproduction", "required_validation"):
+            text = row.get(key)
+            if not isinstance(text, str):
+                continue
+            shortened = text[:_PACKET_SHORT_TEXT_CHARS] + "…"
+            if len(text) > _PACKET_SHORT_TEXT_CHARS and text != shortened:
+                row[key] = shortened
+                changed = True
+    return changed
+
+
+def _packet_irreducible_section(packet: dict[str, Any]) -> str:
+    """The largest declared irreducible section still standing, or ``""``.
+
+    Only the dotted names in ``_PACKET_IRREDUCIBLE_SECTIONS`` are candidates:
+    the parts no declared drop can reduce further. Ties go to the first one in
+    tuple order.
+    """
+
+    def size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    best_name = ""
+    best_size = -1
+    for dotted in _PACKET_IRREDUCIBLE_SECTIONS:
+        value: Any = packet
+        for part in dotted.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        if value is None:
+            continue
+        measured = size(value)
+        if measured > best_size:
+            best_name, best_size = dotted, measured
+    return best_name
+
+
 def _packet_drop(packet: dict[str, Any], section: str) -> bool:
     """Apply one declared drop. Returns whether anything was actually removed."""
+    if section == "gate_rows_non_blocking":
+        # Both collapses run even when the first one alone would fit: the
+        # passing rows are noise for the manager, and collapsing both keeps the
+        # packet's gate shape the same whenever it had to shrink.
+        gates = packet.get("gates", {})
+        passed = _packet_collapse_gate_rows(
+            gates, "destructive_diff_checks", "destructive_diff_collapsed", ("passed",)
+        )
+        moved = _packet_collapse_gate_rows(
+            gates, "citation_drift", "citation_drift_collapsed", _PACKET_NON_BLOCKING_CITATION
+        )
+        return passed or moved
     if section == "validation_output_tails":
         rows = packet.get("gates", {}).get("validation") or []
         dropped = False
@@ -1125,11 +1230,8 @@ def _packet_drop(packet: dict[str, Any], section: str) -> bool:
         kept = [row for row in rows if row.get("status") != "passed"]
         gates["quality_gate_checks"] = kept
         return len(kept) != len(rows)
-    if section == "reviewer_observations":
-        review = packet.get("review", {})
-        had = bool(review.get("observations"))
-        review["observations"] = []
-        return had
+    if section == "reviewer_observations_prose":
+        return _packet_shorten_prose(packet.get("review", {}).get("observations"))
     if section == "changed_paths":
         diff = packet.get("diff", {})
         had = bool(diff.get("changed_paths"))
@@ -1145,11 +1247,8 @@ def _packet_drop(packet: dict[str, Any], section: str) -> bool:
         had = bool(gates.get("quality_gate_checks"))
         gates["quality_gate_checks"] = []
         return had
-    if section == "reviewer_findings":
-        review = packet.get("review", {})
-        had = bool(review.get("findings"))
-        review["findings"] = []
-        return had
+    if section == "reviewer_findings_prose":
+        return _packet_shorten_prose(packet.get("review", {}).get("findings"))
     return False
 
 
@@ -1317,7 +1416,7 @@ _DECISION_COMPACTED_SECTION = "decision.dispose_calls"
 
 
 def _packet_compact_decision(packet: dict[str, Any], max_bytes: int) -> bool:
-    """Fold ``decision.dispose_calls`` so an over-bound packet can honour max_bytes.
+    """Fold ``decision.dispose_calls`` into one template and an id list.
 
     The accept and reject argument dicts are never touched. The per-finding
     calls become ``{count, finding_ids, omitted_finding_id_count, template}``:
@@ -1325,8 +1424,9 @@ def _packet_compact_decision(packet: dict[str, Any], max_bytes: int) -> bool:
     ``reviewer_request_id`` is blank when the findings span several reviewers;
     ``reviewer_request_ids`` then lists them all and ``finding_reviewer_index[i]``
     is the position of finding_ids[i]'s reviewer in it). ``finding_ids`` keeps
-    the call order and, only if the packet still exceeds the bound, is cut to
-    the longest prefix that fits (the index with it), the rest counted.
+    the call order and is never cut: no finding id or dispose id is dropped.
+    Only finding prose shrinks (see ``_packet_shorten_prose``); a packet that
+    still exceeds ``max_bytes`` is reported with ``within_bound`` false.
     Returns whether it compacted.
     """
     decision = packet.get("decision")
@@ -1348,46 +1448,26 @@ def _packet_compact_decision(packet: dict[str, Any], max_bytes: int) -> bool:
         for key, value in (arguments[0] if arguments else {}).items()
         if key != "finding_id"
     }
-    reviewer_index: list[int] | None = None
-    if len(reviewer_ids) > 1:
-        template["reviewer_request_id"] = ""
-        position = {reviewer: i for i, reviewer in enumerate(reviewer_ids)}
-        reviewer_index = [position[reviewer] for reviewer in finding_reviewers]
     folded: dict[str, Any] = {
         "compacted": True,
         "tool": _DECISION_DISPOSE_TOOL,
         "count": len(finding_ids),
         "finding_ids": finding_ids,
+        # Every id is kept; the count stays for shape stability.
         "omitted_finding_id_count": 0,
         "template": template,
         # Whole, never row-capped: finding_reviewer_index points into it.
         "reviewer_request_ids": reviewer_ids,
     }
-
-    def keep(prefix: int) -> None:
-        folded["finding_ids"] = finding_ids[:prefix]
-        folded["omitted_finding_id_count"] = len(finding_ids) - prefix
-        if reviewer_index is not None:
-            folded["finding_reviewer_index"] = reviewer_index[:prefix]
-
-    keep(len(finding_ids))
+    if len(reviewer_ids) > 1:
+        template["reviewer_request_id"] = ""
+        position = {reviewer: i for i, reviewer in enumerate(reviewer_ids)}
+        folded["finding_reviewer_index"] = [position[reviewer] for reviewer in finding_reviewers]
     decision["dispose_calls"] = folded
     truncation = packet.setdefault("truncation", {})
     compacted = truncation.setdefault("compacted_sections", [])
     if _DECISION_COMPACTED_SECTION not in compacted:
         compacted.append(_DECISION_COMPACTED_SECTION)
-    if _packet_finalized_bytes(packet) <= max_bytes:
-        return True
-    # Largest kept prefix that fits; bounded at log2(count) encodes.
-    low, high = 0, len(finding_ids)
-    while low < high:
-        middle = (low + high + 1) // 2
-        keep(middle)
-        if _packet_finalized_bytes(packet) <= max_bytes:
-            low = middle
-        else:
-            high = middle - 1
-    keep(low)
     return True
 
 
@@ -1750,8 +1830,11 @@ def review_packet(
     # NF-2026-01925: built before truncation from the sections already above,
     # and absent from _PACKET_DROP_ORDER, so evidence is always dropped first.
     packet["decision"] = _packet_decision(packet, preview)
+    bound = int(max_bytes)
+    # The loop measures the finalized packet (encoded_bytes and within_bound
+    # included), so a section is never kept on a size the caller will not get.
     for section in _PACKET_DROP_ORDER:
-        if _packet_encoded_bytes(packet) <= int(max_bytes):
+        if _packet_finalized_bytes(packet) <= bound:
             break
         if _packet_drop(packet, section):
             packet["truncation"]["dropped_sections"].append(section)
@@ -1759,10 +1842,16 @@ def review_packet(
     # decision is COMPACTED, never dropped: accept/reject stay whole and only
     # the per-finding dispose calls fold. A packet that already fits never
     # reaches this, so it stays byte-identical.
-    if _packet_finalized_bytes(packet) > int(max_bytes):
-        _packet_compact_decision(packet, int(max_bytes))
+    if _packet_finalized_bytes(packet) > bound:
+        _packet_compact_decision(packet, bound)
+    within = _packet_finalized_bytes(packet) <= bound
+    if not within:
+        # The irreducible core does not fit: name the section that could not shrink.
+        packet["truncation"]["irreducible_section"] = _packet_irreducible_section(packet)
+    # Measured after every truncation key except the trailer, so encoded_bytes
+    # describes the body actually returned.
     packet["encoded_bytes"] = _packet_encoded_bytes(packet)
-    packet["truncation"]["within_bound"] = packet["encoded_bytes"] <= int(max_bytes)
+    packet["truncation"]["within_bound"] = within
     return packet
 
 
