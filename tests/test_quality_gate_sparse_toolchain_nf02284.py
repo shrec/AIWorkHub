@@ -165,7 +165,8 @@ def test_changed_policy_resolves_module_and_inputs_from_canonical_toolchain(
     assert check["provenance"].endswith(":sparse_inputs_filled=4")
     assert gate["passed"] is True, gate["blocking_checks"]
     assert gate["verification_scope"] == "repository_policy"
-    assert (union / "scripts" / "check_me.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    # The check saw the filled input while it ran; the sealed tree keeps none.
+    assert not (union / "scripts").exists()
     # The candidate's config is never replaced by the canonical one.
     assert CANDIDATE_ONLY_CHECK in (union / CONFIG).read_text(encoding="utf-8")
 
@@ -237,8 +238,9 @@ def test_candidate_deleted_test_is_not_refilled_and_check_fails(tmp_path: Path) 
     assert row["status"] == "failed", row["summary"]
     assert row["executed_command"][-1] == "tests/test_x.py"
     assert not (union / "tests" / "test_x.py").exists()
-    # An unchanged canonical sibling is still filled.
-    assert (union / "tests" / "test_y.py").is_file()
+    # The unchanged canonical sibling was filled for the run, then removed.
+    assert row["provenance"].endswith(":sparse_inputs_filled=1")
+    assert not (union / "tests" / "test_y.py").exists()
     assert gate["passed"] is False
 
 
@@ -325,8 +327,9 @@ def test_untracked_and_ignored_canonical_files_are_not_filled(tmp_path: Path) ->
     assert check["provenance"].endswith(":sparse_inputs_filled=4")
     assert not (union / "scripts" / "untracked_local.py").exists()
     assert not (union / "src" / "token.secret").exists()
+    # NF-2026-02294: the fill is removed once the checks finish.
     for relative in _CANONICAL_TRACKED:
-        assert (union / relative).is_file(), relative
+        assert not (union / relative).exists(), relative
 
 
 @requires_git

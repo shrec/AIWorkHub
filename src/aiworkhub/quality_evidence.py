@@ -2704,6 +2704,10 @@ class SparseFillResult:
     filled: tuple[str, ...] = ()
     refused: int = 0
     error: str = ""
+    # NF-2026-02294: directories absent before the fill that it may have
+    # created; with ``filled`` this is the exact set cleanup removes. Not part
+    # of the receipt's identity.
+    created_dirs: tuple[str, ...] = field(default=(), compare=False)
 
 
 def _tracked_sparse_inputs(source_root: Path) -> tuple[list[str], str]:
@@ -2860,26 +2864,113 @@ def _fill_sparse_toolchain_inputs(
         missing.append(relative)
     if not missing:
         return SparseFillResult()
+    # Directories the fill may create: every ancestor below the root that is
+    # absent now. Recorded before any copy so cleanup removes only these (and
+    # only while empty); a pre-existing directory is never listed.
+    absent_dirs: set[str] = set()
+    for relative in missing:
+        parts = relative.split("/")[:-1]
+        for depth in range(1, len(parts) + 1):
+            directory = "/".join(parts[:depth])
+            if not os.path.lexists(root / directory):
+                absent_dirs.add(directory)
     capacity = parallelism.get_cpu_capacity()
     workers, _selection = parallelism.compute_worker_count(
         candidate_count=len(missing), reserve=max(1, capacity // 4)
     )
-    with parallelism.worker_pool_scope(), ThreadPoolExecutor(
-        max_workers=max(1, workers)
-    ) as pool:
-        outcomes = list(pool.map(
-            lambda relative: _copy_sparse_input(
-                source_root / relative, root, relative
-            ),
-            missing,
-        ))
+    try:
+        with parallelism.worker_pool_scope(), ThreadPoolExecutor(
+            max_workers=max(1, workers)
+        ) as pool:
+            outcomes = list(pool.map(
+                lambda relative: _copy_sparse_input(
+                    source_root / relative, root, relative
+                ),
+                missing,
+            ))
+    except BaseException as fill_error:
+        # A copy failure propagates (fail closed). Every path in ``missing``
+        # was absent before the fill, so whatever regular file sits there now
+        # (a partial copy included) is fill residue and must not outlive it.
+        try:
+            _remove_sparse_fill(root, SparseFillResult(
+                filled=tuple(sorted(missing)),
+                created_dirs=tuple(sorted(absent_dirs)),
+            ))
+        except OSError as cleanup_error:
+            # The copy failure (or interrupt) stays the raised exception; the
+            # cleanup leftover rides along as a note instead of replacing it.
+            fill_error.add_note(str(cleanup_error))
+        raise
     return SparseFillResult(
         filled=tuple(sorted(
             relative for relative, outcome in zip(missing, outcomes)
             if outcome == _SPARSE_FILL_FILLED
         )),
         refused=sum(1 for outcome in outcomes if outcome == _SPARSE_FILL_REFUSED),
+        created_dirs=tuple(sorted(absent_dirs)),
     )
+
+
+def _remove_sparse_fill(
+    validation_root: Path | str, fill: SparseFillResult
+) -> None:
+    """Remove exactly what one fill created, leaving the tree as it was.
+
+    Only ``fill.filled`` files are unlinked (a link or non-file at that path
+    is not ours and is left alone), then ``fill.created_dirs`` are removed
+    deepest first with ``rmdir`` so a directory that gained other content is
+    kept. Every removal is attempted; if a created file could not be removed
+    an ``OSError`` naming the leftovers is raised after the sweep (fail
+    closed: a sealed tree must not silently keep fill residue).
+    """
+
+    root = Path(validation_root)
+    leftovers: list[str] = []
+    for relative in fill.filled:
+        target = root / relative
+        try:
+            if target.is_symlink() or not target.is_file():
+                continue
+            target.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            leftovers.append(relative)
+    for directory in sorted(
+        fill.created_dirs, key=lambda item: item.count("/"), reverse=True
+    ):
+        target = root / directory
+        try:
+            if target.is_symlink():
+                continue
+            # A created directory the checks imported from holds a bytecode
+            # cache that is not fill content but would keep it alive. Drop it
+            # only when it is a real directory of regular ``*.pyc`` files and
+            # nothing but it would keep the directory; anything else stays.
+            cache = target / "__pycache__"
+            if (
+                cache.is_dir()
+                and not cache.is_symlink()
+                and [entry.name for entry in target.iterdir()] == ["__pycache__"]
+            ):
+                cached = list(cache.iterdir())
+                if all(
+                    entry.suffix == ".pyc"
+                    and entry.is_file()
+                    and not entry.is_symlink()
+                    for entry in cached
+                ):
+                    for entry in cached:
+                        entry.unlink()
+                    cache.rmdir()
+            target.rmdir()
+        except OSError:
+            continue
+    if leftovers:
+        raise OSError(
+            "sparse_fill_cleanup_failed:" + ",".join(sorted(leftovers))
+        )
 
 
 def _run_command_array(
@@ -3068,61 +3159,85 @@ def run_declared_checks(
         else ""
     )
     results: list[EvidenceCheck] = []
-    for entry in config.get("checks", []):
-        check_id = str(entry["id"])
-        kind = str(entry["kind"])
-        command = tuple(str(part) for part in entry["command"])
-        applies, skip_reason = _declared_check_applicability(
-            entry,
-            changed_paths=affected,
-            effective_risk_tier=effective_risk_tier,
-        )
-        if not applies:
-            results.append(EvidenceCheck(
-                check_id=check_id,
-                kind=kind,
-                status=STATUS_SKIPPED,
-                command=command,
-                affected_paths=affected,
-                summary=skip_reason,
-                provenance=f"repo_config:{CONFIG_RELATIVE_PATH}:applicability",
-            ))
-            continue
-        execution_receipt: dict[str, Any] = {
-            "sparse_inputs_filled": len(sparse_fill.filled),
-            "sparse_inputs_refused": sparse_fill.refused,
-            "sparse_inputs_fill_error": sparse_fill.error,
-        }
-        status, stdout, stderr, duration = _run_command_array(
-            command,
-            cwd=root,
-            timeout_seconds=timeout_seconds,
-            execution_receipt=execution_receipt,
-            toolchain_root=command_toolchain_root,
-        )
-        summary = f"stdout:\n{stdout}\nstderr:\n{stderr}"
-        results.append(
-            EvidenceCheck(
-                check_id=check_id,
-                kind=kind,
-                status=status,
-                command=command,
-                executed_command=tuple(execution_receipt.get("executed_command") or ()),
-                command_resolution=str(
-                    execution_receipt.get("command_resolution") or "declared"
-                ),
-                duration_seconds=duration,
-                affected_paths=affected,
-                summary=summary.strip(),
-                provenance=(f"repo_config:{CONFIG_RELATIVE_PATH}:cwd={root}:"
-                            f"source_root={root / 'src'}{fill_provenance}"),
-                error="" if status != STATUS_NOT_AVAILABLE else stderr,
+    cleanup_error: OSError | None = None
+    # NF-2026-02294: the fill exists only for the checks' lifetime. The
+    # validation tree is the retained, hash-sealed review worktree, so what the
+    # fill created is removed whether the commands pass, fail, time out or raise.
+    try:
+        for entry in config.get("checks", []):
+            check_id = str(entry["id"])
+            kind = str(entry["kind"])
+            command = tuple(str(part) for part in entry["command"])
+            applies, skip_reason = _declared_check_applicability(
+                entry,
+                changed_paths=affected,
+                effective_risk_tier=effective_risk_tier,
             )
-        )
-        if isinstance(entry.get("report"), Mapping):
+            if not applies:
+                results.append(EvidenceCheck(
+                    check_id=check_id,
+                    kind=kind,
+                    status=STATUS_SKIPPED,
+                    command=command,
+                    affected_paths=affected,
+                    summary=skip_reason,
+                    provenance=f"repo_config:{CONFIG_RELATIVE_PATH}:applicability",
+                ))
+                continue
+            execution_receipt: dict[str, Any] = {
+                "sparse_inputs_filled": len(sparse_fill.filled),
+                "sparse_inputs_refused": sparse_fill.refused,
+                "sparse_inputs_fill_error": sparse_fill.error,
+            }
+            status, stdout, stderr, duration = _run_command_array(
+                command,
+                cwd=root,
+                timeout_seconds=timeout_seconds,
+                execution_receipt=execution_receipt,
+                toolchain_root=command_toolchain_root,
+            )
+            summary = f"stdout:\n{stdout}\nstderr:\n{stderr}"
             results.append(
-                _adapt_declared_report(root, entry, affected_paths=affected)
+                EvidenceCheck(
+                    check_id=check_id,
+                    kind=kind,
+                    status=status,
+                    command=command,
+                    executed_command=tuple(execution_receipt.get("executed_command") or ()),
+                    command_resolution=str(
+                        execution_receipt.get("command_resolution") or "declared"
+                    ),
+                    duration_seconds=duration,
+                    affected_paths=affected,
+                    summary=summary.strip(),
+                    provenance=(f"repo_config:{CONFIG_RELATIVE_PATH}:cwd={root}:"
+                                f"source_root={root / 'src'}{fill_provenance}"),
+                    error="" if status != STATUS_NOT_AVAILABLE else stderr,
+                )
             )
+            if isinstance(entry.get("report"), Mapping):
+                results.append(
+                    _adapt_declared_report(root, entry, affected_paths=affected)
+                )
+    finally:
+        # Cleanup must not raise out of the finally block: that would discard
+        # the collected results and mask the commands' own exception.
+        try:
+            _remove_sparse_fill(root, sparse_fill)
+        except OSError as exc:
+            cleanup_error = exc
+    if cleanup_error is not None:
+        # Fail closed: a sealed tree that kept fill residue must not pass.
+        results.append(EvidenceCheck(
+            check_id="builtin:sparse_fill_cleanup",
+            kind="build",
+            status=STATUS_FAILED,
+            command=(),
+            affected_paths=affected,
+            summary=f"sparse fill residue left in validation tree: {cleanup_error}",
+            provenance=f"builtin:sparse_fill_cleanup:cwd={root}",
+            error=str(cleanup_error),
+        ))
     return results
 
 
