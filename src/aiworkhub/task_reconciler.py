@@ -44,6 +44,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +72,7 @@ from .platform_io import (
     lock_file_open_flags,
     nofollow_open_flag,
     open_directory_descriptor,
+    process_memory_bytes,
     stat_owned_by_current_user,
     trim_heap_after,
     windows_descriptor_secret_trust,
@@ -110,6 +112,11 @@ MIN_STALE_SCAN_SECONDS = 300.0
 # made a finished card's time-to-review hostage to garbage collection, so the
 # sweep runs on every Nth pass instead.
 GC_SCAN_EVERY_N_PASSES = 20
+# NF-2026-02382, measurement only: which scan phase owns the RSS peak. One
+# sampler thread reads RSS this often; the history keeps the last N scans.
+MEMORY_SAMPLE_INTERVAL_SECONDS = 1.0
+PHASE_MEMORY_HISTORY_MAX = 120
+IDLE_PHASE = "idle"
 AUTHORITY_RETRY_SECONDS = 0.25
 # A cause that cannot change without the environment changing must not be
 # retried at full speed.  A Windows host reported the acquisition counter
@@ -642,6 +649,120 @@ def run_scan(
         "sdlc_sync": sdlc,
         "phase_durations_ms": phase_ms,
     }
+
+
+def _read_rss_bytes() -> int | None:
+    """Current RSS from the platform owner, or ``None`` on any failure."""
+
+    try:
+        value = process_memory_bytes().get("rss_bytes")
+    except Exception:  # noqa: BLE001 -- measurement must never fail a scan
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+class _PhaseMemorySampler:
+    """RSS high-water per scan phase. MEASUREMENT ONLY: never changes a scan.
+
+    One daemon thread reads RSS every ``interval`` seconds and keeps the max
+    per current label. The label is the running phase (``sdlc_sync:<part>``
+    folds into ``sdlc_sync``) and ``idle`` between scans. Sequential by
+    design: it is one cheap read per second, so fanning it out would only add
+    threads. VmHWM is never reset, so ``peak_rss_bytes`` keeps lifetime
+    semantics elsewhere. ``reader`` returns an int or ``None`` and may raise;
+    ``sample()`` is public so a test drives samples without a thread.
+    """
+
+    def __init__(
+        self,
+        reader: Callable[[], int | None] | None = None,
+        interval: float = MEMORY_SAMPLE_INTERVAL_SECONDS,
+    ) -> None:
+        self._reader = reader if reader is not None else _read_rss_bytes
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._label = IDLE_PHASE
+        self._peaks: dict[str, int] = {}
+        self._scan_start: int | None = None
+        self._last: int | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def sample(self) -> int | None:
+        """One read attributed to the current label; ``None`` and no change on failure."""
+
+        # Read under the lock so the label is the phase the read was taken in:
+        # set_phase/end_scan cannot slip between the read and the record. The
+        # read is one cheap call (/proc/self/status or K32GetProcessMemoryInfo),
+        # so the scan thread never waits on it measurably.
+        with self._lock:
+            try:
+                value = self._reader()
+            except Exception:  # noqa: BLE001 -- a raising reader leaves no trace
+                return None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            self._last = value
+            if value > self._peaks.get(self._label, -1):
+                self._peaks[self._label] = value
+        return value
+
+    def set_phase(self, name: str) -> None:
+        with self._lock:
+            self._label = str(name).partition(":")[0] or IDLE_PHASE
+
+    def begin_scan(self) -> None:
+        """Closes the idle window with one read and records the scan's start RSS."""
+
+        value = self.sample()
+        with self._lock:
+            self._scan_start = value
+            self._label = IDLE_PHASE
+
+    def end_scan(self) -> dict[str, Any]:
+        """Closes the scan, returns its memory fields, and opens the next idle window."""
+
+        end = self.sample()
+        with self._lock:
+            peaks = dict(self._peaks)
+            start = self._scan_start
+            self._peaks = {}
+            self._label = IDLE_PHASE
+            self._scan_start = None
+        return {
+            "phase_rss_peak_bytes": peaks or None,
+            "scan_rss_start_bytes": start,
+            "scan_rss_end_bytes": end,
+        }
+
+    def _run(self, stop: threading.Event) -> None:
+        while not stop.wait(self._interval):
+            self.sample()
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive() and not self._stop.is_set():
+            return
+        # Each cycle owns its stop event: a thread that a timed-out stop() left
+        # alive keeps the old, already-set event and exits after its current
+        # read, while this cycle samples on a fresh thread instead of none.
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(self._stop,),
+            name="aiworkhub-reconciler-rss-sampler",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if not thread.is_alive():
+                self._thread = None
 
 
 # 0.11.37 measured what a fixed one-action policy costs: a 143.496 s
@@ -1385,6 +1506,23 @@ class ReconcilerService:
     def is_running(self) -> bool:
         return bool(self._thread is not None and self._thread.is_alive())
 
+    def _memory_state(self) -> tuple[_PhaseMemorySampler, deque[dict[str, Any]]]:
+        """The loop's RSS sampler and its bounded scan history, created once.
+
+        Created lazily (``getattr``) so a service built without ``__init__``
+        still works; ``_memory_reader`` is the seam a test injects.
+        """
+
+        sampler = getattr(self, "_memory_sampler", None)
+        if sampler is None:
+            sampler = _PhaseMemorySampler(reader=getattr(self, "_memory_reader", None))
+            self._memory_sampler = sampler
+        history = getattr(self, "_phase_memory_history", None)
+        if history is None:
+            history = deque(maxlen=PHASE_MEMORY_HISTORY_MAX)
+            self._phase_memory_history = history
+        return sampler, history
+
     def _superseded_reason(self) -> str:
         """Non-empty only when this server's installed generation is not current."""
 
@@ -1513,6 +1651,10 @@ class ReconcilerService:
             daemon=True,
         )
         drain_thread.start()
+        # Measurement only: started and joined with the owner loop, so two
+        # start/stop cycles leave no sampler thread behind.
+        sampler, _history = self._memory_state()
+        sampler.start()
         try:
             self._owner_scan_loop(
                 max_iterations=max_iterations,
@@ -1520,6 +1662,7 @@ class ReconcilerService:
                 stop_requested=stop_requested,
             )
         finally:
+            sampler.stop()
             drain_stop.set()
             drain_thread.join(timeout=self.scan_interval_seconds)
 
@@ -1531,6 +1674,7 @@ class ReconcilerService:
         stop_requested: Any = None,
     ) -> None:
         iterations = 0
+        sampler, history = self._memory_state()
         while not self._stop_event.is_set():
             if stop_requested is not None and stop_requested():
                 break
@@ -1539,6 +1683,7 @@ class ReconcilerService:
             # reclaims immediately; after that housekeeping is periodic.
             include_gc = self._pass_index % GC_SCAN_EVERY_N_PASSES == 0
             self._pass_index += 1
+            sampler.begin_scan()
             # Announce the pass BEFORE running it. The record is the only way to
             # tell "no reconciler" from "a reconciler mid-pass", and a sweep can
             # run for minutes -- writing only on completion left the loop
@@ -1572,11 +1717,17 @@ class ReconcilerService:
                 "scan_interval_seconds": self.scan_interval_seconds,
                 "gc_included": include_gc,
                 "last_error": "",
+                # In memory only: a scan can run for a minute, and the history
+                # must stay visible while it does.
+                "phase_memory_history": list(history),
                 "last_completed_scan": previous.get("last_completed_scan", previous if previous.get("scan_finished_epoch") else {}),
             }
             write_status(self.repo, in_progress)
 
             def _publish_phase(name: str, record: dict[str, Any] = in_progress) -> None:
+                # Label first: the status write below is the slow part, and the
+                # sampler must already attribute RSS to the phase that is starting.
+                sampler.set_phase(name)
                 write_status(self.repo, {
                     **record, "scan_phase": name, "scan_phase_started_epoch": time.time(),
                 })
@@ -1597,16 +1748,31 @@ class ReconcilerService:
                     self._last_error = error
             # Written on success AND on failure: a loop that is running but
             # failing every scan must not look the same as one that is working.
+            # Measurement only: closes the scan's RSS window. Never raises and
+            # carries no scan input, so a failed read leaves null fields.
+            memory = sampler.end_scan()
+            scan_duration = round(time.time() - started, 3)
+            scanned_at = result.get("scanned_at", "")
+            history.append({
+                "scanned_at": scanned_at,
+                "gc_included": include_gc,
+                "scan_duration_seconds": scan_duration,
+                "phase_rss_peak_bytes": memory["phase_rss_peak_bytes"],
+            })
             completed = {
                 "scan_finished_epoch": time.time(),
-                "scan_duration_seconds": round(time.time() - started, 3),
+                "scan_duration_seconds": scan_duration,
                 "last_error": error,
                 "finalized": result.get("finalized", 0),
                 "watched": result.get("watched", 0),
                 "gc_included": include_gc,
                 "gc_cleaned": result.get("gc_cleaned", 0),
-                "scanned_at": result.get("scanned_at", ""),
+                "scanned_at": scanned_at,
                 "phase_durations_ms": result.get("phase_durations_ms", {}),
+                "phase_rss_peak_bytes": memory["phase_rss_peak_bytes"],
+                "scan_rss_start_bytes": memory["scan_rss_start_bytes"],
+                "scan_rss_end_bytes": memory["scan_rss_end_bytes"],
+                "phase_memory_history": list(history),
             }
             write_status(self.repo, {
                 "pid": owner["owner_pid"],
