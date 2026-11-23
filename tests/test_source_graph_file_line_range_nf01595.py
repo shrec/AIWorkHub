@@ -107,6 +107,9 @@ def _overlay_fixture():
         sealed_sources={},
         repair_evidence={},
         snapshot_sha256="b" * 64,
+        live_paths=frozenset(),
+        live_overflow=(),
+        live_overflow_count=0,
     )
     return SimpleNamespace(rework_overlay_packet={}), view, text
 

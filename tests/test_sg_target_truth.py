@@ -16,8 +16,8 @@ acceptance contract:
 * body/function with a qualname target now resolve the symbol WITH its source
   (before: empty result).
 * the path-prefix filter is no longer applied to selector modes.
-* a resolved symbol whose file is outside the allowlist is refused BY NAME,
-  never returned as an empty "no such symbol" result.
+* a resolved symbol whose file is outside the focus list is SERVED
+  (NF-2026-02363: ``source_graph_targets`` is focus, not a read gate).
 * a ``body``/``function`` target that names no symbol is still a PATH SCOPE, so
   the pre-existing declared-target behaviour is unchanged.
 * ``semantic_edit.path_is_allowed`` no longer raises on a ``None`` allowlist.
@@ -107,24 +107,25 @@ def test_qualname_target_resolves_symbol_with_source(tmp_path, mode):
 
 
 # ---------------------------------------------------------------------------
-# The security boundary: a resolved symbol out of scope is refused BY NAME.
+# NF-2026-02363: ``source_graph_targets`` is a FOCUS list, not a read gate, so
+# a resolved symbol in a repository file outside it is SERVED.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("mode", ["body", "function"])
-def test_symbol_outside_allowlist_is_refused_by_name(tmp_path, mode):
+def test_symbol_outside_focus_list_is_served_by_name(tmp_path, mode):
     repo = _new_repo(tmp_path)
     _write(repo, "pkg/allowed.py", "def allowed_symbol():\n    return 1\n")
     _write(repo, "pkg/secret.py", "def hidden_symbol():\n    return 2\n")
     sg.build_index(repo, incremental=True)
 
     qualname = "pkg/secret.py.hidden_symbol"
-    # The caller may NAME the selector (it passes the target-membership gate),
-    # but the file allowlist covers only pkg/allowed.py.
+    # The focus list names only pkg/allowed.py (plus the selector); the
+    # symbol's file is an ordinary tracked repository file, so it is readable.
     ctx = _ctx(
         repo,
         targets=("pkg/allowed.py", qualname),
-        task_id=f"t-refuse-{mode}",
-        request_id=f"req-refuse-{mode}",
+        task_id=f"t-serve-{mode}",
+        request_id=f"req-serve-{mode}",
     )
     w._CACHE.clear()
 
@@ -132,12 +133,12 @@ def test_symbol_outside_allowlist_is_refused_by_name(tmp_path, mode):
         ctx, mode=mode, query="hidden_symbol", target=qualname, budget=16,
     )
 
-    # Not an empty success that reads as "no such symbol" -- a named refusal.
-    assert result["ok"] is False, result
-    reason = str(result.get("reason") or "")
-    assert reason.startswith("symbol_out_of_scope")
-    assert "hidden_symbol" in reason  # the caller learns the symbol exists
-    assert "pkg/secret.py" in reason  # ...and which out-of-scope file holds it
+    # Before NF-2026-02363: a named symbol_out_of_scope refusal.  Now: served.
+    assert result["ok"] is True, result
+    assert result["hit_count"] >= 1
+    payload = _content_json(result["content"])
+    match = next(m for m in payload["matches"] if m.get("file_path") == "pkg/secret.py")
+    assert "hidden_symbol" in match["source"]
 
 
 # ---------------------------------------------------------------------------

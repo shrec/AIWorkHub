@@ -361,6 +361,9 @@ def _overlay_context(text, file_line_range=None):
         sealed_sources={},
         repair_evidence={},
         snapshot_sha256="b" * 64,
+        live_paths=frozenset(),
+        live_overflow=(),
+        live_overflow_count=0,
     )
     merged, touched = wtm._merge_rework_overlay_payload(
         SimpleNamespace(rework_overlay_packet={}), {"matches": [], "contexts": []}, view,

@@ -426,6 +426,9 @@ class WorkerToolContext:
     # candidate overlay).  Only trusted in-process callers can set it; it is
     # never derived from a packet path or tool argument.
     source_graph_binding_override: AuthorityBinding | None = None
+    # Repository-wide Source Graph READ authority: set only by the manager seat
+    # and the Source Graph self-check, never inferred from runner/task/topic.
+    repository_read_authority: bool = False
     _supervisor_owned: bool = False
 
 
@@ -3444,6 +3447,8 @@ def _source_graph_read_refusal(ctx: WorkerToolContext, path: str) -> str | None:
     keeps those bytes out of the worktree) and the card's ``deny_read`` /
     ``forbidden`` globs.  ``source_graph_targets`` is the focus list, not this
     gate; writes stay bounded by ``allowed_writes`` in the semantic editor.
+    A context with ``repository_read_authority`` (manager seat, self-check) is
+    refused only outside the repository; the remaining checks bind workers.
     """
 
     from . import linux_read_roots
@@ -3463,6 +3468,8 @@ def _source_graph_read_refusal(ctx: WorkerToolContext, path: str) -> str | None:
         return "path_outside_repo"
     text = raw.strip("/")
     if not text:
+        return None
+    if ctx.repository_read_authority:
         return None
     # NTFS is case-insensitive: "SECRET/a.py" and ".GIT/config" name the same
     # bytes as "secret/a.py" and ".git/config", so both the path and every

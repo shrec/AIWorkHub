@@ -70,6 +70,7 @@ def _manager_context(*, topic: str = "management", target: str | None = None) ->
         session_topic=str(topic or "management")[:128],
         audit_ledger_path=None,
         audit_hmac_key_path=None,
+        repository_read_authority=True,
     )
     return context, {"provider": provider, "session_id": session_id, "repo": str(root)}
 

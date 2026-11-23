@@ -2169,6 +2169,7 @@ class SourceGraphDaemon:
                             session_topic="source_graph_health",
                             audit_ledger_path=None,
                             audit_hmac_key_path=None,
+                            repository_read_authority=True,
                         )
                         recommendation = (
                             worker_ai_tools_mcp.source_graph_recommendation_roundtrip_gate(

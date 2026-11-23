@@ -436,3 +436,72 @@ def test_a_row_is_dropped_when_any_of_its_file_keys_is_excluded(tmp_path: Path) 
     filtered, dropped = w._apply_source_graph_read_gate(ctx, payload)
     assert dropped == 1
     assert filtered["edges"] == [{"caller_file": _OTHER, "callee_file": _OTHER}]
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-02375: the manager seat and the Source Graph self-check carry an
+# explicit repository_read_authority; workers keep every NF-2026-02363 refusal.
+# ---------------------------------------------------------------------------
+
+_DOT_NOTES = ".github/notes.md"
+_DOT_IGNORE = ".gitignore"
+
+
+def _dot_repos(tmp_path: Path) -> tuple[Path, Path]:
+    authority = tmp_path / "authority"
+    workspace = tmp_path / "workspace"
+    extra = {
+        _DOT_NOTES: b"# Notes\n\ndot_notes_marker_nf02375 guidance text\n",
+        _DOT_IGNORE: b"dot_ignore_marker_nf02375/\n",
+    }
+    for root in (authority, workspace):
+        root.mkdir()
+        for relative, data in {**_CANONICAL, **extra}.items():
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).write_bytes(data)
+    repository_state.bootstrap_repository(authority)
+    repository_state.bootstrap_repository(workspace)
+    source_graph.build_index(authority, incremental=False)
+    return authority, workspace
+
+
+def test_repository_read_authority_defaults_to_false(tmp_path: Path) -> None:
+    ctx = w.WorkerToolContext(
+        task_id="t", runner="claude", topic="manager", request_id="r",
+        repo=tmp_path, authority_repo=tmp_path, source_graph_targets=(),
+        session_topic="manager", audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+    assert ctx.repository_read_authority is False
+
+
+def test_authority_context_reads_tracked_dot_files_but_not_outside_repo(
+    tmp_path: Path,
+) -> None:
+    import dataclasses
+
+    worker = _ctx(tmp_path, targets=(), repos=_dot_repos(tmp_path))
+    manager = dataclasses.replace(worker, repository_read_authority=True)
+
+    for path in (_DOT_NOTES, _DOT_IGNORE):
+        assert w._source_graph_read_refusal(manager, path) is None
+        assert w._source_graph_read_refusal(worker, path) == "private_repository_path"
+        served = w.source_graph_query(manager, mode="file", query=path, target=path)
+        assert served["ok"] is True, served
+        assert served["hit_count"] >= 1
+        refused = w.source_graph_query(worker, mode="file", query=path, target=path)
+        assert refused["ok"] is False
+        assert refused["excluded_reason"] == "private_repository_path"
+
+    w._source_graph_cache_clear()
+    focus = _query(manager, "focus", _DOT_NOTES)
+    assert _DOT_NOTES in _paths(focus) or _DOT_NOTES in focus.get("candidate_files", [])
+    w._source_graph_cache_clear()
+    worker_focus = _query(worker, "focus", _DOT_NOTES)
+    assert _DOT_NOTES not in _paths(worker_focus)
+    assert _DOT_NOTES not in worker_focus.get("candidate_files", [])
+
+    for outside in ("../outside.py", "/etc/passwd", "C:/x.py"):
+        assert w._source_graph_read_refusal(manager, outside) == "path_outside_repo"
+        refused = w.source_graph_query(manager, mode="file", query=outside, target=outside)
+        assert refused["ok"] is False
+        assert refused["excluded_reason"] == "path_outside_repo"
