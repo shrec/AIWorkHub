@@ -37,7 +37,13 @@ from .worker_workspace_appcontainer_dotnet_restore import (
 )
 
 _DOTNET_EXECUTABLE_BASENAMES = frozenset({"dotnet", "dotnet.exe"})
-_DOTNET_ADAPTED_VERBS = frozenset({"build", "test", "restore", "publish"})
+_DOTNET_ADAPTED_VERBS = frozenset({"build", "test", "restore", "publish", "run"})
+# NF-2026-02383 measured on SDK 11.0.100: ``dotnet run --help`` lists
+# ``--artifacts-path`` and run forwards ``-p:`` properties to its build, but a
+# probe ``dotnet run --project p.csproj -m:1 -nodeReuse:false -p:... -- --flag x``
+# printed ``ARGS=-m:1|-nodeReuse:false|--flag|x``: run hands those two to the
+# program.  Node reuse stays off via MSBUILDDISABLENODEREUSE in the lane env.
+_DOTNET_RUN_UNACCEPTED_FLAGS = frozenset({"-m:1", "-nodeReuse:false"})
 _DOTNET_APP_CONTAINER_SWITCHES = {
     "DOTNET_NOLOGO": "1",
     "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
@@ -105,54 +111,65 @@ def _dotnet_declared_switches(argv: Sequence[str]) -> frozenset[str]:
     return frozenset(declared)
 
 
+def _dotnet_head(argv: Sequence[str]) -> list[str]:
+    """``argv`` up to, not including, the first bare ``--`` after the verb.
+
+    Everything after that separator belongs to the program (``dotnet run``) or
+    the test host (``dotnet test``), so no lane decision ever reads it.
+    """
+    tokens = [str(part) for part in argv]
+    return tokens[: tokens.index("--", 2)] if "--" in tokens[2:] else tokens
+
+
 def _appcontainer_dotnet_validation_argv(
     argv: Iterable[str], artifacts_path: str | Path
 ) -> list[str]:
     """The argv a dotnet validation can run inside the AppContainer.
 
     Pure and idempotent: a second pass finds every switch already declared and
-    inserts nothing.  Only build/test/restore/publish are adapted; every
-    insertion lands before a bare ``--`` so the caller's own pass-through
-    arguments keep their position, and a flag the caller declared wins.
+    inserts nothing.  Only build/test/restore/publish/run are adapted; every
+    insertion lands right after the verb, so before any bare ``--`` and the
+    caller's own pass-through arguments stay whole; a flag the caller declared
+    before ``--`` wins, and nothing after ``--`` is read.
     """
     rewritten = [str(part) for part in argv]
     if len(rewritten) < 2 or not _is_appcontainer_dotnet_executable(rewritten[0]):
         return rewritten
-    if rewritten[1].lower() not in _DOTNET_ADAPTED_VERBS:
+    verb = rewritten[1].lower()
+    if verb not in _DOTNET_ADAPTED_VERBS:
         return rewritten
-    declared = _dotnet_declared_switches(rewritten)
+    declared = _dotnet_declared_switches(_dotnet_head(rewritten))
     insertions: list[tuple[str, ...]] = []
     if not declared & _DOTNET_ARTIFACTS_SWITCHES:
         insertions.append(("--artifacts-path", str(artifacts_path)))
     for tokens, names in _DOTNET_APP_CONTAINER_FLAGS:
+        if verb == "run" and tokens[0] in _DOTNET_RUN_UNACCEPTED_FLAGS:
+            continue
         if not declared & names:
             insertions.append(tokens)
-    if not insertions:
-        return rewritten
-    insert_at = rewritten.index("--", 2) if "--" in rewritten[2:] else 2
+    insert_at = 2
     for tokens in insertions:
         rewritten[insert_at:insert_at] = list(tokens)
         insert_at += len(tokens)
     return rewritten
 
 
-def _appcontainer_dotnet_env(
+def _appcontainer_dotnet_base_env(
     env: Mapping[str, str], home: str | Path
 ) -> dict[str, str]:
-    """The env one dotnet validation needs, scoped to the request home.
+    """The dotnet env shared by the validation lane and the worker shell.
 
-    The input mapping is never mutated.  ``DOTNET_CLI_HOME``, ``APPDATA``,
-    ``LOCALAPPDATA`` and ``NUGET_PACKAGES`` all land under ``home``, which the
-    lane already modify-grants, so this adds no grant and no capability SID.
-    The five switches cut the host-wide rendezvous points (MSBuild node reuse,
-    the MSBuild server, VBCSCompiler); the platform variables are copied from
-    the host only when the caller omitted them.
+    The input mapping is never mutated.  ``DOTNET_CLI_HOME`` and
+    ``NUGET_PACKAGES`` land under ``home``, which the lane already
+    modify-grants, so this adds no grant and no capability SID.  The five
+    switches cut the host-wide rendezvous points (MSBuild node reuse, the
+    MSBuild server, VBCSCompiler) and opt out of CLI telemetry; the platform
+    variables are copied from the host only when the caller omitted them.
+    APPDATA/LOCALAPPDATA are deliberately not touched here.
     """
     root = Path(home)
     scoped = {
         "DOTNET_CLI_HOME": root,
-        "APPDATA": root / "AppData" / "Roaming",
-        "LOCALAPPDATA": root / "AppData" / "Local",
         "NUGET_PACKAGES": root / ".nuget" / "packages",
     }
     rewritten = dict(env)
@@ -166,15 +183,63 @@ def _appcontainer_dotnet_env(
     return rewritten
 
 
+def _appcontainer_dotnet_env(
+    env: Mapping[str, str], home: str | Path
+) -> dict[str, str]:
+    """The env one dotnet validation needs, scoped to the request home.
+
+    ``_appcontainer_dotnet_base_env`` plus ``APPDATA`` and ``LOCALAPPDATA``
+    under ``home/AppData``: the validation lane owns its child's env, so NuGet
+    gets a non-null ``path1`` there without consulting the supervisor's values.
+    """
+    root = Path(home)
+    rewritten = _appcontainer_dotnet_base_env(env, root)
+    for name, path in (
+        ("APPDATA", root / "AppData" / "Roaming"),
+        ("LOCALAPPDATA", root / "AppData" / "Local"),
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+        rewritten[name] = str(path)
+    return rewritten
+
+
+def _appcontainer_dotnet_shell_env(
+    env: Mapping[str, str], home: str | Path | None, *, os_name: str | None = None
+) -> dict[str, str]:
+    """The worker shell's env with the shared request-scoped dotnet env applied.
+
+    NF-2026-02383 measured the AppContainer worker shell on 0.13.11: ``dotnet``
+    died on the CLI telemetry DeviceIdGetter registry read (SecurityException,
+    exit 5) because DOTNET_CLI_TELEMETRY_OPTOUT was unset.  On Windows with a
+    request home this is exactly ``_appcontainer_dotnet_base_env``; elsewhere,
+    or without a home, the input is returned as an unchanged copy.
+
+    APPDATA/LOCALAPPDATA are never set or created here: this env also launches
+    the provider CLI itself, and NF-2026-01484 (``supervisor_appdata_env`` in
+    ``windows_appcontainer``) owns them -- the supervisor's own values, or
+    absent when unresolvable, and a root inside the request HOME is refused.
+    Package restore stays offline in the shell; the lane's host pre-restore
+    seeds packages.
+    """
+    if (os_name or os.name) != "nt" or home is None:
+        return dict(env)
+    return _appcontainer_dotnet_base_env(env, home)
+
+
 def _appcontainer_dotnet_needs_packages(argv: Sequence[str]) -> bool:
-    """True when the verb resolves packages, so the pre-restore matters."""
+    """True when the verb resolves packages, so the pre-restore matters.
+
+    Only the tokens before a bare ``--`` count: after it ``dotnet run`` hands
+    everything to the program, so an app's own ``--no-build`` is not a switch.
+    """
+    head = _dotnet_head(argv)
     if (
-        len(argv) < 2
-        or not _is_appcontainer_dotnet_executable(argv[0])
-        or argv[1].lower() not in _DOTNET_ADAPTED_VERBS
+        len(head) < 2
+        or not _is_appcontainer_dotnet_executable(head[0])
+        or head[1].lower() not in _DOTNET_ADAPTED_VERBS
     ):
         return False
-    return not any(flag in argv for flag in ("--no-restore", "--no-build"))
+    return not any(flag in head for flag in ("--no-restore", "--no-build"))
 
 
 def _resolved_dotnet_executable(executable: str) -> str:
@@ -213,7 +278,7 @@ def _dotnet_target_token(argv: Sequence[str]) -> str | None:
     named even when neither tree carries it, because that is exactly the case
     in which falling back to the working directory restores the wrong thing.
     """
-    for token in argv[2:]:
+    for token in _dotnet_head(argv)[2:]:
         if _is_dotnet_switch(token):
             continue
         if token.lower().endswith(_DOTNET_PROJECT_SUFFIXES):

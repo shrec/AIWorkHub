@@ -11,6 +11,8 @@ NuGet or an AppContainer.
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -152,7 +154,6 @@ def test_rewrite_inserts_only_what_the_caller_did_not_declare():
 def test_rewrite_leaves_non_adapted_verbs_and_foreign_argv_alone():
     for argv in (
         ["dotnet", "--info"],
-        ["dotnet", "run"],
         ["dotnet", "pack"],
         ["dotnet"],
         [],
@@ -1183,3 +1184,183 @@ def test_a_strict_seed_still_names_a_project_the_solution_lists_but_lacks(
         == "candidate_project_missing"
     )
     assert runs == []
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-02383: ``dotnet run`` in the lane and the worker shell's dotnet env
+# ---------------------------------------------------------------------------
+
+_DOTNET_SHELL_KEYS = ("DOTNET_CLI_HOME", "APPDATA", "LOCALAPPDATA", "NUGET_PACKAGES")
+
+
+def test_run_gets_the_lane_flags_run_accepts_and_keeps_the_program_argv_whole():
+    declared = ["dotnet", "run", "app.csproj", "--", "--flag", "x"]
+    once = _lane_argv(declared)
+    assert once == [
+        "dotnet",
+        "run",
+        "--artifacts-path",
+        _ARTIFACTS,
+        "-p:UseSharedCompilation=false",
+        "-p:NuGetAudit=false",
+        "app.csproj",
+        "--",
+        "--flag",
+        "x",
+    ]
+    # Measured: ``dotnet run`` hands -m:1/-nodeReuse:false to the program.
+    assert not dotnet_lane._DOTNET_RUN_UNACCEPTED_FLAGS & set(once)
+    assert _lane_argv(once) == once
+    assert declared == ["dotnet", "run", "app.csproj", "--", "--flag", "x"]
+
+
+def test_switch_shaped_program_args_after_the_separator_are_never_read():
+    rewritten = _lane_argv(
+        ["dotnet", "run", "--", "--artifacts-path", "y", "-p:NuGetAudit=true"]
+    )
+    marker = rewritten.index("--")
+    assert rewritten[marker:] == ["--", "--artifacts-path", "y", "-p:NuGetAudit=true"]
+    assert rewritten[2:marker] == [
+        "--artifacts-path",
+        _ARTIFACTS,
+        "-p:UseSharedCompilation=false",
+        "-p:NuGetAudit=false",
+    ]
+    assert dotnet_lane._appcontainer_dotnet_needs_packages(
+        ["dotnet", "run", "--", "--no-build"]
+    )
+    assert not dotnet_lane._appcontainer_dotnet_needs_packages(
+        ["dotnet", "run", "--no-build", "--", "x"]
+    )
+    assert dotnet_lane._dotnet_target_token(["dotnet", "run", "--", "x.csproj"]) is None
+
+
+def test_run_triggers_the_host_prerestore_exactly_like_build(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    (workspace.repo / "app.csproj").write_text("<Project />", encoding="utf-8")
+    runs: list[tuple[list[str], dict]] = []
+    _install_fake_run(monkeypatch, sink=runs)
+
+    effective_argv, scoped_env = dotnet_lane._appcontainer_dotnet_validation_command(
+        ["dotnet", "run", "app.csproj", "--", "--flag", "x"],
+        workspace=workspace,
+        cwd=workspace.path,
+        env={"PATH": "x"},
+    )
+
+    assert effective_argv[2:4] == [
+        "--artifacts-path",
+        str(workspace.home / "dotnet-artifacts"),
+    ]
+    assert effective_argv[-3:] == ["--", "--flag", "x"]
+    assert scoped_env["NUGET_PACKAGES"] == str(workspace.home / ".nuget" / "packages")
+    assert len(runs) == 1
+    command, _kwargs = runs[0]
+    assert command[1] == "restore"
+    assert Path(command[2]).resolve() == (workspace.repo / "app.csproj").resolve()
+
+
+def test_shell_env_is_the_base_env_on_windows_and_a_plain_copy_elsewhere(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("PROGRAMDATA", raising=False)
+    shell_home = tmp_path / "shell"
+    declared = {"PATH": "x", "HOME": str(shell_home)}
+
+    windows = dotnet_lane._appcontainer_dotnet_shell_env(
+        declared, shell_home, os_name="nt"
+    )
+    assert windows == dotnet_lane._appcontainer_dotnet_base_env(declared, shell_home)
+    # NF-2026-01484: supervisor_appdata_env owns APPDATA/LOCALAPPDATA for the
+    # AppContainer child, so the shell env never sets or creates them.
+    assert "APPDATA" not in windows
+    assert "LOCALAPPDATA" not in windows
+    assert not (shell_home / "AppData").exists()
+    assert windows["DOTNET_CLI_HOME"] == str(shell_home)
+    assert windows["NUGET_PACKAGES"] == str(shell_home / ".nuget" / "packages")
+    assert windows["DOTNET_CLI_TELEMETRY_OPTOUT"] == "1"
+    for os_name, home in (("posix", shell_home), ("nt", None)):
+        copied = dotnet_lane._appcontainer_dotnet_shell_env(declared, home, os_name=os_name)
+        assert copied == declared
+        assert copied is not declared
+    assert declared == {"PATH": "x", "HOME": str(shell_home)}
+
+
+def test_lane_env_is_the_base_env_plus_request_scoped_appdata(tmp_path: Path):
+    lane_home = tmp_path / "lane"
+    base_home = tmp_path / "base"
+    lane = dotnet_lane._appcontainer_dotnet_env({"PATH": "x"}, lane_home)
+    base = dotnet_lane._appcontainer_dotnet_base_env({"PATH": "x"}, base_home)
+
+    assert lane["APPDATA"] == str(lane_home / "AppData" / "Roaming")
+    assert lane["LOCALAPPDATA"] == str(lane_home / "AppData" / "Local")
+    assert (lane_home / "AppData" / "Roaming").is_dir()
+    assert (lane_home / "AppData" / "Local").is_dir()
+    assert set(lane) - set(base) == {"APPDATA", "LOCALAPPDATA"}
+    assert lane["DOTNET_CLI_HOME"] == str(lane_home)
+    assert lane["NUGET_PACKAGES"] == str(lane_home / ".nuget" / "packages")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the Windows sanitized_env branch")
+def test_windows_sanitized_env_carries_the_request_scoped_dotnet_env(
+    tmp_path: Path, monkeypatch
+):
+    from aiworkhub import worker_workspace
+
+    calls: list[Path] = []
+    real_env = dotnet_lane._appcontainer_dotnet_base_env
+
+    def _spy(env, home):
+        calls.append(Path(home))
+        return real_env(env, home)
+
+    monkeypatch.setattr(dotnet_lane, "_appcontainer_dotnet_base_env", _spy)
+    home = tmp_path / "home"
+    plain = worker_workspace.sanitized_env("claude_cli", home=home)
+
+    selected = home.resolve()
+    assert calls == [selected]
+    assert plain["DOTNET_CLI_HOME"] == str(selected)
+    assert plain["NUGET_PACKAGES"] == str(selected / ".nuget" / "packages")
+    assert plain["DOTNET_CLI_TELEMETRY_OPTOUT"] == "1"
+    # NF-2026-01484: APPDATA/LOCALAPPDATA belong to supervisor_appdata_env.
+    assert "APPDATA" not in plain
+    assert "LOCALAPPDATA" not in plain
+    assert not (selected / "AppData").exists()
+    safe = worker_workspace.sanitized_env(
+        "claude_cli", home=home, provider_env={"APPDATA": "provider-wins"}
+    )
+    assert safe["APPDATA"] == "provider-wins"
+    assert "LOCALAPPDATA" not in safe
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the POSIX sanitized_env branch")
+def test_posix_sanitized_env_is_unchanged_by_the_dotnet_env(tmp_path: Path):
+    from aiworkhub import worker_workspace
+
+    safe = worker_workspace.sanitized_env("claude_cli", home=tmp_path / "home")
+
+    assert not set(_DOTNET_SHELL_KEYS) & set(safe)
+    assert not set(_SWITCHES) & set(safe)
+
+
+@pytest.mark.skipif(shutil.which("dotnet") is None, reason="dotnet is not installed")
+@pytest.mark.skipif(os.name != "nt", reason="the request-scoped env is Windows-only")
+def test_live_dotnet_info_starts_under_the_worker_shell_env(tmp_path: Path):
+    """Live: ``dotnet --info`` exits 0 with the env the worker shell receives."""
+    from aiworkhub import worker_workspace
+
+    env = worker_workspace.sanitized_env("claude_cli", home=tmp_path / "home")
+    completed = subprocess.run(
+        [shutil.which("dotnet") or "dotnet", "--info"],
+        env=env,
+        capture_output=True,
+        check=False,
+        shell=False,
+        text=True,
+        timeout=120,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output[-2000:]
+    assert "SecurityException" not in output

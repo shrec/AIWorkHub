@@ -7169,9 +7169,9 @@ def sanitized_env(
     # coordinator's own environment. This is the ONLY place the child receives
     # the key, and it is applied last so an explicit provider value is never
     # shadowed by an allowlisted passthrough of the same name.
-    if provider_env:
-        for key, value in provider_env.items():
-            safe[str(key)] = str(value)
+    from .worker_workspace_appcontainer_dotnet import _appcontainer_dotnet_shell_env
+    safe = _appcontainer_dotnet_shell_env(safe, None if home is None else selected_home)
+    safe.update({str(key): str(value) for key, value in (provider_env or {}).items()})
     return safe
 
 
