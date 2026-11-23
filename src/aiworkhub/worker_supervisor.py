@@ -65,6 +65,10 @@ _PR_SET_PDEATHSIG = 1
 # while the child runs. Heartbeat cadence is deliberately independent of any
 # model turn, dashboard read, or MCP request.
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15.0
+# NF-2026-02354: idle seconds past timeout_seconds before a stall-gated kill.
+DEFAULT_STALL_WINDOW_SECONDS = 1800
+MIN_STALL_WINDOW_SECONDS = 60
+MAX_STALL_WINDOW_SECONDS = 86_400
 # Keep each live provider stream within a small, predictable disk envelope.
 # The writer retains the newest bytes and marks every compaction explicitly, so
 # lowering this ceiling does not hide the terminal diagnostic tail.
@@ -1200,10 +1204,25 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
     supervisor_pid_start_ticks = _pid_start_ticks(supervisor_pid)
     started_epoch = time.time()
     execution_backend = spec.get("execution_backend")
-    # NF-2026-00517: timeout_seconds is a monotonic hard wall deadline for
-    # every spawned backend (POSIX/Landlock subprocess, editor bridge, native
-    # CLI route, OpenCode, Windows AppContainer). Heartbeats, provider output,
-    # trusted progress and usage telemetry never extend it.
+    # NF-2026-02354: timeout_seconds is a monotonic deadline FLOOR, not a kill,
+    # for every spawned backend (POSIX/Landlock subprocess, editor bridge,
+    # native CLI route, OpenCode, Windows AppContainer). Past it a child is
+    # terminated as timed_out only after stall_window idle seconds with no
+    # output growth, meaningful progress or usage change. spec
+    # hard_wall_deadline true keeps the exact wall kill at the deadline for an
+    # explicit owner/card budget.
+    hard_wall = spec.get("hard_wall_deadline") is True
+    try:
+        stall_window = int(
+            spec.get("stall_window_seconds") or DEFAULT_STALL_WINDOW_SECONDS
+        )
+    except (TypeError, ValueError, OverflowError):
+        stall_window = DEFAULT_STALL_WINDOW_SECONDS
+    stall_window = max(
+        MIN_STALL_WINDOW_SECONDS, min(stall_window, MAX_STALL_WINDOW_SECONDS)
+    )
+    timeout_policy = "hard_wall" if hard_wall else "stall_gated"
+    stall_idle_seconds: int | None = None
     deadline_epoch = started_epoch + timeout
     deadline_monotonic = time.monotonic() + timeout
     cancel_requested = False
@@ -1232,6 +1251,8 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
         "deadline_epoch": deadline_epoch,
         "timeout_seconds": timeout,
         "timeout_enforced": True,
+        "timeout_policy": timeout_policy,
+        "stall_window_seconds": stall_window,
         "prompt_bytes_delivered": prompt_bytes_delivered,
     })
 
@@ -1263,6 +1284,8 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 "deadline_epoch": deadline_epoch,
                 "timeout_seconds": timeout,
                 "timeout_enforced": True,
+                "timeout_policy": timeout_policy,
+                "stall_window_seconds": stall_window,
             })
             return 126
         spawn_phase = "child_spawn"
@@ -1319,6 +1342,8 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 "deadline_epoch": deadline_epoch,
                 "timeout_seconds": timeout,
                 "timeout_enforced": True,
+                "timeout_policy": timeout_policy,
+                "stall_window_seconds": stall_window,
             })
             return 126
 
@@ -1357,6 +1382,8 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             "deadline_epoch": deadline_epoch,
             "timeout_seconds": timeout,
             "timeout_enforced": True,
+            "timeout_policy": timeout_policy,
+            "stall_window_seconds": stall_window,
             "prompt_bytes_delivered": prompt_bytes_delivered,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
@@ -1444,9 +1471,17 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 returncode = _terminate_child(child)
                 break
             if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                final_state = "timed_out"
-                returncode = _terminate_child(child)
-                break
+                # NF-2026-02354: past the deadline floor only a stalled child
+                # (no output growth, meaningful progress or usage change for
+                # stall_window seconds) is killed, unless hard_wall is set.
+                idle_seconds = time.time() - max(
+                    last_output_change_epoch, last_meaningful_progress_epoch
+                )
+                if hard_wall or idle_seconds >= stall_window:
+                    final_state = "timed_out"
+                    stall_idle_seconds = max(0, int(idle_seconds))
+                    returncode = _terminate_child(child)
+                    break
             now_monotonic = time.monotonic()
             if now_monotonic >= next_heartbeat_monotonic:
                 # Heartbeat is a supervisor-owned liveness signal only --
@@ -1465,6 +1500,8 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                     "deadline_epoch": deadline_epoch,
                     "timeout_seconds": timeout,
                     "timeout_enforced": True,
+                    "timeout_policy": timeout_policy,
+                    "stall_window_seconds": stall_window,
                     "prompt_bytes_delivered": prompt_bytes_delivered,
                     "heartbeat_seq": heartbeat_seq,
                     "heartbeat_at_epoch": time.time(),
@@ -1534,6 +1571,13 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
             "deadline_epoch": deadline_epoch,
             "timeout_seconds": timeout,
             "timeout_enforced": True,
+            "timeout_policy": timeout_policy,
+            "stall_window_seconds": stall_window,
+            **(
+                {"stall_idle_seconds": stall_idle_seconds}
+                if final_state == "timed_out"
+                else {}
+            ),
             "prompt_bytes_delivered": prompt_bytes_delivered,
             "heartbeat_seq": heartbeat_seq,
             "heartbeat_at_epoch": time.time(),
@@ -1623,6 +1667,8 @@ def supervise(spec: dict[str, Any], *, stdin_text: str | None = None) -> int:
                 "deadline_epoch": deadline_epoch,
                 "timeout_seconds": timeout,
                 "timeout_enforced": True,
+                "timeout_policy": timeout_policy,
+                "stall_window_seconds": stall_window,
             })
         except Exception:
             # Status artifact itself is unwritable (e.g. a nested read-only

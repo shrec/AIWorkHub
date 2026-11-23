@@ -541,6 +541,7 @@ def test_fake_clock_hard_deadline_kills_live_child(
         timeout=timeout_seconds,
     )
     spec["heartbeat_interval_seconds"] = 0.05
+    spec["hard_wall_deadline"] = True
     started_mono = clock.mono
     payloads: list[dict] = []
     terminate_calls = {"n": 0, "mono": None}
@@ -1659,6 +1660,7 @@ def test_fake_clock_output_heartbeat_and_usage_cannot_extend_deadline(
         adapter_id="vscode_lm",
         token_budget={"cap_tokens": 10},
         heartbeat_interval_seconds=0.05,
+        hard_wall_deadline=True,
     )
     started_mono = clock.mono
     terminate_calls = {"n": 0, "mono": None}
@@ -1695,6 +1697,7 @@ def test_fake_clock_simulated_appcontainer_hard_deadline(
     spec["execution_backend"] = "windows_appcontainer"
     spec["repo_id"] = "repo-test"
     spec["heartbeat_interval_seconds"] = 0.05
+    spec["hard_wall_deadline"] = True
     stdout_r, stdout_w = os.pipe()
     stderr_r, stderr_w = os.pipe()
     os.close(stdout_w)
