@@ -812,6 +812,7 @@ from . import manager_lane
 from . import manager_loop_service
 from . import manager_recipe_tools
 from . import manager_skill_tools
+from . import platform_io
 from . import process_launcher
 from . import process_launcher_accept_review
 from . import process_launcher_evidence
@@ -889,6 +890,47 @@ if _MCP_SDK_AVAILABLE and hasattr(mcp, "list_tools"):
 # with ``report_progress=True`` sends one this often while it runs -- and only
 # to a caller that asked for progress with a progressToken.
 _MCP_PROGRESS_INTERVAL_SECONDS = 15.0
+
+
+# NF-2026-02407: the serving backend named in the heap census.
+_MCP_BACKEND_NAME = "mcp_sdk" if _MCP_SDK_AVAILABLE else "stdlib"
+
+
+def _after_sdk_tool_call(tool_name: str, peak_before: int | None) -> None:
+    """SDK-backend twin of the stdlib per-response trim; never raises into the reply.
+
+    Logs one bounded line when the call raised the Linux high-water mark by
+    ``platform_io.PEAK_RSS_GROWTH_LOG_BYTES`` or more, then schedules the same
+    coalesced heap trim the stdlib transport runs after every response.
+    """
+
+    try:
+        platform_io.note_tool_call_peak(tool_name, peak_before)
+    except Exception:  # noqa: BLE001 -- memory accounting never fails a tool call
+        pass
+    try:
+        platform_io.schedule_heap_trim()
+    except Exception:  # noqa: BLE001 -- a trim never fails a tool call
+        pass
+
+
+def _heap_managed_sdk_call(
+    tool_name: str, function: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Any:
+    """Run one synchronous SDK tool on its worker thread, then trim on that thread.
+
+    The trim runs off the event loop, so a large ``malloc_trim`` never stalls
+    unrelated requests; the tool's own result or exception is returned unchanged.
+    """
+
+    try:
+        peak_before = platform_io.linux_peak_rss_bytes()
+    except Exception:  # noqa: BLE001 -- unreadable /proc only disables the peak line
+        peak_before = None
+    try:
+        return function(*args, **kwargs)
+    finally:
+        _after_sdk_tool_call(tool_name, peak_before)
 
 
 if _MCP_SDK_AVAILABLE:
@@ -969,11 +1011,19 @@ if _MCP_SDK_AVAILABLE:
             )
             register = _sdk_tool_decorator(*tool_args, **tool_kwargs)
 
+            # NF-2026-02407: every SDK tool call reports its high-water growth
+            # and schedules the coalesced heap trim, like the stdlib transport.
+            heap_tool_name = str(tool_name)
+
             if inspect.iscoroutinefunction(function):
 
                 @wraps(function)
                 async def async_adapter(*args: Any, **kwargs: Any) -> Any:
-                    return await function(*args, **kwargs)
+                    peak_before = platform_io.linux_peak_rss_bytes()
+                    try:
+                        return await function(*args, **kwargs)
+                    finally:
+                        _after_sdk_tool_call(heap_tool_name, peak_before)
 
                 if signature is not None:
                     async_adapter.__signature__ = signature
@@ -985,9 +1035,14 @@ if _MCP_SDK_AVAILABLE:
                 report = _progress_reporter() if report_progress else None
                 if report is not None:
                     return await _await_reporting_progress(
-                        asyncio.to_thread(function, *args, **kwargs), report
+                        asyncio.to_thread(
+                            _heap_managed_sdk_call, heap_tool_name, function, args, kwargs
+                        ),
+                        report,
                     )
-                return await asyncio.to_thread(function, *args, **kwargs)
+                return await asyncio.to_thread(
+                    _heap_managed_sdk_call, heap_tool_name, function, args, kwargs
+                )
 
             if signature is not None:
                 run_in_worker_thread.__signature__ = signature
@@ -9080,6 +9135,10 @@ def _detach_inheritable_stdin() -> None:
 
 
 def main() -> None:
+    # NF-2026-02407: cap glibc arenas first, on BOTH backends, before any
+    # thread allocates (glibc latches the limit once arena_test arenas exist).
+    # The stdlib transport's own call then returns the cached outcome.
+    platform_io.start_serving_heap_policy(_MCP_BACKEND_NAME)
     # Before ANY store initialization, reconciler thread or repository probe:
     # each of those spawns children, and a child that inherits the request pipe
     # is exactly what stalls this server on Windows.

@@ -775,6 +775,15 @@ def server_process(*, heap_census: bool = False) -> dict[str, Any]:
             reply["native_memory"] = _native_memory()
         except Exception as error:
             reply["native_memory"] = {"error": type(error).__name__}
+        # NF-2026-02407: which MCP backend served, its arena-cap outcome and the
+        # trim state, so a census taken on a host is attributable.
+        try:
+            reply.update(platform_io.serving_heap_state())
+        except Exception as error:
+            reply["mcp_backend"] = None
+            reply["arena_cap"] = None
+            reply["heap_trim"] = None
+            reply["serving_reason"] = f"state_unreadable:{type(error).__name__}"
     return reply
 
 

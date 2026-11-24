@@ -973,7 +973,16 @@ _HEAP_TRIM_STATE: dict[str, Any] = {
     "last": None,
     "timer": None,
     "arena_cap": None,
+    # NF-2026-02407: trims run so far, reported by the heap census.
+    "count": 0,
 }
+# NF-2026-02407: the serving MCP backend and its start-time arena-cap outcome,
+# recorded once by ``start_serving_heap_policy`` for the heap census.
+_SERVING_HEAP_STATE: dict[str, Any] = {"backend": None, "arena_cap": None}
+# A tool call that raises the Linux high-water mark (VmHWM) by at least this
+# much logs one bounded stderr line naming the tool and the delta.
+PEAK_RSS_GROWTH_LOG_BYTES = 256 * 1024 * 1024
+_PEAK_LOG_TOOL_NAME_CHARS = 128
 # Factory for the deferred trim timer; tests inject a fake.
 _HEAP_TRIM_TIMER: Callable[..., Any] = threading.Timer
 # glibc <malloc.h> M_ARENA_MAX.
@@ -1028,7 +1037,7 @@ def trim_process_heap() -> dict[str, Any]:
             last = _HEAP_TRIM_STATE["last"]
             if last is not None and now - last < HEAP_TRIM_MIN_INTERVAL_SECONDS:
                 return {"available": True, "trimmed": False, "skipped": "rate_limited"}
-            _HEAP_TRIM_STATE["last"] = now
+            _mark_trimmed_locked(now)
             return {"available": True, "trimmed": bool(trim(0))}
     except Exception as exc:
         return {
@@ -1066,7 +1075,7 @@ def _fire_scheduled_heap_trim(armed: list[Any]) -> None:
             trim = _glibc_malloc_trim()
             if trim is None:
                 return
-            _HEAP_TRIM_STATE["last"] = time.monotonic()
+            _mark_trimmed_locked(time.monotonic())
             trim(0)
     except Exception:
         return
@@ -1102,7 +1111,7 @@ def schedule_heap_trim() -> dict[str, Any]:
             now = time.monotonic()
             last = _HEAP_TRIM_STATE["last"]
             if last is None or now - last >= HEAP_TRIM_MIN_INTERVAL_SECONDS:
-                _HEAP_TRIM_STATE["last"] = now
+                _mark_trimmed_locked(now)
                 return {"available": True, "trimmed": bool(trim(0)), "scheduled": False}
             delay = max(0.0, HEAP_TRIM_MIN_INTERVAL_SECONDS - (now - last))
             armed: list[Any] = []
@@ -1166,6 +1175,135 @@ def cap_malloc_arenas(limit: int = 2) -> dict[str, Any]:
             "capped": False,
             "reason": f"cap_failed:{type(exc).__name__}",
         }
+
+
+def _mark_trimmed_locked(now: float) -> None:
+    """Record one trim (monotonic time and running count).  Caller holds ``_HEAP_TRIM_LOCK``."""
+
+    _HEAP_TRIM_STATE["last"] = now
+    _HEAP_TRIM_STATE["count"] = int(_HEAP_TRIM_STATE.get("count") or 0) + 1
+
+
+def start_serving_heap_policy(backend: str) -> dict[str, Any]:
+    """Cap glibc arenas once at MCP server start and record the serving backend.
+
+    NF-2026-02407: both MCP backends call this before any tool thread
+    allocates.  ``cap_malloc_arenas`` keeps its ``MALLOC_ARENA_MAX`` deference
+    and its cached outcome; this records that outcome and ``backend`` (e.g.
+    ``"stdlib"`` or ``"mcp_sdk"``) so a heap census is attributable.  Never raises.
+    """
+
+    try:
+        outcome = cap_malloc_arenas()
+    except Exception as exc:
+        outcome = {
+            "available": False,
+            "capped": False,
+            "reason": f"cap_failed:{type(exc).__name__}",
+        }
+    try:
+        recorded = dict(outcome) if isinstance(outcome, dict) else {
+            "available": False,
+            "capped": False,
+            "reason": "cap_outcome_not_a_mapping",
+        }
+        with _HEAP_TRIM_LOCK:
+            _SERVING_HEAP_STATE["backend"] = str(backend)[:32]
+            _SERVING_HEAP_STATE["arena_cap"] = recorded
+        return dict(recorded)
+    except Exception as exc:
+        return {
+            "available": False,
+            "capped": False,
+            "reason": f"record_failed:{type(exc).__name__}",
+        }
+
+
+def serving_heap_state() -> dict[str, Any]:
+    """Serving backend, start-time arena-cap outcome and trim state; never raises.
+
+    ``mcp_backend``/``arena_cap`` are ``None`` with ``serving_reason`` set when
+    no MCP server start was recorded in this process (unknown, never assumed).
+    """
+
+    try:
+        with _HEAP_TRIM_LOCK:
+            backend = _SERVING_HEAP_STATE["backend"]
+            arena_cap = _SERVING_HEAP_STATE["arena_cap"]
+            last = _HEAP_TRIM_STATE["last"]
+            count = int(_HEAP_TRIM_STATE.get("count") or 0)
+            timer_armed = _HEAP_TRIM_STATE["timer"] is not None
+        since: float | None = None
+        if last is not None:
+            since = round(max(0.0, time.monotonic() - float(last)), 3)
+        state: dict[str, Any] = {
+            "mcp_backend": backend,
+            "arena_cap": dict(arena_cap) if isinstance(arena_cap, dict) else None,
+            "heap_trim": {
+                "count": count,
+                "last_trim_monotonic": last,
+                "seconds_since_last_trim": since,
+                "timer_armed": timer_armed,
+            },
+        }
+        if backend is None:
+            state["serving_reason"] = "mcp_server_start_not_recorded"
+        return state
+    except Exception as exc:
+        return {
+            "mcp_backend": None,
+            "arena_cap": None,
+            "heap_trim": None,
+            "serving_reason": f"state_unreadable:{type(exc).__name__}",
+        }
+
+
+def linux_peak_rss_bytes() -> int | None:
+    """This process's Linux VmHWM via ``process_memory_bytes``; ``None`` off Linux.  Never raises."""
+
+    try:
+        if not is_linux():
+            return None
+        peak = process_memory_bytes().get("peak_rss_bytes")
+        return int(peak) if isinstance(peak, int) and not isinstance(peak, bool) else None
+    except Exception:
+        return None
+
+
+def note_tool_call_peak(tool_name: str, peak_before: int | None) -> int | None:
+    """Log one bounded stderr line when a tool call raised VmHWM by >= the threshold.
+
+    ``peak_before`` is ``linux_peak_rss_bytes()`` taken as the call started.
+    Returns the growth in bytes, or ``None`` when either reading is unavailable
+    (off Linux, unreadable ``/proc``).  Concurrent calls share one process
+    high-water mark, so the growth is attributed to the call that observed it.
+    Never raises and never writes stdout (the stdio protocol channel).
+    """
+
+    try:
+        if peak_before is None:
+            return None
+        peak_after = linux_peak_rss_bytes()
+        if peak_after is None:
+            return None
+        delta = int(peak_after) - int(peak_before)
+        if delta >= PEAK_RSS_GROWTH_LOG_BYTES:
+            record = {
+                "component": "aiworkhub.server_memory",
+                "event": "tool_peak_rss_growth",
+                "tool": str(tool_name)[:_PEAK_LOG_TOOL_NAME_CHARS],
+                "delta_bytes": delta,
+                "delta_mib": delta // (1024 * 1024),
+                "peak_rss_bytes": int(peak_after),
+            }
+            try:
+                sys.stderr.write(json.dumps(record, ensure_ascii=False)[:1024] + "\n")
+                sys.stderr.flush()
+            except (OSError, ValueError, AttributeError):
+                pass
+        return delta
+    except Exception:
+        return None
 
 
 def _windows_creation_flag() -> int:
