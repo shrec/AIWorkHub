@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Mapping
@@ -110,14 +111,24 @@ def _task_exists(task_id: str) -> bool:
 
 
 def successor_task_id(task_id: str, by: str = "") -> str:
-    """``by`` when given, else ``<task_id>-c<N>`` with the smallest free N >= 1."""
+    """``by`` when given, else ``<root>-c<N>`` with the smallest free N.
+
+    A ``task_id`` already ending in ``-c<digits>`` is a continuation: the suffix is
+    stripped so the chain stays on its root and N starts above the stripped number
+    (``X-c1`` -> ``X-c2``, or ``X-c3`` when ``X-c2`` exists).  Otherwise N starts at 1.
+    """
     explicit = str(by or "").strip()
     if explicit:
         return explicit
+    root = task_id
     number = 1
-    while _task_exists(f"{task_id}-c{number}"):
+    match = re.fullmatch(r"(.+)-c(\d+)", task_id)
+    if match:
+        root = match.group(1)
+        number = int(match.group(2)) + 1
+    while _task_exists(f"{root}-c{number}"):
         number += 1
-    return f"{task_id}-c{number}"
+    return f"{root}-c{number}"
 
 
 def _bounded_reason(text: str) -> str:
