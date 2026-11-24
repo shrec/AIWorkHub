@@ -803,6 +803,8 @@ def test_caller_context_reads_canonical_source_around_graph_resolved_callers(
         _caller_context_manager(canonical), {"src/changed.py": "a" * 64}, scoped
     )
 
+    # The changed-path caller is no longer skipped silently (NF-2026-01145):
+    # without a candidate_root it cannot be read, so it is counted.
     assert context == {
         "rows": [{
             "identity": "callers:1",
@@ -813,8 +815,8 @@ def test_caller_context_reads_canonical_source_around_graph_resolved_callers(
             "source": "canonical",
             "text": "".join(f"line {index}\n" for index in range(7, 18)),
         }],
-        "complete": True,
-        "omitted": 0,
+        "complete": False,
+        "omitted": 1,
     }
 
 
@@ -841,10 +843,10 @@ def test_caller_context_counts_every_caller_it_could_not_carry(tmp_path: Path) -
     )
 
     assert [row["identity"] for row in context["rows"]] == ["callers:1"]
-    # Past EOF and the unreadable file are counted; the escaped path is refused
-    # before it is ever a candidate row.
+    # Past EOF, the unreadable file and the malformed (escaping) entry are all
+    # counted: no callers entry is dropped without leaving a trace.
     assert context["complete"] is False
-    assert context["omitted"] == 2
+    assert context["omitted"] == 3
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows forbids control characters in paths")

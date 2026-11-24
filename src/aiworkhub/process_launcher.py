@@ -6291,12 +6291,16 @@ class ProcessManager:
         self,
         changed_hashes: Mapping[str, str | None],
         scoped_audits: Mapping[str, Mapping[str, Any]],
+        *,
+        candidate_root: Path | str | None = None,
     ) -> dict[str, Any]:
-        """Read the canonical source around every graph-resolved caller line.
+        """Read the source around every graph-resolved caller line.
 
         Delegation to :func:`process_launcher_review_context.quality_review_caller_context`.
         """
-        return _quality_review_caller_context_impl(self, changed_hashes, scoped_audits)
+        return _quality_review_caller_context_impl(
+            self, changed_hashes, scoped_audits, candidate_root=candidate_root
+        )
 
     def _quality_review_candidate_delta(
         self,
@@ -6522,7 +6526,7 @@ class ProcessManager:
             )
             mark("scope_audits_complete")
             caller_context = self._quality_review_caller_context(
-                current_hashes, scoped_audits
+                current_hashes, scoped_audits, candidate_root=workspace.path
             )
             candidate_delta = self._quality_review_candidate_delta(
                 card, current_hashes, workspace

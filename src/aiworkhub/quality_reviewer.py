@@ -3064,7 +3064,7 @@ MAX_SOURCE_EVIDENCE_SEGMENTS = 200
 MAX_CALLER_CONTEXT_ROWS = 64
 MAX_CALLER_CONTEXT_CHARS = 2_048
 MAX_CALLER_CONTEXT_TOTAL_CHARS = 16 * 1024
-_CALLER_CONTEXT_SOURCES = frozenset({"canonical"})
+_CALLER_CONTEXT_SOURCES = frozenset({"canonical", "candidate"})
 
 
 def _caller_context_rows(value: Mapping[str, Any]) -> dict[str, Any]:
