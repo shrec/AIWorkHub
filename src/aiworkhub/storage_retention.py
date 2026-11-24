@@ -2891,6 +2891,15 @@ def _file_worktree_failure_needfix(
     from . import process_launcher  # local import: cycle-safe
 
     capped = len(failures) >= process_launcher._GC_FAILURE_REPORT_LIMIT
+    # A live candidate still holds its workspace: the intended hold, not a failure.
+    failures = [
+        item
+        for item in failures
+        if not (
+            isinstance(item, Mapping)
+            and "workspace_cleanup_live_candidate_retained:" in str(item.get("reason") or "")
+        )
+    ]
     known = ("rework_seal_failed:", "cleanup_failed:")
     unclassified = [
         dict(item) if isinstance(item, Mapping) else {"value": str(item)[:200]}
