@@ -346,9 +346,18 @@ def reconcile_pending_finalization(manager: Any, request_id: str, state: Any) ->
     A finalizer that is provably dead, or whose validation outlived every
     enforced timeout, ends explicitly; anything else finalizes as before.
     """
+    from . import core  # lazy, like process_launcher: keeps this module import-light
     from . import process_launcher as pl  # lazy: process_launcher imports this module
 
     ended = end_if_finalizer_dead(manager, request_id) if state == "finalizing" else None
+    if ended is None and state == "finalizing" and not core.writes_allowed():
+        # NF-2026-02417: a write-gated process must not fall through to the
+        # generic finalizer for a dead or hung finalizer's row: that path would
+        # record finalize_failed or race the hung finalizer that still holds the
+        # request lock. The next write-enabled reconcile decides it.
+        latest = _pending_latest(manager, request_id)
+        if latest and dead_finalizer_reason(latest):
+            return 0
     event = ended or manager._finalize_after_process_exit(request_id)
     return int(event is not None and event.get("state") in pl.TERMINAL_PROCESS_STATES)
 
@@ -473,8 +482,14 @@ def end_if_finalizer_dead(manager: Any, request_id: str) -> dict[str, Any] | Non
     it -- the fence written first makes every later write of that finalizer
     a no-op -- and recorded ``finalize_failed``.
     """
+    from . import core  # lazy, like process_launcher: keeps this module import-light
     from . import process_launcher as pl  # lazy: process_launcher imports this module
 
+    if not core.writes_allowed():
+        # A write-gated process cannot re-finalize: retry_finalization would
+        # refuse with write_gate_closed and the refusal would be recorded as
+        # finalize_failed. Leave the row finalizing for a write-enabled reconcile.
+        return None
     latest = _pending_latest(manager, request_id)
     reason = dead_finalizer_reason(latest) if latest else ""
     if not reason:

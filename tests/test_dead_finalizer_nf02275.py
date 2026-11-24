@@ -86,6 +86,12 @@ def _seed(mgr, tmp_path: Path, *, state="finalizing", finalizer=None, supervisor
     return status_path
 
 
+@pytest.fixture(autouse=True)
+def _writes_allowed(monkeypatch):
+    """NF-2026-02417: a write-gated process never decides a dead finalizer."""
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+
+
 @pytest.fixture()
 def terminal_calls(monkeypatch):
     calls: list[tuple[str, dict]] = []
