@@ -44,7 +44,8 @@ def test_host_runner_receives_scratch_under_neutral_temp_area(tmp_path, monkeypa
     seen: list[Path] = []
     monkeypatch.setattr(hvs, "host_runner", lambda _tree, root: seen.append(root) or (lambda *_a: {}))
     tree = SimpleNamespace(repo=repo, path=tmp_path / "cand", home=tmp_path / "home")
-    monkeypatch.setattr(ww, "create_combined_validation_workspace", lambda *_a, **_kw: (tree, {}))
+    rec = {"workspace_prepare": {"status": "not_configured"}}  # NF-2026-02410
+    monkeypatch.setattr(ww, "create_combined_validation_workspace", lambda *_a, **_kw: (tree, rec))
     monkeypatch.setattr(workspace_prepare, "prepare_once", lambda *_a, **_kw: "prepared")
 
     directory = hvs.stage_dir(repo, REQUEST)

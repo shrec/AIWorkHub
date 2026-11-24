@@ -72,6 +72,10 @@ def test_combined_tree_contains_current_canonical_delta_and_candidate(
                 "observed_candidate_paths": ["feature.txt", "shared.txt"],
                 "candidate_paths_already_in_canonical": [],
                 "merged_paths": {},
+                "workspace_prepare": {
+                    "schema_id": "aiworkhub.workspace_prepare.v1",
+                    "status": "not_configured",
+                },
             }
         finally:
             cleanup_workspace(combined.repo, combined.path, combined.home)

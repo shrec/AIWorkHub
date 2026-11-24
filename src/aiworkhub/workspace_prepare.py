@@ -36,7 +36,8 @@ import os
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -295,3 +296,48 @@ def prepare_once(
             status, f"exit={receipt.get('returncode')}:{tail}", receipt
         )
     return receipt
+
+
+COMBINED_STATE_DIRNAME = ".aiworkhub-workspace-prepare"
+
+
+def prepare_combined_tree(
+    repo: str | os.PathLike[str],
+    tree: Any,
+    candidate: Iterable[str],
+    *,
+    changed: Callable[[Any], Iterable[str]],
+    hash_path: Callable[[Path], str | None],
+    failure: Callable[[str], Exception],
+    run: Callable[..., dict[str, Any]] = run_hook,
+) -> tuple[Any, dict[str, Any]]:
+    """Run the hook once on a combined validation tree (NF-2026-02410).
+
+    ``tree`` is the ``WorkerWorkspace`` dataclass of a tree whose candidate
+    delta has already been checked.  The receipt lives under the tree's own
+    ``home``, so it is removed with the tree and never reused by another one.
+    Paths the hook adds or edits join ``workspace_baseline`` at their post-hook
+    hash, so later ``changed_paths`` scope checks still observe only the
+    candidate delta.  A hook that rewrites a candidate path is refused: the
+    tree would no longer validate the candidate's bytes.  Every refusal is
+    ``failure("combined_tree_...")``; the caller owns removing the tree.
+    """
+    root = Path(tree.path)
+    paths = sorted(set(candidate))
+    state_dir = Path(tree.home) / COMBINED_STATE_DIRNAME
+    try:
+        if load_hook(repo) is None:  # no hook: the tree stays exactly as built
+            return tree, prepare_once(repo, root, state_dir=state_dir, run=run)
+        before = {relative: hash_path(root / relative) for relative in paths}
+        receipt = prepare_once(repo, root, state_dir=state_dir, run=run)
+    except WorkspacePrepareError as exc:
+        raise failure("combined_tree_" + str(exc)) from exc
+    touched = [relative for relative in paths if hash_path(root / relative) != before[relative]]
+    if touched:
+        raise failure(
+            "combined_tree_workspace_prepare_touched_candidate:" + ",".join(touched[:20])
+        )
+    created = sorted(set(changed(tree)) - set(paths))
+    baseline = dict(tree.workspace_baseline)
+    baseline.update({relative: hash_path(root / relative) for relative in created})
+    return replace(tree, workspace_baseline=baseline), {**receipt, "baseline_paths": created}

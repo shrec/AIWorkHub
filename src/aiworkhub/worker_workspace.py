@@ -6001,7 +6001,7 @@ def create_combined_validation_workspace(
         # repo-declared checks import are absent.  Expand to the full ``HEAD`` union
         # (minus forbidden paths under the card's materialize/checkout rule) before
         # the overlays below, which still take precedence.  Fail closed on error.
-        from . import worker_materialize
+        from . import worker_materialize, workspace_prepare
 
         worker_materialize.expand_full_tree(
             combined.path, union_card, repo, run=_run, timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
@@ -6029,22 +6029,20 @@ def create_combined_validation_workspace(
         unexpected = sorted(set(observed) - set(candidate))
         not_observed = sorted(set(candidate) - set(observed))
         already_in_canonical = [
-            relative
-            for relative in not_observed
-            if _same_regular_file_content(
-                source_workspace.path / relative,
-                repo / relative,
-            )
+            relative for relative in not_observed
+            if _same_regular_file_content(source_workspace.path / relative, repo / relative)
         ]
         missing = sorted(set(not_observed) - set(already_in_canonical))
         if unexpected:
-            raise WorkspaceError(
-                "combined_tree_unexpected_delta:" + ",".join(unexpected[:20])
-            )
+            raise WorkspaceError("combined_tree_unexpected_delta:" + ",".join(unexpected[:20]))
         if missing:
             raise WorkspaceError(
                 "combined_tree_candidate_not_materialized:" + ",".join(missing[:20])
             )
+        combined, prepared = workspace_prepare.prepare_combined_tree(  # NF-2026-02410
+            repo, combined, candidate, changed=changed_paths, hash_path=_hash_path,
+            failure=WorkspaceError,
+        )
         return combined, {
             "schema_id": "aiworkhub.combined_tree.v1",
             "candidate_paths": candidate,
@@ -6052,6 +6050,7 @@ def create_combined_validation_workspace(
             "observed_candidate_paths": observed,
             "candidate_paths_already_in_canonical": already_in_canonical,
             "merged_paths": merged_path_hashes(merges),
+            "workspace_prepare": prepared,
         }
     except Exception:
         cleanup_workspace(repo, combined.path, combined.home)

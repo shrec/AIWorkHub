@@ -1413,13 +1413,13 @@ def workspace_tree_ops(
         return None
 
     def build_candidate() -> TreeHandle:
+        # NF-2026-02410: the combined tree already ran the repo hook once; its
+        # receipt is reused, never re-run, and an unrecorded one fails closed.
         combined, record = ww.create_combined_validation_workspace(workspace, card, paths)
         handle = _handle(combined, dict(record))
-        try:
-            handle.record["workspace_prepare"] = _prepare(handle.path)
-        except BaseException:
+        if not isinstance(handle.record.get("workspace_prepare"), Mapping):
             handle.cleanup()
-            raise
+            raise HostStageError("host_stage_candidate_workspace_prepare_unrecorded")
         return handle
 
     def build_base() -> TreeHandle:

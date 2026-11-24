@@ -983,7 +983,8 @@ def test_the_stage_wires_its_scratch_into_each_tree_runner_and_removes_it(tmp_pa
     seen: list = []
     monkeypatch.setattr(hvs, "host_runner", lambda _tree, root: seen.append(root) or _Runner())
     tree = SimpleNamespace(repo=tmp_path, path=tmp_path / "cand", home=tmp_path / "home")
-    monkeypatch.setattr(ww, "create_combined_validation_workspace", lambda *_a, **_kw: (tree, {}))
+    rec = {"workspace_prepare": {"status": "not_configured"}}  # NF-2026-02410
+    monkeypatch.setattr(ww, "create_combined_validation_workspace", lambda *_a, **_kw: (tree, rec))
     monkeypatch.setattr(workspace_prepare, "prepare_once", lambda *_a, **_kw: "prepared")
     directory = hvs.stage_dir(tmp_path, REQUEST)
     scratch = hvs.neutral_scratch_root(tmp_path, REQUEST)
