@@ -264,8 +264,10 @@ def test_baseline_cold_reconcile_rows_parsed(
     _reconcile(manager)
 
     assert closed == []
-    assert counters.replays == 1
-    assert counters.parsed > 0
+    # NF-2026-02422: the cold path prefilters raw lines, so it no longer replays
+    # every row through iter_events and parses only the wanted-state rows.
+    assert counters.replays == 0
+    assert 0 < counters.parsed < 20  # 20 ledger rows, only the 10 pending ones parse
     _emit({"metric": _METRIC, "value": counters.parsed, "unit": "rows"}, capsys)
 
 

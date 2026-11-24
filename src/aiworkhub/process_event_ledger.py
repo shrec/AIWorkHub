@@ -2124,9 +2124,13 @@ def closure_events(
                 return _copy_state_rows(rows)
 
     before = _ledger_signatures(path)
-    rows = tuple(
-        row for row in iter_events(path) if _row_has_state(row, wanted_set)
-    )
+    # Cold path: a wanted row's raw line carries the JSON-quoted state, so lines
+    # without any such token are skipped before json.loads. ``None`` (spill merge
+    # or a state JSON would escape) means the full replay is required.
+    candidates = _iter_events_containing(path, [_json_token(s) for s in wanted])
+    if candidates is None:
+        candidates = iter_events(path)
+    rows = tuple(row for row in candidates if _row_has_state(row, wanted_set))
     after = _ledger_signatures(path)
     if before is not None and before == after:
         active_offset = 0
