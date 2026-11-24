@@ -154,7 +154,7 @@ def test_findings_keep_every_id_and_dispose_id_when_the_bound_cannot_be_met():
 
 def test_gate_collapse_comes_first_and_reviewer_evidence_last_in_the_declared_order():
     order = completion_inbox._PACKET_DROP_ORDER
-    assert order[0] == "gate_rows_non_blocking"
+    assert order[:2] == ("finding_diff_context", "gate_rows_non_blocking")
     assert order[-2:] == ("reviewer_observations_prose", "reviewer_findings_prose")
     assert "reviewer_observations" not in order
     assert "reviewer_findings" not in order

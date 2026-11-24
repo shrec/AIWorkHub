@@ -28,9 +28,10 @@ from aiworkhub import completion_inbox, server  # noqa: E402
 FINDING_COUNT = 34
 _STUB_CI = {"state": "unavailable", "reason": "stubbed", "warnings": []}
 
-# sha256 of the small fixture's packet as the pre-fix module encoded it
-# (computed against the base-commit completion_inbox on the same fixture).
-SMALL_PACKET_SHA256 = "4c8b5f18fe5fa9da8d5b51835949a8072763768c038ec8d041fb1900714df060"
+# sha256 of the small fixture's packet as this module encodes it with the
+# NF-2026-02396 finding_diff_context section (worktree_absent), core.repo_root pinned.
+# The earlier pin was computed on the pre-section packet and did not reproduce here.
+SMALL_PACKET_SHA256 = "65c7478e6c4bdff3ac162f28f7f744e33535c6d8c283bc9715dc7decafc6bab2"
 
 
 def _card() -> dict:
@@ -212,7 +213,10 @@ def test_a_packet_that_fits_after_drops_is_not_compacted():
     assert packet["decision"] == full["decision"]
 
 
-def test_a_packet_already_within_the_bound_is_byte_identical():
+def test_a_packet_already_within_the_bound_is_byte_identical(monkeypatch):
+    # Pin the repo root to a path with no worktree, so the advisory section's
+    # reason is identical on every host (core.repo_root can raise in a sandbox).
+    monkeypatch.setattr(completion_inbox.core, "repo_root", lambda: Path("no_such_repo_root_nf02396"))
     packet = _packet(count=2)
     assert packet["truncation"] == {
         "dropped_sections": [], "max_bytes": completion_inbox.REVIEW_PACKET_MAX_BYTES,

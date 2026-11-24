@@ -66,7 +66,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from aiworkhub import ci_status, core, task_plan, task_store, validation_runner
+from aiworkhub import ci_status, core, review_finding_context, task_plan, task_store, validation_runner
 
 READONLY: bool = True
 LAUNCH_IMPLEMENTED: bool = False
@@ -943,12 +943,15 @@ _PACKET_SHORT_TEXT_CHARS = 120
 _PACKET_NON_BLOCKING_CITATION = ("moved", "ok")
 
 # Dropped or collapsed in this order while the finalized packet exceeds the
-# bound. Least decisive first: passing gate rows collapse to counts, then the
-# output tails (re-readable from the artifact bundle), then gate evidence. The
-# blockers (failed destructive diff, broken citation) are never removed here.
+# bound. Least decisive first: the advisory per-finding diff context
+# (NF-2026-02396) goes first, since the worktree still holds it. Then passing
+# gate rows collapse to counts, then the output tails (re-readable from the
+# artifact bundle), then gate evidence. The blockers (failed destructive diff,
+# broken citation) are never removed here.
 # Reviewer observations and findings are never dropped: only their prose
 # shrinks, so no finding id or dispose id is ever lost.
 _PACKET_DROP_ORDER = (
+    "finding_diff_context",
     "gate_rows_non_blocking",
     "validation_output_tails",
     "gate_checks_passed",
@@ -1264,6 +1267,11 @@ def _packet_irreducible_section(packet: dict[str, Any]) -> str:
 
 def _packet_drop(packet: dict[str, Any], section: str) -> bool:
     """Apply one declared drop. Returns whether anything was actually removed."""
+    if section == "finding_diff_context":
+        # Advisory hunks, re-derivable from the worktree: the first thing to go.
+        # Removing an empty stub (worktree absent) lists nothing: no evidence was lost.
+        removed = packet.pop("finding_diff_context", None)
+        return isinstance(removed, dict) and bool(removed.get("items"))
     if section == "gate_rows_non_blocking":
         # Both collapses run even when the first one alone would fit: the
         # passing rows are noise for the manager, and collapsing both keeps the
@@ -1890,6 +1898,16 @@ def review_packet(
         except Exception as exc:  # noqa: BLE001 -- advisory data must not break the packet
             base_ci = {"state": "unavailable", "reason": type(exc).__name__, "warnings": []}
     packet["base_ci"] = base_ci
+    # NF-2026-02396: advisory per-finding diff context from this request's
+    # retained worktree. Built before truncation and first in _PACKET_DROP_ORDER,
+    # so the bound drops it before any evidence. It never raises into the packet.
+    try:
+        worktree = task_store._request_worktree_path(core.repo_root(), request_id)
+        packet["finding_diff_context"] = review_finding_context.build_section(
+            packet["review"]["findings"] + packet["review"]["observations"], worktree
+        )
+    except Exception as exc:  # noqa: BLE001 -- advisory data must not break the packet
+        packet["finding_diff_context"] = {"items": [], "unavailable_reason": type(exc).__name__}
     # NF-2026-01925: built before truncation from the sections already above,
     # and absent from _PACKET_DROP_ORDER, so evidence is always dropped first.
     packet["decision"] = _packet_decision(packet, preview)
