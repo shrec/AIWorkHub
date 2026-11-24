@@ -41,6 +41,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from . import accept_neighbour_direct as _direct
 from . import accept_neighbour_nodes as _nodes
 from . import card_contract_advice as _advice
 from . import test_impact_select as _impact
@@ -197,10 +198,18 @@ class NeighbourSelection:
     contract_tier_reasons: tuple[Mapping[str, str], ...] = field(default=())
     contract_tier_skipped: tuple[Mapping[str, str], ...] = field(default=())
     contract_tier_reason: str = ""
+    # NF-2026-02390: the tests that directly import a changed module, outside ``limit``;
+    # how many direct importers ``DIRECT_IMPORTER_CAP`` left out, and why. The tier is
+    # additive: ``direct_added`` counts the ones appended because no other lane held them.
+    direct: tuple[str, ...] = ()
+    direct_omitted: int = 0
+    direct_reason: str = ""
+    direct_added: int = 0
 
     def evidence(self) -> dict[str, Any]:
         ranked = (
             len(self.tests)
+            - self.direct_added
             - len(self.invariant)
             - len(self.contract_gate)
             - len(self.contract_tier)
@@ -213,6 +222,11 @@ class NeighbourSelection:
             "related_count": self.related_count,
             "omitted": max(0, self.related_count - ranked),
         }
+        if self.direct or self.direct_omitted:
+            record["direct"] = list(self.direct)
+            record["direct_omitted"] = self.direct_omitted
+        if self.direct_reason:
+            record["direct_reason"] = self.direct_reason
         if self.invariant:
             record["invariant"] = list(self.invariant)
         if self.contract_gate:
@@ -330,6 +344,12 @@ def select_neighbour_tests(
     when every changed path maps to nodes (NF-2026-02102). ``INVARIANT_TESTS``
     and the tests that load a changed module by path or ratchet its size
     follow, outside that cap. Never raises.
+
+    NF-2026-02390: in either lane the tests that directly import a changed
+    module (``direct``) are added last, outside ``limit`` under ``DIRECT_IMPORTER_CAP``
+    with any overflow in ``direct_omitted``/``direct_reason``. The tier is strictly
+    additive: every entry above stays as it was, node ids included, and only the
+    importers no entry already covers are appended.
     """
     bounded = _bounded_limit(limit)
     try:
@@ -371,10 +391,19 @@ def select_neighbour_tests(
         failed = f"{CONTRACT_TIER_PREFIX}_failed:{type(exc).__name__}"
         selection = replace(selection, contract_tier_reason=failed)
     try:
-        return _with_referencing(Path(repo_root), selection, changed_paths, declared_commands)
+        selection = _with_referencing(
+            Path(repo_root), selection, changed_paths, declared_commands
+        )
     except Exception as exc:  # nor the referencing scan: it names its failure and adds nothing
         reason = f"referencing_scan_failed:{type(exc).__name__}"
-        return replace(selection, referencing_reason=reason)
+        selection = replace(selection, referencing_reason=reason)
+    try:
+        direct, direct_omitted, direct_reason = _direct_importers(
+            Path(repo_root), changed_paths, declared_commands, bounded
+        )
+        return _with_direct(selection, direct, direct_omitted, direct_reason)
+    except Exception as exc:  # a failed scan keeps the selection and is named, never silent
+        return replace(selection, direct_reason=f"direct_scan_failed:{type(exc).__name__}")
 
 
 def _impact_lane(
@@ -911,6 +940,98 @@ def _scan_workers(count: int) -> int:
     return max(1, min(count, (os.cpu_count() or 1) * 3 // 4))
 
 
+def _direct_importers(
+    root: Path,
+    changed_paths: Iterable[Any],
+    declared_commands: Sequence[str],
+    limit: int,
+) -> tuple[tuple[str, ...], int, str]:
+    """NF-2026-02390: ``(direct, omitted, reason)`` for the changed ``src/`` modules.
+
+    Every collected test that imports a changed module (see
+    :mod:`aiworkhub.accept_neighbour_direct`), minus the tests the declared
+    validation names and ``INVARIANT_TESTS``, capped at ``DIRECT_IMPORTER_CAP``
+    with the overflow counted and named. Within the cap the files keep path
+    order. On overflow they are first ordered by the ranked lane's testmap score
+    (highest first, ties by path), so the cut drops the least-related importers
+    and never the alphabetically last ones. The extra testmap lookup runs only
+    on overflow. When the scores cannot be read, path order decides and the
+    reason says ``unranked``.
+    """
+    if limit == 0:
+        return (), 0, ""
+    production = _production_paths(changed_paths)
+    modules = _direct.changed_modules(production)
+    if not modules:
+        return (), 0, ""
+    named = _advice._command_names(
+        command for command in declared_commands if isinstance(command, str)
+    )
+    candidates = [
+        (test, path)
+        for test, path in _collected_tests(root, bounded=False)
+        if test not in INVARIANT_TESTS and not _advice._covers(named, test)
+    ]
+    found = _direct.scan_direct_importers(
+        candidates, modules, workers=_scan_workers(len(candidates))
+    )
+    if len(found) <= _direct.DIRECT_IMPORTER_CAP:
+        return _direct.cap_direct(found)
+    unranked = ""
+    try:
+        consulted = tuple(production[: _advice.MAX_PRODUCTION_PATHS])
+        _freshness, best, _unavailable, answered = _testmap_related(root, consulted, named)
+    except Exception as exc:  # unknown ranking: scan order, and the reason says so
+        answered, unranked = False, f":unranked:{type(exc).__name__}"
+    else:
+        if not answered:  # an unanswered testmap is no ranking: never present it as one
+            unranked = ":unranked:testmap_not_answered"
+    if answered:
+        scores = {test: float(score) for test, (score, _path) in best.items()}
+        found = tuple(sorted(found, key=lambda test: (-scores.get(test, 0.0), test)))
+    kept, omitted, reason = _direct.cap_direct(found)
+    return kept, omitted, reason + unranked
+
+
+def _testmap_related(
+    root: Path, consulted: Sequence[str], named: Any, freshness: Any = None
+) -> tuple[Any, dict[str, Any], list[Any], bool]:
+    """The ranked lane's testmap lookup: ``(freshness, best, unavailable, answered)``.
+
+    ``best`` maps a test path to ``(score, path)``. Both the ranked lane and the
+    direct tier's overflow order read scores here. ``freshness`` is read when not
+    given, and the call raises when it cannot be read.
+    """
+    if freshness is None:
+        freshness = _advice._freshness_states(root, tuple(consulted))
+    best, unavailable, _truncated, answered = _advice._related_tests(
+        root, tuple(consulted), freshness, named
+    )
+    return freshness, best, list(unavailable), bool(answered)
+
+
+def _with_direct(
+    selection: NeighbourSelection, direct: tuple[str, ...], omitted: int, reason: str
+) -> NeighbourSelection:
+    """Append the direct importers no entry covers; every existing entry stays as it is.
+
+    A file is covered by an equal entry or by a node id of it (``file::...``), so a
+    node id is never replaced by its file and the order above never changes.
+    """
+    if not direct and not omitted and not reason:
+        return selection
+    covered = {test.split("::", 1)[0] for test in selection.tests}
+    added = tuple(test for test in direct if test not in covered)
+    return replace(
+        selection,
+        tests=selection.tests + added,
+        direct=direct,
+        direct_omitted=omitted,
+        direct_reason=reason,
+        direct_added=len(added),
+    )
+
+
 def _select(
     root: Path,
     changed_paths: Iterable[Any],
@@ -918,22 +1039,21 @@ def _select(
     limit: int,
     candidate_root: Path | str | None = None,
 ) -> NeighbourSelection:
+    """The testmap-ranked lane; it never depends on the NF-2026-02390 direct tier."""
     if limit == 0:
         return _empty("neighbour_limit_zero", limit)
     production = _production_paths(changed_paths)
     if not production:
         return _empty("no_changed_production_python", limit)
     consulted = tuple(production[: _advice.MAX_PRODUCTION_PATHS])
+    named = _advice._command_names(
+        command for command in declared_commands if isinstance(command, str)
+    )
     try:
         freshness = _advice._freshness_states(root, consulted)
     except Exception as exc:  # unresolved repo, missing or unreadable index, ...
         return _empty(_advice._failure_reason(exc), limit, production_paths=consulted)
-    named = _advice._command_names(
-        command for command in declared_commands if isinstance(command, str)
-    )
-    best, unavailable, _truncated, answered = _advice._related_tests(
-        root, consulted, freshness, named
-    )
+    freshness, best, unavailable, answered = _testmap_related(root, consulted, named, freshness)
     if not answered:
         reason = unavailable[0]["reason"] if unavailable else "testmap_not_answered"
         return _empty(

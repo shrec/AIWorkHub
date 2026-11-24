@@ -290,7 +290,9 @@ def test_a_stale_changed_path_falls_back_unchanged(
     root, candidate = trees
     (root / MOD).write_bytes(b"def f():\n    return 2\n")  # canonical moved after recording
     selection = _select(root, candidate)
-    assert selection.tests == (TEST_OTHER, RATCHET)
+    # NF-2026-02390: TEST_MOD does `from pkg import mod`, so the additive direct tier appends it.
+    assert selection.tests == (TEST_OTHER, RATCHET, TEST_MOD)
+    assert selection.direct == (TEST_MOD,) and selection.direct_added == 1
     _assert_structural(monkeypatch, selection, f"impact_map_stale:{MOD}", root, candidate)
 
 
