@@ -3103,6 +3103,105 @@ def _stale_inputs_touching_candidate(
     return touching
 
 
+# NF-2026-02409: the ``stored_hash_mismatch`` detail stays bounded however many
+# paths drifted; a digest is shortened to a prefix that still tells two apart.
+_STORED_HASH_MISMATCH_LIST_LIMIT = 12
+_STORED_HASH_DIGEST_CHARS = 12
+
+
+def _stored_hash_mismatch_refusal(
+    accepted: Mapping[str, str | None],
+    current: Mapping[str, str | None],
+    *,
+    candidate_root: Path,
+    canonical_root: Path,
+    before_validation: Mapping[str, str | None] | None = None,
+) -> str | None:
+    """The ``stored_hash_mismatch`` refusal naming what drifted, or ``None``.
+
+    ``accepted`` is what the accept is about to promote (the sealed candidate's
+    hashes, corrected where a manager correction landed) and ``current`` is the
+    changed-path hashes of the retained worktree now. The refusal used to be the
+    bare token, so a manager could not tell which path moved or why
+    (NF-2026-02409); it is now ``stored_hash_mismatch:`` plus compact JSON:
+
+    - ``only_stored`` / ``only_current``: paths in one key set but not the other;
+    - ``digest_changed``: ``{path, stored, current}`` with 12-char digests;
+    - ``mutated_by_validation``: paths whose digest moved between
+      ``before_validation`` and ``current`` -- the declared validation wrote
+      into the tree -- present only when there is such a path;
+    - ``omitted``: per list, how many entries the bound dropped, only when any.
+
+    A key-set difference whose recorded digest is ``None`` for a path that
+    exists neither in the candidate tree nor in canonical is not drift: an
+    earlier round created and later deleted it, and there is nothing to
+    promote. Every other difference, including any real byte change, refuses.
+    """
+
+    def _absent(root: Path, relative: str) -> bool:
+        # A rooted, drive-qualified or climbing key is never exempt: it refuses.
+        parts = relative.replace("\\", "/").split("/")
+        if not relative or relative[0] in "/\\" or ":" in relative or ".." in parts:
+            return False
+        return not os.path.lexists(Path(root) / relative)
+
+    def _short(digest: str | None) -> str | None:
+        return None if digest is None else str(digest)[:_STORED_HASH_DIGEST_CHARS]
+
+    only_stored: list[str] = []
+    only_current: list[str] = []
+    for relative in sorted(set(accepted) ^ set(current)):
+        in_stored = relative in accepted
+        recorded = accepted[relative] if in_stored else current[relative]
+        if (
+            recorded is None
+            and _absent(candidate_root, relative)
+            and _absent(canonical_root, relative)
+        ):
+            continue
+        (only_stored if in_stored else only_current).append(relative)
+    digest_changed = [
+        relative
+        for relative in sorted(set(accepted) & set(current))
+        if accepted[relative] != current[relative]
+    ]
+    if not (only_stored or only_current or digest_changed):
+        return None
+    limit = _STORED_HASH_MISMATCH_LIST_LIMIT
+    detail: dict[str, Any] = {
+        "only_stored": only_stored[:limit],
+        "only_current": only_current[:limit],
+        "digest_changed": [
+            {
+                "path": relative,
+                "stored": _short(accepted[relative]),
+                "current": _short(current[relative]),
+            }
+            for relative in digest_changed[:limit]
+        ],
+    }
+    totals = {
+        "only_stored": len(only_stored),
+        "only_current": len(only_current),
+        "digest_changed": len(digest_changed),
+    }
+    if before_validation is not None:
+        mutated = sorted(
+            relative
+            for relative in set(before_validation) | set(current)
+            if before_validation.get(relative) != current.get(relative)
+        )
+        if mutated:
+            detail["mutated_by_validation"] = mutated[:limit]
+            totals["mutated_by_validation"] = len(mutated)
+    omitted = {name: total - limit for name, total in totals.items() if total > limit}
+    if omitted:
+        detail["omitted"] = omitted
+    return "stored_hash_mismatch:" + json.dumps(
+        detail, sort_keys=True, separators=(",", ":")
+    )
+
+
 # The seams are runtime names only.  ``Any`` and ``_WorkerWorkspaceT`` appear
 # solely in annotations -- which ``from __future__ import annotations`` leaves
 # as strings -- so they are resolved from this module's own imports and are
@@ -3159,6 +3258,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "_reviewer_target_split",
     "carried_reviewer_evidence",
     "retained_sealed_binding",
+    "_stored_hash_mismatch_refusal",
 )
 
 ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
@@ -5022,6 +5122,11 @@ def accept_review(
             # evidence for this tree; the finalizer receipt is the fallback.
             validation_reuse = union_validation_reuse or validation_reuse
             in_flight.advance("revalidating")
+            # NF-2026-02409: the declared validation runs inside this workspace,
+            # so a test or build step that rewrites a changed path moves its
+            # digest without any worker edit. Hashing the changed paths right
+            # before it lets the refusal below name the drift validation caused.
+            pre_validation_hashes = _changed_path_hashes(workspace, changed)
             validations, full_validation_snapshot = (
                 _run_full_snapshot_validations(
                     workspace, card, latest, changed,
@@ -5035,11 +5140,15 @@ def accept_review(
             # corrected paths carry their corrected digests -- so this still
             # proves the tree about to be promoted is the tree just validated.
             current_hashes = _changed_path_hashes(workspace, changed)
-            if set(current_hashes) != set(accepted_path_hashes) or any(
-                current_hashes[relative] != accepted_path_hashes.get(relative)
-                for relative in current_hashes
-            ):
-                raise WorkspaceError("stored_hash_mismatch")
+            stored_hash_refusal = _stored_hash_mismatch_refusal(
+                accepted_path_hashes,
+                current_hashes,
+                candidate_root=workspace.path,
+                canonical_root=self.repo,
+                before_validation=pre_validation_hashes,
+            )
+            if stored_hash_refusal is not None:
+                raise WorkspaceError(stored_hash_refusal)
             # NF-2026-02026: everything above ran outside the repo-wide promotion
             # lock, against the canonical pin taken before the first validation.
             # The lock enters ``held`` here, so the ``with`` above releases it on
