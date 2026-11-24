@@ -14925,7 +14925,7 @@ def test_bare_claude_runner_derives_claude_cli_first():
     process_launcher._validate_adapter_identity("claude", "vscode_lm")
     with pytest.raises(process_launcher.LaunchRejected):
         process_launcher._validate_adapter_identity("claude", "not_an_adapter")
-    # The prefixed family keeps its editor-bridge-first order unchanged.
+    # NF-2026-01343: the prefixed family now uses the same order as the bare runner.
     assert process_launcher.adapter_identity_tuple("claude_opus-5") == (
-        "vscode_lm", "claude_cli",
+        "claude_cli", "vscode_lm",
     )

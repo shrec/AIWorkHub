@@ -59,10 +59,10 @@ def test_vscode_lm_capability_blocker_reroutes_to_claude_cli(tmp_path, monkeypat
     card = _card(validation=["cmake --build build"])
     identity = process_launcher.derive_launch_identity(tmp_path, card, runner="claude_sonnet-5", topic="nf02087")
     assert identity["adapter_id"] == "claude_cli"
-    assert any(
-        rejection == "vscode_lm:capability:native_toolchain:cmake"
-        for rejection in identity["adapter_rejections"]
-    )
+    # NF-2026-01343: claude_cli leads the claude_* tuple and has no capability
+    # blocker, so vscode_lm is never evaluated; the blocker itself is pinned by
+    # the reject_incapable tests below.
+    assert identity["adapter_rejections"] == []
 
 
 def test_vscode_lm_capability_blocker_allows_python_only_validation(tmp_path, monkeypatch):
@@ -72,7 +72,7 @@ def test_vscode_lm_capability_blocker_allows_python_only_validation(tmp_path, mo
 
     card = _card(validation=["python -m pytest -q"])
     identity = process_launcher.derive_launch_identity(tmp_path, card, runner="claude_sonnet-5", topic="nf02087")
-    assert identity["adapter_id"] == "vscode_lm"
+    assert identity["adapter_id"] == "claude_cli"
 
 
 def test_reject_incapable_appends_one_capability_rejection_for_blocked_card():

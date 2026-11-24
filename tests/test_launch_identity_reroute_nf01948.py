@@ -60,10 +60,10 @@ def _bridge(monkeypatch, *, launchable=True, blocker=""):
     )
 
 
-def test_baseline_without_reroute_picks_vscode_lm(tmp_path, monkeypatch):
+def test_baseline_without_reroute_picks_claude_cli(tmp_path, monkeypatch):
     _bridge(monkeypatch)
     derived = process_launcher.derive_launch_identity(tmp_path, _card())
-    assert derived["adapter_id"] == "vscode_lm"
+    assert derived["adapter_id"] == "claude_cli"
     assert "identity_reroute" not in derived["derived_from"].values()
 
 
@@ -113,7 +113,7 @@ def test_reroute_for_other_runner_is_ignored(tmp_path, monkeypatch):
     derived = process_launcher.derive_launch_identity(
         tmp_path, _card(_reroute(to_runner="codex_gpt-5"))
     )
-    assert derived["adapter_id"] == "vscode_lm"
+    assert derived["adapter_id"] == "claude_cli"
     assert derived["model"] != REROUTE_MODEL
     assert "identity_reroute" not in derived["derived_from"].values()
     assert "identity_reroute_rejected" not in derived["derived_from"]
@@ -122,7 +122,7 @@ def test_reroute_for_other_runner_is_ignored(tmp_path, monkeypatch):
 def test_non_mapping_reroute_is_ignored(tmp_path, monkeypatch):
     _bridge(monkeypatch)
     derived = process_launcher.derive_launch_identity(tmp_path, _card("claude_cli"))
-    assert derived["adapter_id"] == "vscode_lm"
+    assert derived["adapter_id"] == "claude_cli"
 
 
 def test_unpinnable_reroute_adapter_falls_back_and_records_reason(tmp_path, monkeypatch):
@@ -130,7 +130,7 @@ def test_unpinnable_reroute_adapter_falls_back_and_records_reason(tmp_path, monk
     derived = process_launcher.derive_launch_identity(
         tmp_path, _card(_reroute(to_adapter_id="not_a_real_adapter"))
     )
-    assert derived["adapter_id"] == "vscode_lm"
+    assert derived["adapter_id"] == "claude_cli"
     assert derived["model"] != REROUTE_MODEL
     assert derived["derived_from"]["adapter_id"] != "identity_reroute"
     rejected = derived["derived_from"]["identity_reroute_rejected"]

@@ -2949,7 +2949,10 @@ def adapter_identity_tuple(runner: str) -> tuple[str, ...]:
         # bridge stays acceptable exactly as for the ``claude_`` family.
         return ("claude_cli", "vscode_lm")
     if runner.startswith("claude_"):
-        return ("vscode_lm", "claude_cli")
+        # NF-2026-01343: vscode_lm on claude_* runners measured 0/20 (each dies
+        # at once on vscode_lm_semantic_edit_stage_required) while claude_cli
+        # accepted 469; same order as the bare ``claude`` runner above.
+        return ("claude_cli", "vscode_lm")
     if runner.startswith("codex_"):
         return ("vscode_lm", "codex_cli")
     if runner.startswith("deepseek_"):

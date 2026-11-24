@@ -59,18 +59,25 @@ def _derive(tmp_path, card):
     )
 
 
-def test_two_consecutive_validation_failures_move_to_claude_cli(tmp_path):
+# NF-2026-01343: the claude_* tuple now leads with claude_cli, so derivation
+# stops at the first pinnable candidate and never evaluates vscode_lm at all.
+# Whether vscode_lm WOULD be rejected for a card's history is pinned directly
+# on adapter_capability.reject_incapable below; these tests pin what derivation
+# really records.
+
+
+def test_two_consecutive_validation_failures_derive_claude_cli(tmp_path):
     identity = _derive(tmp_path, _reworked_after_validation_failures(2))
     assert identity["adapter_id"] == "claude_cli"
-    assert "vscode_lm:repeated_validation_failure" in identity["adapter_rejections"]
+    assert identity["adapter_rejections"] == []
 
 
-def test_third_validation_failure_also_moves_off_vscode_lm(tmp_path):
+def test_third_validation_failure_also_derives_claude_cli(tmp_path):
     identity = _derive(tmp_path, _reworked_after_validation_failures(3))
     assert identity["adapter_id"] == "claude_cli"
 
 
-def test_terminal_review_evidence_counts_the_current_attempt(tmp_path):
+def test_terminal_review_evidence_derives_claude_cli(tmp_path):
     card = _card(
         terminal_substatus="validation_failed",
         terminal_review={
@@ -83,30 +90,30 @@ def test_terminal_review_evidence_counts_the_current_attempt(tmp_path):
     )
     identity = _derive(tmp_path, card)
     assert identity["adapter_id"] == "claude_cli"
-    assert "vscode_lm:repeated_validation_failure" in identity["adapter_rejections"]
+    assert identity["adapter_rejections"] == []
 
 
-def test_single_validation_failure_keeps_vscode_lm(tmp_path):
+def test_single_validation_failure_derives_claude_cli(tmp_path):
     identity = _derive(tmp_path, _reworked_after_validation_failures(1))
-    assert identity["adapter_id"] == "vscode_lm"
+    assert identity["adapter_id"] == "claude_cli"
     assert not any("repeated_validation_failure" in r for r in identity["adapter_rejections"])
 
 
-def test_manager_rework_without_auto_return_header_keeps_vscode_lm(tmp_path):
+def test_manager_rework_without_auto_return_header_derives_claude_cli(tmp_path):
     card = _reworked_after_validation_failures(2)
     card["review_feedback"] = {"instruction": "please fix the failing test"}
-    assert _derive(tmp_path, card)["adapter_id"] == "vscode_lm"
+    assert _derive(tmp_path, card)["adapter_id"] == "claude_cli"
 
 
-def test_card_wide_validation_failures_reject_vscode_lm_after_another_adapter_ran(tmp_path):
+def test_card_wide_validation_failures_derive_claude_cli(tmp_path):
     card = _reworked_after_validation_failures(2)
     card["adapter_id"] = "claude_cli"
     identity = _derive(tmp_path, card)
     assert identity["adapter_id"] == "claude_cli"
-    assert "vscode_lm:repeated_validation_failure" in identity["adapter_rejections"]
+    assert identity["adapter_rejections"] == []
 
 
-def test_rejection_stays_sticky_after_switch_to_claude_cli(tmp_path):
+def test_claude_cli_stays_derived_after_switch_to_claude_cli(tmp_path):
     card = _reworked_after_validation_failures(3)
     card["adapter_id"] = "claude_cli"
     card["terminal_substatus"] = "validation_failed"
@@ -116,7 +123,7 @@ def test_rejection_stays_sticky_after_switch_to_claude_cli(tmp_path):
     }
     identity = _derive(tmp_path, card)
     assert identity["adapter_id"] == "claude_cli"
-    assert "vscode_lm:repeated_validation_failure" in identity["adapter_rejections"]
+    assert identity["adapter_rejections"] == []
 
 
 @pytest.mark.parametrize(
@@ -129,7 +136,7 @@ def test_rejection_stays_sticky_after_switch_to_claude_cli(tmp_path):
 def test_vscode_lm_staging_failure_retry_derives_claude_cli(tmp_path, error):
     identity = _derive(tmp_path, _worker_failed(error))
     assert identity["adapter_id"] == "claude_cli"
-    assert "vscode_lm:vscode_lm_staging_failure" in identity["adapter_rejections"]
+    assert identity["adapter_rejections"] == []
 
 
 def test_staging_failure_recorded_in_substatus_is_recognised(tmp_path):
@@ -138,21 +145,21 @@ def test_staging_failure_recorded_in_substatus_is_recognised(tmp_path):
     assert identity["adapter_id"] == "claude_cli"
 
 
-def test_other_worker_failure_keeps_vscode_lm(tmp_path):
+def test_other_worker_failure_derives_claude_cli(tmp_path):
     identity = _derive(tmp_path, _worker_failed("vscode_lm_response_timeout"))
-    assert identity["adapter_id"] == "vscode_lm"
+    assert identity["adapter_id"] == "claude_cli"
 
 
-def test_staging_marker_without_worker_failed_keeps_vscode_lm(tmp_path):
+def test_staging_marker_without_worker_failed_derives_claude_cli(tmp_path):
     card = _worker_failed("vscode_lm_semantic_edit_stage_required")
     card["terminal_substatus"] = "review_ready"
     card["terminal_review"]["substatus"] = "review_ready"
-    assert _derive(tmp_path, card)["adapter_id"] == "vscode_lm"
+    assert _derive(tmp_path, card)["adapter_id"] == "claude_cli"
 
 
-def test_clean_card_keeps_todays_derivation(tmp_path):
+def test_clean_card_derives_claude_cli(tmp_path):
     identity = _derive(tmp_path, _card())
-    assert identity["adapter_id"] == "vscode_lm"
+    assert identity["adapter_id"] == "claude_cli"
     assert identity["adapter_rejections"] == []
 
 
@@ -178,4 +185,24 @@ def test_non_vscode_lm_candidate_is_never_history_rejected():
     card["adapter_id"] = "claude_cli"
     rejections: list[str] = []
     assert adapter_capability.reject_incapable(card, "claude_cli", rejections) is False
+    assert rejections == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["vscode_lm_semantic_edit_stage_required", "coordinates_shifted_requires_fresh_worker_pair"],
+)
+def test_reject_incapable_records_the_vscode_lm_staging_failure(error):
+    # NF-2026-01343: derivation no longer reaches vscode_lm for claude_* runners,
+    # so the staging-failure cause is pinned on reject_incapable directly.
+    rejections: list[str] = []
+    card = _worker_failed(error)
+    assert adapter_capability.reject_incapable(card, "vscode_lm", rejections) is True
+    assert rejections == ["vscode_lm:vscode_lm_staging_failure"]
+
+
+def test_reject_incapable_keeps_vscode_lm_after_another_worker_failure():
+    rejections: list[str] = []
+    card = _worker_failed("vscode_lm_response_timeout")
+    assert adapter_capability.reject_incapable(card, "vscode_lm", rejections) is False
     assert rejections == []

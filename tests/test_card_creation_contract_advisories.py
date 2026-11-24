@@ -407,11 +407,10 @@ def test_adapter_is_the_first_pinnable_launchable_in_canonical_tuple_order(tmp_p
     derived = process_launcher.derive_launch_identity(tmp_path, _launchable_card())
     tuple_order = process_launcher.adapter_identity_tuple("claude_opus-5")
     assert derived["adapter_candidates"] == list(tuple_order)
-    # claude_opus-5's tuple leads with vscode_lm, which owns NO canonical
-    # workforce row; deriving it would pin a model that validate_workforce_
-    # identity refuses with workforce_route_absent one line later.
-    assert tuple_order[0] == "vscode_lm"
-    assert ("claude_opus-5", "vscode_lm") not in process_launcher._CANONICAL_WORKFORCE
+    # NF-2026-01343: claude_opus-5's tuple leads with claude_cli, the adapter
+    # that actually completes work for the claude_* family.
+    assert tuple_order[0] == "claude_cli"
+    assert tuple_order == ("claude_cli", "vscode_lm")
     assert derived["adapter_id"] == "claude_cli"
     assert (
         derived["derived_from"]["adapter_id"]
@@ -808,26 +807,27 @@ def _sealed_balance_observations(monkeypatch, *, open_adapter):
 def test_derivation_skips_an_open_route_circuit_and_says_why(tmp_path, monkeypatch):
     card = _launchable_card(runner="claude_sonnet-5")
     assert process_launcher.adapter_identity_tuple("claude_sonnet-5")[:2] == (
-        "vscode_lm", "claude_cli",
+        "claude_cli", "vscode_lm",
     )
     _sealed_balance_observations(monkeypatch, open_adapter="nobody")
     baseline = process_launcher.derive_launch_identity(tmp_path, card)
-    assert baseline["adapter_id"] == "vscode_lm"
+    assert baseline["adapter_id"] == "claude_cli"
     assert "adapter_circuit_skipped" not in baseline["derived_from"]
 
-    _sealed_balance_observations(monkeypatch, open_adapter="vscode_lm")
+    _sealed_balance_observations(monkeypatch, open_adapter="claude_cli")
     derived = process_launcher.derive_launch_identity(tmp_path, card)
 
-    assert derived["adapter_id"] == "claude_cli"
-    assert derived["model"] == "claude-sonnet-5-5"
+    assert derived["adapter_id"] == "vscode_lm"
+    # The editor bridge addresses the model by its family id, not the CLI id.
+    assert derived["model"] == "claude-sonnet-5"
     assert (
         derived["derived_from"]["adapter_id"]
         == "first_pinnable_launchable_in_tuple_order"
     )
     skipped = derived["derived_from"]["adapter_circuit_skipped"]
-    assert skipped.startswith("vscode_lm:route_circuit_open:quota:reset_at=")
+    assert skipped.startswith("claude_cli:route_circuit_open:quota:reset_at=")
     assert any(
-        rejection.startswith("vscode_lm:route_circuit_open")
+        rejection.startswith("claude_cli:route_circuit_open")
         for rejection in derived["adapter_rejections"]
     )
 
@@ -857,15 +857,15 @@ def test_derivation_skips_a_route_whose_harness_keeps_failing(tmp_path, monkeypa
     monkeypatch.setattr(
         workforce_catalog.task_store, "route_terminal_observations", observations
     )
+    # NF-2026-01343: claude_* now leads with claude_cli, so derivation stops
+    # there and never consults the vscode_lm harness circuit.
     derived = process_launcher.derive_launch_identity(
         tmp_path, _launchable_card(runner="claude_sonnet-5")
     )
 
     assert derived["adapter_id"] == "claude_cli"
-    assert (
-        "vscode_lm:route_circuit_open:harness_behaviour"
-        in derived["derived_from"]["adapter_circuit_skipped"]
-    )
+    assert "adapter_circuit_skipped" not in derived["derived_from"]
+    assert derived["adapter_rejections"] == []
 
 
 def test_an_explicit_adapter_pin_is_never_overridden_by_the_circuit(

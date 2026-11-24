@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -30,7 +32,21 @@ def _card(**overrides):
     return card
 
 
-def test_stale_bridge_host_falls_back_to_claude_cli(tmp_path, monkeypatch):
+def _reject_claude_cli(monkeypatch):
+    """Deny claude_cli by policy so a claude_* derivation reaches vscode_lm."""
+    real_validate = process_launcher.repo_policy.validate_launch
+
+    def fake_validate(repo, card, adapter):
+        if adapter == "claude_cli":
+            return {"ok": False, "reason": "policy_denied_for_test"}
+        return real_validate(repo, card, adapter)
+
+    monkeypatch.setattr(process_launcher.repo_policy, "validate_launch", fake_validate)
+
+
+def test_stale_bridge_host_rejects_vscode_lm_when_claude_cli_is_denied(
+    tmp_path, monkeypatch
+):
     def fake_bridge_readiness(repo, **kwargs):
         return {
             "launchable": False,
@@ -41,11 +57,15 @@ def test_stale_bridge_host_falls_back_to_claude_cli(tmp_path, monkeypatch):
     monkeypatch.setattr(
         process_launcher.vscode_lm_bridge, "bridge_readiness", fake_bridge_readiness
     )
+    _reject_claude_cli(monkeypatch)
 
-    derived = process_launcher.derive_launch_identity(tmp_path, _card())
+    with pytest.raises(process_launcher.LaunchRejected) as excinfo:
+        process_launcher.derive_launch_identity(tmp_path, _card())
 
-    assert derived["adapter_id"] == "claude_cli"
-    assert "vscode_lm:vscode_lm_unavailable:vscode_lm_host_stale" in derived["adapter_rejections"]
+    message = str(excinfo.value)
+    assert message.startswith("launch_adapter_underivable:runner=claude_sonnet-5:")
+    assert "claude_cli:policy_denied_for_test" in message
+    assert "vscode_lm:vscode_lm_unavailable:vscode_lm_host_stale" in message
 
 
 def test_live_bridge_host_keeps_vscode_lm(tmp_path, monkeypatch):
@@ -59,11 +79,12 @@ def test_live_bridge_host_keeps_vscode_lm(tmp_path, monkeypatch):
     monkeypatch.setattr(
         process_launcher.vscode_lm_bridge, "bridge_readiness", fake_bridge_readiness
     )
+    _reject_claude_cli(monkeypatch)
 
     derived = process_launcher.derive_launch_identity(tmp_path, _card())
 
     assert derived["adapter_id"] == "vscode_lm"
-    assert derived["adapter_rejections"] == []
+    assert derived["adapter_rejections"] == ["claude_cli:policy_denied_for_test"]
 
 
 def test_explicit_vscode_lm_adapter_id_ignores_a_stale_host(tmp_path, monkeypatch):
@@ -90,18 +111,48 @@ def test_explicit_vscode_lm_adapter_id_ignores_a_stale_host(tmp_path, monkeypatc
     assert calls == []
 
 
-def test_bridge_readiness_error_falls_back_to_claude_cli(tmp_path, monkeypatch):
+def test_bridge_readiness_error_rejects_vscode_lm_when_claude_cli_is_denied(
+    tmp_path, monkeypatch
+):
     def raising_bridge_readiness(repo, **kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(
         process_launcher.vscode_lm_bridge, "bridge_readiness", raising_bridge_readiness
     )
+    _reject_claude_cli(monkeypatch)
+
+    with pytest.raises(process_launcher.LaunchRejected) as excinfo:
+        process_launcher.derive_launch_identity(tmp_path, _card())
+
+    message = str(excinfo.value)
+    assert message.startswith("launch_adapter_underivable:runner=claude_sonnet-5:")
+    assert "claude_cli:policy_denied_for_test" in message
+    assert "vscode_lm:vscode_lm_unavailable:bridge_readiness_error" in message
+
+
+def test_claude_family_derivation_never_probes_the_bridge_when_claude_cli_is_first(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def fake_bridge_readiness(repo, **kwargs):
+        calls.append(kwargs)
+        return {
+            "launchable": True,
+            "blocker_reason": "",
+            "resolved_model": kwargs.get("model") or "",
+        }
+
+    monkeypatch.setattr(
+        process_launcher.vscode_lm_bridge, "bridge_readiness", fake_bridge_readiness
+    )
 
     derived = process_launcher.derive_launch_identity(tmp_path, _card())
 
     assert derived["adapter_id"] == "claude_cli"
-    assert "vscode_lm:vscode_lm_unavailable:bridge_readiness_error" in derived["adapter_rejections"]
+    assert derived["adapter_rejections"] == []
+    assert calls == []
 
 
 def test_glm_runner_with_a_stale_bridge_host_derives_glm_copilot_cli(tmp_path, monkeypatch):
