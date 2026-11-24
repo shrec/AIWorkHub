@@ -9873,6 +9873,8 @@ def needfix_convert(
     task_plan: dict[str, Any] | None = None,
     plan_digest: str | None = None,
     include_plan: bool = False,
+    launch: bool = False,
+    launch_adapter_id: str = "",
 ) -> dict:
     """Convert an accepted NeedFix into a task card; ``task_plan`` alone commits in one call.
 
@@ -9890,7 +9892,16 @@ def needfix_convert(
         task_plan: Task card fields as in needfix_preview_convert. Given without plan_digest, the plan is previewed and committed in one call.
         plan_digest: plan_digest from the matching needfix_preview_convert; optional when task_plan is given. A digest this server no longer holds is refused.
         include_plan: Return the plan body verbatim instead of a summary of its identity and counts; default false.
+        launch: Also launch a worker for the card this call committed, through aiworkhub_agent_launch_task; default false. Only a NEW commit launches; a refused or already-converted NeedFix never does, and the reply then carries launch with skipped set.
+        launch_adapter_id: Adapter for that launch, passed through to aiworkhub_agent_launch_task; omit to let it derive the adapter. Refused with launch_adapter_requires_launch unless launch is true.
     """
+    if launch_adapter_id and not launch:
+        return {
+            "ok": False,
+            "committed": False,
+            "error": "launch_adapter_requires_launch",
+            "needfix_id": needfix_id,
+        }
     # NF-2026-02241: ``evidence`` is a card field, not a NeedFix plan field, so
     # it is split off before the plan is normalized and signed.
     task_plan, evidence = manager_card_amend.split_plan_evidence(task_plan)
@@ -9898,22 +9909,30 @@ def needfix_convert(
     # normalized it, so the digest the preview returned still binds.
     plan, normalizations, filled_from = _normalize_needfix_task_plan(needfix_id, task_plan)
     if task_plan and not plan_digest:
-        return _needfix_one_call_convert(
-            needfix_id, plan, normalizations, filled_from, include_plan=bool(include_plan),
-            evidence=evidence,
+        return _needfix_launch_after_convert(
+            _needfix_one_call_convert(
+                needfix_id, plan, normalizations, filled_from, include_plan=bool(include_plan),
+                evidence=evidence,
+            ),
+            launch=bool(launch), launch_adapter_id=launch_adapter_id,
         )
     evidence, evidence_refusal = manager_card_amend.convert_evidence_or_refusal(
         evidence, plan_digest
     )
     if evidence_refusal is not None:
-        return evidence_refusal
-    return _needfix_plan_receipt(
-        core.needfix_convert(
-            needfix_id, task_plan=plan, plan_digest=plan_digest,
-            **({"evidence": evidence} if evidence is not None else {}),
+        return _needfix_launch_after_convert(
+            evidence_refusal, launch=bool(launch), launch_adapter_id=launch_adapter_id,
+        )
+    return _needfix_launch_after_convert(
+        _needfix_plan_receipt(
+            core.needfix_convert(
+                needfix_id, task_plan=plan, plan_digest=plan_digest,
+                **({"evidence": evidence} if evidence is not None else {}),
+            ),
+            include_plan=bool(include_plan),
+            tool="needfix_convert",
         ),
-        include_plan=bool(include_plan),
-        tool="needfix_convert",
+        launch=bool(launch), launch_adapter_id=launch_adapter_id,
     )
 
 
@@ -9978,6 +9997,44 @@ def _needfix_one_call_convert(
     warnings = [item["warning"] for item in normalizations if item.get("warning")]
     if warnings:
         reply["warnings"] = [*list(reply.get("warnings") or []), *warnings]
+    return reply
+
+
+def _needfix_new_commit_task_id(reply: dict) -> tuple[str, str]:
+    """Return ``(task_id, "")`` for a conversion that committed a NEW card in this call.
+
+    Otherwise return ``("", skipped)`` with skipped ``already_converted`` or ``not_committed``.
+    """
+    if reply.get("already_converted"):
+        return "", "already_converted"
+    task_id = str(reply.get("converted_task_id") or "")
+    if reply.get("committed") is False or reply.get("ok") is False or not task_id:
+        return "", "not_committed"
+    return task_id, ""
+
+
+def _needfix_launch_after_convert(reply: dict, *, launch: bool, launch_adapter_id: str) -> dict:
+    """Launch the card a conversion committed in this call, through the launch tool.
+
+    The conversion has already happened. A launch refusal or exception is reported
+    under ``launch`` and never undoes ``committed``. With launch false the reply is
+    returned untouched.
+    """
+    if not launch:
+        return reply
+    task_id, skipped = _needfix_new_commit_task_id(reply)
+    if skipped:
+        reply["launch"] = {"ok": False, "skipped": skipped}
+        return reply
+    adapter_kwargs = {"adapter_id": launch_adapter_id} if launch_adapter_id else {}
+    try:
+        reply["launch"] = aiworkhub_agent_launch_task(task_id=task_id, **adapter_kwargs)
+    except Exception as exc:  # the commit stands; the failure is reported, not raised
+        reply["launch"] = {
+            "ok": False,
+            "error": "launch_exception",
+            "blocked_reason": f"{type(exc).__name__}: {exc}",
+        }
     return reply
 
 
