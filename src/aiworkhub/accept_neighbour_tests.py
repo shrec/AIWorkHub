@@ -142,7 +142,14 @@ _FIRST_FAILURE_CHARS = 500
 _TEST_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.py")
 # pytest's default python_files (test_*.py, *_test.py): the only test files CI collects.
 _COLLECTED_TEST_PATH = re.compile(r"(?:.*/)?(?:test_[^/]*|[^/]*_test)\.py")
-_PYTEST_FAILURE = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.MULTILINE)
+# NF-2026-02408: a summary line, optionally behind an xdist ``[gw3]`` worker prefix
+# (and its ``[ 50%]`` progress marker); matched over ANSI-stripped text.
+_PYTEST_FAILURE = re.compile(
+    r"^(?:\[gw\d+\][ \t]+(?:\[[ \t]*\d+%\][ \t]+)?)?(?:FAILED|ERROR) (\S+)", re.MULTILINE
+)
+# CSI sequences (colours, cursor moves) and two-byte ESC sequences.
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])")
+_OUTPUT_TAIL_CHARS = 3000
 # A failed node id re-run as one argv token: a selected path, optionally ``::name``,
 # with nothing a command line would need to quote.
 _NODE_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.py(?:::[A-Za-z0-9_.:\[\]/,+=-]+)?")
@@ -1157,6 +1164,10 @@ def neighbour_authority(card: Mapping[str, Any], command: str) -> dict[str, Any]
     return authority
 
 
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub("", text)
+
+
 def _failed_tests(
     rows: Iterable[Mapping[str, Any]], limit: int = MAX_REPORTED_FAILURES
 ) -> tuple[list[str], str]:
@@ -1164,9 +1175,10 @@ def _failed_tests(
     first_line = ""
     for row in rows:
         for key in ("stdout_tail", "stderr_tail"):
-            text = row.get(key)
-            if not isinstance(text, str):
+            raw = row.get(key)
+            if not isinstance(raw, str):
                 continue
+            text = _strip_ansi(raw)
             for match in _PYTEST_FAILURE.finditer(text):
                 node = match.group(1)
                 if not first_line:
@@ -1217,6 +1229,63 @@ def _attempt(
         return rows, str(exc) or type(exc).__name__, type(exc) is ValidationRunError
 
 
+def _output_tail(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The last ``_OUTPUT_TAIL_CHARS`` of the first red row that names no node id.
+
+    NF-2026-02408: stdout_tail then stderr_tail, ANSI stripped, so a refusal whose
+    ``failed`` list is empty still shows what pytest printed.
+    """
+    for row in rows:
+        if row.get("returncode") == 0 and not row.get("timed_out"):
+            continue
+        parts = [
+            _strip_ansi(text)
+            for text in (row.get("stdout_tail"), row.get("stderr_tail"))
+            if isinstance(text, str) and text
+        ]
+        if parts and not any(_PYTEST_FAILURE.search(part) for part in parts):
+            return "\n".join(parts)[-_OUTPUT_TAIL_CHARS:]
+    return ""
+
+
+def _fit_detail(detail: dict[str, Any]) -> str:
+    """``detail`` as JSON within ``NEIGHBOUR_FAILURE_DETAIL_CHARS``, trimming the
+    output tail first and then the test list, never the JSON structure."""
+    text = json.dumps(detail)
+    tail = detail.get("output_tail")
+    if len(text) > NEIGHBOUR_FAILURE_DETAIL_CHARS and tail:
+        # JSON escaping makes the cost per char vary: keep the longest suffix that fits.
+        low, high = 0, len(tail)
+        while low < high:
+            mid = (low + high + 1) // 2
+            detail["output_tail"] = tail[-mid:]
+            if len(json.dumps(detail)) <= NEIGHBOUR_FAILURE_DETAIL_CHARS:
+                low = mid
+            else:
+                high = mid - 1
+        if low:
+            detail["output_tail"] = tail[-low:]
+        else:
+            del detail["output_tail"]
+        text = json.dumps(detail)
+    while len(text) > NEIGHBOUR_FAILURE_DETAIL_CHARS and detail["tests"]:
+        detail["tests"] = detail["tests"][:-1]
+        text = json.dumps(detail)
+    # Long node ids in ``failed`` or a JSON-escaped (non-ASCII) base_red_refused /
+    # first_failure can still overflow: keep the first failure name, halve the texts.
+    while len(text) > NEIGHBOUR_FAILURE_DETAIL_CHARS and len(detail["failed"]) > 1:
+        detail["failed"] = detail["failed"][:-1]
+        text = json.dumps(detail)
+    for key in ("base_red_refused", "first_failure"):
+        value = detail.get(key)
+        while len(text) > NEIGHBOUR_FAILURE_DETAIL_CHARS and value:
+            value = value[: len(value) // 2]
+            detail[key] = value
+            text = json.dumps(detail)
+    # Backstop for one node id longer than the bound on its own.
+    return text[:NEIGHBOUR_FAILURE_DETAIL_CHARS]
+
+
 def _refusal(
     tests: Sequence[str],
     rows: Sequence[Mapping[str, Any]],
@@ -1226,17 +1295,19 @@ def _refusal(
 ) -> WorkspaceError:
     failed, first_line = _failed_tests(rows)
     fallback = "neighbour_validation_failed" if rows else "neighbour_validation_returned_no_rows"
-    detail = {
+    detail: dict[str, Any] = {
         "tests": list(tests),
         "failed": failed or list(default_failed),
         "first_failure": (first_line or error or fallback)[:_FIRST_FAILURE_CHARS],
     }
+    if not failed:
+        tail = _output_tail(rows)
+        if tail:
+            detail["output_tail"] = tail
     if base_red_refused:
         # NF-2026-02101: why the still-red nodes were not excused as base_red.
         detail["base_red_refused"] = base_red_refused[:_FIRST_FAILURE_CHARS]
-    return WorkspaceError(
-        NEIGHBOUR_FAILURE_PREFIX + json.dumps(detail)[:NEIGHBOUR_FAILURE_DETAIL_CHARS]
-    )
+    return WorkspaceError(NEIGHBOUR_FAILURE_PREFIX + _fit_detail(detail))
 
 
 def _rerun_nodes(
