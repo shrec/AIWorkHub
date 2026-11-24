@@ -41,6 +41,9 @@ DEFAULT_IDLE_POLL_SECONDS = 1.0
 DEFAULT_RETRY_POLL_SECONDS = 0.2
 DEFAULT_FAILED_TURN_BACKOFF_SECONDS = 300.0
 DEFAULT_MAX_FAILED_TURN_BACKOFF_SECONDS = 3600.0
+# How many delivered wake identities one consumer remembers (oldest dropped
+# first). A batch re-claimed after a lost ack is filtered against them.
+_DELIVERED_MEMORY_LIMIT = 1024
 _HOUR_SECONDS = 3600.0
 _MAX_BACKOFF_DOUBLINGS = 32
 
@@ -181,10 +184,16 @@ class WakeConsumer:
         max_failed_turn_backoff_seconds: float = DEFAULT_MAX_FAILED_TURN_BACKOFF_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = _utc_now,
+        settle_stale: Callable[[Mapping[str, Any]], str] | None = None,
     ) -> None:
         self._claim = claim
         self._ack = ack
         self._dispatch = dispatch
+        # Re-checks a queued member right before its turn and acks it as stale
+        # (returning the reason) when its card moved on. Defaults to the one the
+        # real claim function carries (see :func:`default_callback_source`).
+        self._settle_stale = settle_stale or getattr(claim, "settle_stale", None)
+        self._delivered: dict[str, None] = {}
         self._cap_per_hour = max(0, int(cap_per_hour))
         self._idle_poll_seconds = max(0.0, float(idle_poll_seconds))
         self._retry_poll_seconds = max(0.0, float(retry_poll_seconds))
@@ -300,6 +309,7 @@ class WakeConsumer:
         members = [dict(member) for member in (batch.get("members") or [])]
         if not batch_id or not members:
             return
+        ack_now = False
         with self._state_lock:
             existing = self._batches.get(batch_id)
             if existing is not None:
@@ -311,8 +321,26 @@ class WakeConsumer:
                 # same callback twice.
                 existing.lease_id = lease_id
                 return
-            self._batches[batch_id] = _BatchState(lease_id=lease_id, remaining=len(members))
-            self._queue.extend(_QueuedMember(member=member, batch_id=batch_id) for member in members)
+            # NF-2026-02406: a batch that comes back after its lease lapsed
+            # (its ack was lost or refused) carries members this consumer has
+            # already woken the manager for, or is still holding. Those are
+            # never woken twice; only genuinely new members are queued.
+            skip = set(self._delivered) | self._live_keys_locked()
+            fresh = [member for member in members if self._member_key(member) not in skip]
+            if fresh:
+                self._batches[batch_id] = _BatchState(lease_id=lease_id, remaining=len(fresh))
+                self._queue.extend(_QueuedMember(member=member, batch_id=batch_id) for member in fresh)
+                return
+            # Only a batch whose members were ALL delivered may be acked here; a
+            # member still queued under another batch is not delivered yet.
+            ack_now = all(self._member_key(member) in self._delivered for member in members)
+        if ack_now:
+            # Every member was already delivered: settle the batch so it stops
+            # coming back, instead of leaving it for the next lease expiry.
+            try:
+                self._ack(batch_id, lease_id)
+            except Exception:  # noqa: BLE001 -- a refused ack only means the next claim retries it
+                pass
 
     def _drain_queue(self) -> bool:
         """Start the next queued member, in order, while nothing is in flight.
@@ -336,6 +364,18 @@ class WakeConsumer:
                 queued = self._queue[0]
                 turn = _Turn(queued=queued)
                 self._in_flight = turn
+            # NF-2026-02406: the member may have waited in the queue (turn lock,
+            # hourly cap, backoff) while its card was accepted or archived, so
+            # the card is read again right before the turn. A stale wake is
+            # acked as superseded with its reason and never dispatched.
+            if self._stale_reason(queued.member):
+                with self._state_lock:
+                    turn.finished = True
+                    if self._in_flight is turn:
+                        self._in_flight = None
+                    self._leave_queue_locked(turn)
+                self._settle_batch(queued.batch_id)
+                continue
             try:
                 started = bool(self._dispatch(queued.member, partial(self._finish_turn, turn)))
             except Exception:  # noqa: BLE001 -- a dispatch failure must never kill the consumer
@@ -404,6 +444,7 @@ class WakeConsumer:
                     self._park_after_failure_locked(errors)
                     return
                 self._turn_times.append(self._clock())
+                self._remember_delivered_locked(turn.queued.member)
                 self._failed_turns = 0
                 self._parked_reason = None
             self._settle_batch(turn.queued.batch_id)
@@ -424,6 +465,43 @@ class WakeConsumer:
             self._ack(batch_id, lease_id)
         except Exception:  # noqa: BLE001 -- an ack failure leaves the batch for lease-expiry re-delivery
             pass
+
+    @staticmethod
+    def _member_key(member: Mapping[str, Any]) -> str:
+        """The durable identity of one wake (its outbox row), or ``''`` when it has none."""
+
+        return str(member.get("outbox_id") or "")
+
+    def _remember_delivered_locked(self, member: Mapping[str, Any]) -> None:
+        key = self._member_key(member)
+        if not key:
+            return
+        self._delivered.pop(key, None)
+        self._delivered[key] = None
+        while len(self._delivered) > _DELIVERED_MEMORY_LIMIT:
+            del self._delivered[next(iter(self._delivered))]
+
+    def _live_keys_locked(self) -> set[str]:
+        keys = {self._member_key(queued.member) for queued in self._queue}
+        if self._in_flight is not None:
+            keys.add(self._member_key(self._in_flight.queued.member))
+        keys.discard("")
+        return keys
+
+    def _stale_reason(self, member: Mapping[str, Any]) -> str:
+        """Why ``member`` is no longer owed a wake ('' = still owed).
+
+        The check acks a stale wake in the store as a side effect. A failing
+        check never drops a wake: the member is delivered, because a late wake
+        costs one turn and a lost one strands a review.
+        """
+
+        if self._settle_stale is None:
+            return ""
+        try:
+            return str(self._settle_stale(member) or "")
+        except Exception:  # noqa: BLE001 -- an unreadable card must not drop a real wake
+            return ""
 
 
 def default_callback_source(
@@ -541,4 +619,24 @@ def default_callback_source(
         finally:
             conn.close()
 
+    def settle_stale(member: Mapping[str, Any]) -> str:
+        """Ack ``member`` as stale if its card is no longer in the state it announces.
+
+        Returns the recorded reason, or ``''`` when the wake is still owed.
+        """
+        from . import callback_store
+        from .core import _canonical_connect
+
+        outbox_id = member.get("outbox_id")
+        if outbox_id in (None, ""):
+            return ""
+        conn = _canonical_connect()
+        try:
+            return callback_store.supersede_stale_outbox_member(conn, outbox_id)
+        finally:
+            conn.close()
+
+    # ``WakeConsumer`` reads this off its claim function (NF-2026-02406), so the
+    # production wiring re-checks every queued wake right before its turn.
+    claim.settle_stale = settle_stale  # type: ignore[attr-defined]
     return claim, ack

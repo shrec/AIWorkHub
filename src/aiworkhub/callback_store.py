@@ -1244,6 +1244,67 @@ def _supersede_stale_batch_members(conn: sqlite3.Connection, batch_id: str) -> i
     return remaining
 
 
+def stale_outbox_member_reason(conn: sqlite3.Connection, member: Any) -> str:
+    """Why ``member`` must not be delivered now, or ``''`` when it still may be.
+
+    NF-2026-02406: a claimed wake can wait in the consumer's queue for minutes
+    (turn lock, hourly cap, failure backoff) while its card moves on, so the
+    claim-time check is not enough. This is the same predicate the claim uses
+    (:func:`_outbox_member_deliverable`), with the card's live status named in
+    the reason so the ack records why the wake was dropped.
+    """
+    if _outbox_member_deliverable(conn, member):
+        return ""
+    row = conn.execute(
+        "SELECT card_json, status, worker_status, archived_at FROM tasks WHERE task_id=?",
+        (member["task_id"],),
+    ).fetchone()
+    if row is None:
+        return "task_missing"
+    return f"task_no_longer_in_matching_terminal_state:{task_store.canonical_status(dict(row))}"
+
+
+def supersede_stale_outbox_member(conn: sqlite3.Connection, outbox_id: Any) -> str:
+    """Ack one undelivered member as stale; return the reason, or ``''`` if it is deliverable.
+
+    Only a ``pending``/``inflight`` row is ever written. A missing or already settled
+    row is left as it is and reported as not owed (``outbox_row_missing`` /
+    ``outbox_already_<state>``), so a queued copy of it is never dispatched.
+    """
+    _ensure_callback_outbox_table(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        member = conn.execute(
+            "SELECT outbox_id, task_id, transition, episode_id, state FROM callback_outbox "
+            "WHERE outbox_id=?",
+            (outbox_id,),
+        ).fetchone()
+        if member is None:
+            # Retention purged the row with its task: no wake is owed.
+            reason = "outbox_row_missing"
+        elif member["state"] not in ("pending", "inflight"):
+            # Settled elsewhere (another lease acked it, or a claim superseded
+            # it): delivering it now would be the duplicate wake.
+            reason = f"outbox_already_{member['state']}"
+        else:
+            reason = stale_outbox_member_reason(conn, member)
+            if reason:
+                conn.execute(
+                    "UPDATE callback_outbox SET state='superseded', last_error=?, updated_at=? "
+                    "WHERE outbox_id=?",
+                    (reason, utc_now(), outbox_id),
+                )
+                append_event(
+                    conn, member["task_id"], "callback_superseded", "",
+                    {"transition": member["transition"], "reason": reason},
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return reason
+
+
 def _acknowledge_inside_transaction(
     conn: sqlite3.Connection,
     *,
