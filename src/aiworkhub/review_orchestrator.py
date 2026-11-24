@@ -773,6 +773,25 @@ _ROUTE_HOLD_MARKER = ":hold="
 _PRE_PROVIDER_HOLD_MARKER = ":provider_launched=false"
 # NF-2026-02107: the retired attempt's adapter failed on its own credential.
 _ADAPTER_CREDENTIAL_MARKER = ":adapter_credential"
+# The one refusal ``_review_receipt`` raises when a reviewer card carries no
+# sealed terminal receipt.
+_REVIEWER_TERMINAL_RECEIPT_MISSING = "reviewer_terminal_receipt_missing"
+# NF-2026-02397: a replayed attempt retired because its SOURCE reviewer's
+# receipt is gone; the lens then plans a fresh reviewer.
+_REPLAY_SOURCE_RECEIPT_MISSING_RETIREMENT = (
+    "replay_source_" + _REVIEWER_TERMINAL_RECEIPT_MISSING
+)
+
+
+def _replay_source_identity(
+    identity: Mapping[str, Any], replay: Mapping[str, Any]
+) -> dict[str, str]:
+    """The SOURCE chain's target identity a replayed report was written against."""
+    return {
+        "target_task_id": str(identity["target_task_id"]),
+        "target_request_id": str(replay.get("source_target_request_id") or ""),
+        "claim_epoch": str(replay.get("source_claim_epoch") or ""),
+    }
 
 
 def route_attempt_hold(failure_reason: Any) -> str:
@@ -3175,6 +3194,39 @@ class ReviewOrchestrator:
             return {}
         return plan if isinstance(plan, dict) else {}
 
+    def _replay_source_receipt_missing(
+        self,
+        action: review_lifecycle.ReviewAction,
+        identity: Mapping[str, Any],
+        replay: Mapping[str, Any],
+    ) -> bool:
+        """True when a bound replay's source reviewer no longer has its receipt.
+
+        NF-2026-02397: resolved through the SAME ``_review_receipt`` lookup the
+        replayed accept uses, so the two can never disagree about what
+        "missing" means. Only a missing receipt (or an unreadable source card)
+        voids the replay; any other verifier refusal is left exactly where it
+        was before -- for the accept action to fail closed on.
+        """
+        reviewer_request = str(replay.get("reviewer_request_id") or "")
+        try:
+            status = self.manager.status(reviewer_request)
+        except Exception:  # noqa: BLE001 -- an unreadable source card cannot replay
+            return True
+        if not isinstance(status, Mapping):
+            return True
+        try:
+            self._review_receipt(
+                action,
+                status,
+                reviewer_request,
+                str(replay.get("reviewer_task_id") or ""),
+                _replay_source_identity(identity, replay),
+            )
+        except RuntimeError as exc:
+            return str(exc) == _REVIEWER_TERMINAL_RECEIPT_MISSING
+        return False
+
     def _bind_lens_plan(
         self,
         chain: review_lifecycle.ReviewChain,
@@ -5493,6 +5545,13 @@ class ReviewOrchestrator:
                 raise RuntimeError("launch_readiness_outcome_unknown:"
                                    + str(readiness["outcome"]))
             replay = self._replay_plan(action.chain_id, action.lens)
+            if replay and self._replay_source_receipt_missing(action, identity, replay):
+                # NF-2026-02397: the source reviewer's sealed receipt is gone
+                # (its card archived with terminal_review={}, or unreadable),
+                # so the replayed accept could only fail closed on
+                # reviewer_terminal_receipt_missing and leave the lens missing.
+                # Ignore the replay and launch a fresh reviewer below.
+                replay = {}
             if replay:
                 # HASH-KEYED REPLAY. The bytes and the contract are identical to
                 # a candidate this lens already reported on, and that report was
@@ -5642,6 +5701,15 @@ class ReviewOrchestrator:
                     raise
                 self._launch_with_successor(action, successor)
                 return None
+            if replay and (
+                reviewer_request != str(launch.get("reviewer_request_id") or "")
+                or reviewer_task != str(launch.get("reviewer_task_id") or "")
+            ):
+                # NF-2026-02397: the replayed reviewer's receipt was gone, its
+                # attempt was retired and a FRESH reviewer now owns this lens.
+                # That reviewer's report is bound to THIS chain's target, so it
+                # goes through the ordinary verifier and acceptance below.
+                replay = {}
             if replay:
                 # The replayed report is resolved from the ORIGINAL reviewer's
                 # own card, against the SOURCE chain's target identity, through
@@ -5650,20 +5718,31 @@ class ReviewOrchestrator:
                 # authenticated receipt are the original reviewer's -- nothing
                 # here mints a new one, and the independence rung stays
                 # resolvable from that reviewer's own provider identity.
-                source_identity = {
-                    "target_task_id": str(identity["target_task_id"]),
-                    "target_request_id": str(
-                        replay.get("source_target_request_id") or ""
-                    ),
-                    "claim_epoch": str(replay.get("source_claim_epoch") or ""),
-                }
-                receipt = self._review_receipt(
-                    action,
-                    status,
-                    reviewer_request,
-                    str(launch.get("reviewer_task_id") or ""),
-                    source_identity,
-                )
+                try:
+                    receipt = self._review_receipt(
+                        action,
+                        status,
+                        reviewer_request,
+                        str(launch.get("reviewer_task_id") or ""),
+                        _replay_source_identity(identity, replay),
+                    )
+                except RuntimeError as exc:
+                    if str(exc) != _REVIEWER_TERMINAL_RECEIPT_MISSING:
+                        raise
+                    # NF-2026-02397: the source reviewer's sealed receipt is no
+                    # longer on its card (archived with terminal_review={}), so
+                    # this replay can never complete. Retire the replayed
+                    # attempt as exactly that and plan a fresh reviewer for the
+                    # lens, as the could-not-inspect retirement below does,
+                    # instead of leaving the lens missing for ever.
+                    if not self._retire_route_attempt(
+                        action, attempt, _REPLAY_SOURCE_RECEIPT_MISSING_RETIREMENT
+                    ):
+                        return None
+                    self._launch_with_successor(
+                        action, self._plan_deferrable_route_attempt(action)
+                    )
+                    return None
                 findings = receipt["report"]["findings"]
                 actionable_findings = any(
                     finding.get("actionable") is True
@@ -6538,17 +6617,17 @@ class ReviewOrchestrator:
         identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status.get("ok") is not True or status.get("state") != "review_ready":
-            raise RuntimeError("reviewer_terminal_receipt_missing")
+            raise RuntimeError(_REVIEWER_TERMINAL_RECEIPT_MISSING)
         event = status.get("latest_event")
         card = status.get("task_card")
         if not isinstance(event, Mapping) or not isinstance(card, Mapping):
-            raise RuntimeError("reviewer_terminal_receipt_missing")
+            raise RuntimeError(_REVIEWER_TERMINAL_RECEIPT_MISSING)
         terminal = card.get("terminal_review")
         evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else None
         event_receipt = event.get("quality_review_receipt")
         card_receipt = evidence.get("quality_review_receipt") if isinstance(evidence, Mapping) else None
         if not isinstance(card_receipt, Mapping):
-            raise RuntimeError("reviewer_terminal_receipt_missing")
+            raise RuntimeError(_REVIEWER_TERMINAL_RECEIPT_MISSING)
         # The task card is the durable terminal authority.  Process events may
         # omit the receipt (the live VS Code LM finalizer does), but when an
         # event copy is present it must still agree byte-for-byte with the
