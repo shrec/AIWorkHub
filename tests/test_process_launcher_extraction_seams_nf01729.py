@@ -28,6 +28,7 @@ from aiworkhub import process_launcher_vscode_lm_tool as vscode_lm_tool
 from aiworkhub import process_launcher_workspace_gc as workspace_gc
 from aiworkhub import process_launcher_review_context as review_context
 from aiworkhub import process_launcher_accepted_row_restore as accepted_row_restore
+from aiworkhub import process_launcher_quality_reviewer as quality_reviewer_cluster
 
 # 13574 -> 13681 (0.12.78): five accepted launch/accept fixes, measured; the
 # next extraction ratchets it back down.
@@ -51,7 +52,9 @@ from aiworkhub import process_launcher_accepted_row_restore as accepted_row_rest
 # (+171), landed by owner-authorised break-glass; extraction owed (follow-up NF).
 # 13924 -> 13753 (2026-11-14): NF-2026-02260 moved the reviewer launch
 # admission helpers and their state into reviewer_launch_admission, measured.
-PROCESS_LAUNCHER_MAX_LINES = 13753
+# 13753 -> 13253 (2026-11-23): NF-2026-02379 moved the quality-reviewer cluster
+# into process_launcher_quality_reviewer, measured at 12997 lines.
+PROCESS_LAUNCHER_MAX_LINES = 13253
 
 # (module, function, seam tuple attribute, ProcessManager method)
 EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
@@ -90,6 +93,36 @@ EXTRACTIONS: tuple[tuple[ModuleType, str, str, str], ...] = (
         "prior_reviewer_receipts",
         "PRIOR_REVIEWER_RECEIPTS_SEAM_NAMES",
         "_prior_reviewer_receipts",
+    ),
+    (
+        quality_reviewer_cluster,
+        "quality_review_prior_findings",
+        "QUALITY_REVIEW_PRIOR_FINDINGS_SEAM_NAMES",
+        "_quality_review_prior_findings",
+    ),
+    (
+        quality_reviewer_cluster,
+        "prepared_quality_review",
+        "PREPARED_QUALITY_REVIEW_SEAM_NAMES",
+        "_prepared_quality_review",
+    ),
+    (
+        quality_reviewer_cluster,
+        "ensure_quality_reviewer_card_bound",
+        "ENSURE_QUALITY_REVIEWER_CARD_BOUND_SEAM_NAMES",
+        "_ensure_quality_reviewer_card_bound",
+    ),
+    (
+        quality_reviewer_cluster,
+        "launch_quality_reviewer",
+        "LAUNCH_QUALITY_REVIEWER_SEAM_NAMES",
+        "launch_quality_reviewer",
+    ),
+    (
+        quality_reviewer_cluster,
+        "cancel_disposed_reviewer_processes",
+        "CANCEL_DISPOSED_REVIEWER_PROCESSES_SEAM_NAMES",
+        "cancel_disposed_reviewer_processes",
     ),
 )
 EXTRACTION_IDS = [entry[1] for entry in EXTRACTIONS]
