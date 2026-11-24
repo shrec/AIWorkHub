@@ -1091,15 +1091,33 @@ def _retained_workspace_present(
     return recorded == 0
 
 
+_PY_WHITESPACE = " \t\n\r\x0b\x0c"
+
+# NF-2026-02419: rows the SQL layer can prove decided are never instr-scanned.
+# The terms mirror ``task_store.canonical_status`` for ``archived`` and
+# ``finished`` only and are deliberately conservative: anything they cannot
+# classify (including ``superseded``, odd whitespace, non-text values) still
+# reaches the Python ``canonical_status`` check below.  The cheap terms precede
+# ``instr`` so archived/decided ``card_json`` is not examined.
+_UNDECIDED_DEPENDENT_SQL = (
+    "SELECT status, worker_status, archived_at, card_json FROM tasks "
+    "WHERE task_id<>? "
+    "AND (archived_at IS NULL OR trim(CAST(archived_at AS TEXT), ?) = '') "
+    "AND lower(trim(COALESCE(status, ''), ?)) "
+    "NOT IN ('finished', 'completed', 'stale_already_done') "
+    "AND lower(trim(COALESCE(worker_status, ''), ?)) <> 'done' "
+    "AND instr(card_json, ?) > 0"
+)
+
+
 def _has_undecided_dependent(root: Path | str, task_id: str) -> bool:
     """True when any undecided task lists ``task_id`` in ``depends_on``."""
 
     connection = _connect(root, readonly=True)
     try:
         rows = connection.execute(
-            "SELECT status, worker_status, archived_at, card_json FROM tasks "
-            "WHERE task_id<>? AND instr(card_json, ?) > 0",
-            (task_id, task_id),
+            _UNDECIDED_DEPENDENT_SQL,
+            (task_id, _PY_WHITESPACE, _PY_WHITESPACE, _PY_WHITESPACE, task_id),
         ).fetchall()
     finally:
         connection.close()
@@ -1146,11 +1164,6 @@ def _final_archive_fence(
     reservation_keys = ("launch_reservation", "reservation", "reservation_id")
     if any(card.get(key) for key in reservation_keys):
         return None, "task_reserved"
-    # ``core._card_dependencies_have_accepted_outcomes`` requires each
-    # dependency to still read ``finished``; archiving one would block its
-    # undecided dependents forever.
-    if _has_undecided_dependent(root, task_id):
-        return None, "dependency_live"
     terminal_review = card.get("terminal_review")
     terminal_evidence = (
         terminal_review.get("evidence") if isinstance(terminal_review, Mapping) else None
@@ -1182,6 +1195,14 @@ def _final_archive_fence(
         # workspace path stays fenced conservatively.
         if _retained_workspace_present(card, terminal_evidence):
             return None, "retained_evidence"
+    # NF-2026-02419: the dependency scan is the only fence that reads other
+    # tasks' rows, so it runs after every card-local fence; a candidate that is
+    # already fenced by its own card never pays for it.
+    # ``core._card_dependencies_have_accepted_outcomes`` requires each
+    # dependency to still read ``finished``; archiving one would block its
+    # undecided dependents forever.
+    if _has_undecided_dependent(root, task_id):
+        return None, "dependency_live"
     connection = _connect(root, readonly=True)
     try:
         callback = connection.execute(
