@@ -4669,6 +4669,7 @@ def mark_admission_deferred(
     runner: str,
     reason: str,
     retry_after_seconds: int,
+    request_id: str = "",
 ) -> tuple[bool, str]:
     """Stamp a pending/unclaimed card so the transient-retry reconciler relaunches it.
 
@@ -4717,7 +4718,7 @@ def mark_admission_deferred(
                 "attempts": attempts,
                 "budget": max(TRANSIENT_RETRY_BUDGET, attempts),
                 "reason": bounded_reason,
-                "request_id": "",
+                "request_id": str(request_id or ""),
                 "recorded_at": now,
             },
             retry_not_before=(

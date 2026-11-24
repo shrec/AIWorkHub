@@ -137,9 +137,18 @@ def admission_reason(reason: str) -> str:
 
 
 def defer_card(
-    repo: Path | str, task_id: str, runner: str, reason: str
+    repo: Path | str,
+    task_id: str,
+    runner: str,
+    reason: str,
+    *,
+    request_id: str = "",
 ) -> tuple[bool, str]:
-    """Stamp the pending card for reconciler relaunch; never raises."""
+    """Stamp the pending card for reconciler relaunch; never raises.
+
+    ``request_id`` (NF-2026-02411) is the queued request's id; it is stored on
+    ``transient_retry.request_id`` so the relaunch can link back to it.
+    """
     try:
         return task_store.mark_admission_deferred(
             repo,
@@ -147,6 +156,7 @@ def defer_card(
             runner=runner,
             reason=admission_reason(reason),
             retry_after_seconds=DEFERRED_RETRY_AFTER_SECONDS,
+            request_id=request_id,
         )
     except (task_store.TaskStoreError, sqlite3.Error, OSError, ValueError) as exc:
         return False, f"admission_deferral_failed:{type(exc).__name__}"

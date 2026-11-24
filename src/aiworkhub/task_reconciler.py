@@ -1104,6 +1104,36 @@ def _failed_attempt_timeout(
     return (timeout, "") if timeout is not None else (None, "timeout_not_recorded")
 
 
+def _queued_admission_request_id(mgr: process_launcher.ProcessManager, task_id: str) -> str:
+    """The queued request id on an ``admission_deferred`` card, else ``""``.
+
+    NF-2026-02411: only the ``admission_deferred`` kind names a queued request;
+    any other ``transient_retry.request_id`` is a failed attempt and is never
+    pointed at a successor. An unreadable card yields ``""`` (no link), never
+    an exception: the relaunch itself must not depend on this bookkeeping.
+    """
+    try:
+        card = task_store.get_tasks(Path(mgr.repo).resolve(), [task_id]).get(task_id) or {}
+        transient = card.get("transient_retry")
+        if not isinstance(transient, Mapping) or transient.get("kind") != "admission_deferred":
+            return ""
+        return str(transient.get("request_id") or "")
+    except Exception:  # noqa: BLE001 -- bookkeeping read must not block the relaunch
+        return ""
+
+
+def _link_admission_successor(
+    mgr: process_launcher.ProcessManager, queued_request_id: str, successor_request_id: str
+) -> None:
+    """Append ``admission_relaunched`` to the queued request after a successful relaunch."""
+    if not queued_request_id or not successor_request_id:
+        return
+    try:
+        mgr.record_admission_relaunch(queued_request_id, successor_request_id)
+    except Exception:  # noqa: BLE001 -- the worker is already launched; linking is best-effort
+        return
+
+
 def _scan_transient_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict[str, Any]:
     """Relaunch pending/unclaimed cards whose transient-retry backoff elapsed.
 
@@ -1126,11 +1156,13 @@ def _scan_transient_retry_relaunch(mgr: process_launcher.ProcessManager) -> dict
     def _launch(task_id: str, runner: str, topic: str, request_id: str) -> dict[str, Any]:
         timeout_seconds, reason = _failed_attempt_timeout(mgr, task_id)
         inherited = {} if timeout_seconds is None else {"timeout_seconds": timeout_seconds}
+        queued_request_id = _queued_admission_request_id(mgr, task_id)
         try:
             result = mgr.launch(task_id=task_id, runner=runner, topic=topic, **inherited)
         except Exception as exc:  # noqa: BLE001 -- one bad spawn must not abort the whole relaunch pass
             return {"ok": False, "stderr": f"launch_raised:{type(exc).__name__}"}
         if result.get("ok"):
+            _link_admission_successor(mgr, queued_request_id, str(result.get("request_id") or ""))
             if timeout_seconds is None:
                 return {"ok": True, "timeout_inherited": False, "timeout_inherit_reason": reason}
             return {"ok": True, "timeout_inherited": True, "timeout_seconds": timeout_seconds}

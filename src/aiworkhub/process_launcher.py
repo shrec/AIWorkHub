@@ -8198,11 +8198,17 @@ class ProcessManager:
         reason: str,
         request_id: str | None,
     ) -> dict[str, Any] | None:
-        """Queue a capacity-refused pending card for relaunch, or ``None``."""
+        """Queue a capacity-refused pending card for relaunch, or ``None``.
+
+        NF-2026-02411: the queued request id is minted here, stored on the
+        card's ``transient_retry.request_id`` and used for the queued event, so
+        the reconciler can later point that request at its successor.
+        """
         if not launch_admission.is_admission_refusal(reason):
             return None
+        request_id = request_id or uuid.uuid4().hex
         deferred, _detail = launch_admission.defer_card(
-            self.repo, task_id, runner, reason
+            self.repo, task_id, runner, reason, request_id=request_id
         )
         if not deferred:
             return None
@@ -8211,6 +8217,40 @@ class ProcessManager:
             request_id=request_id, state="admission_queued",
             extra=launch_admission.queued_receipt_fields(reason),
         )
+
+    def record_admission_relaunch(
+        self,
+        queued_request_id: str,
+        successor_request_id: str,
+    ) -> dict[str, Any] | None:
+        """Append ``admission_relaunched`` to the queued request; never raises.
+
+        Written through ``_append_event`` (the writer ``_blocked`` uses) only
+        when the original request's latest state is still ``admission_queued``
+        and the successor is a different, non-empty request id.
+        """
+        if not queued_request_id or not successor_request_id:
+            return None
+        if queued_request_id == successor_request_id:
+            return None
+        try:
+            events = self._request_events(queued_request_id)
+            if not events:
+                return None
+            if str(stated_lifecycle_tail(events)[0].get("state") or "") != "admission_queued":
+                return None
+            identity = self._event_identity(events)
+            return self._append_event({
+                "request_id": queued_request_id,
+                "task_id": str(identity.get("task_id") or ""),
+                "runner": str(identity.get("runner") or ""),
+                "topic": str(identity.get("topic") or ""),
+                "adapter_id": str(identity.get("adapter_id") or ""),
+                "state": "admission_relaunched",
+                "successor_request_id": successor_request_id,
+            })
+        except (OSError, ValueError, TypeError):
+            return None
 
     def _blocked(
         self,
@@ -11646,6 +11686,13 @@ class ProcessManager:
             "task_card": card,
             "task_card_read": card_read,
             "event_count": len(events),
+            # NF-2026-02411: an admission-queued request points at the request
+            # that relaunched it; absent for every other request.
+            **(
+                {"successor_request_id": latest["successor_request_id"]}
+                if latest.get("successor_request_id")
+                else {}
+            ),
             # A JS consumer reads pid_start_ticks off latest_event; carry it as
             # a lossless string so a >2**53 counter is not silently rounded.
             "latest_event": {**latest, **pid_identity_surface(latest)},
