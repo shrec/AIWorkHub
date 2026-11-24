@@ -8,6 +8,7 @@ accepted or returned.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -754,8 +755,10 @@ PROVIDER_PROBE_NEGATIVE_TTL_SECONDS = 60.0
 class _TtlSingleFlightCache:
     """Bounded TTL cache with stale-while-refresh and single-flight refresh."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, on_store: Any = None) -> None:
         self.name = name
+        # Called with (key, value) after each accepted store; never for a seed.
+        self._on_store = on_store
         self._lock = threading.Lock()
         self._entries: dict[Any, tuple[float, float, Any]] = {}
         # key -> (monotonic time, rejected value, raised exception or None)
@@ -809,6 +812,32 @@ class _TtlSingleFlightCache:
             self._entries[key] = (time.monotonic(), time.time(), value)
             while len(self._entries) > _PROVIDER_PROBE_CACHE_MAX_ENTRIES:
                 self._entries.pop(next(iter(self._entries)))
+        on_store = self._on_store
+        if on_store is not None:
+            on_store(key, value)
+
+    def seed(self, key: Any, value: Any, age_seconds: float) -> bool:
+        """Insert ``value`` as observed ``age_seconds`` ago (NF-2026-02421).
+
+        Only into a key with no entry, and only while the age is servable
+        (``0 <= age < PROVIDER_PROBE_MAX_STALE_SECONDS``); ``get`` then serves
+        it fresh or stale with its usual single-flight refresh.  A seed is
+        not a store, so ``on_store`` is not called for it.
+        """
+
+        if not 0 <= age_seconds < PROVIDER_PROBE_MAX_STALE_SECONDS:
+            return False
+        with self._lock:
+            if key in self._entries:
+                return False
+            self._entries[key] = (
+                time.monotonic() - age_seconds,
+                time.time() - age_seconds,
+                deepcopy(value),
+            )
+            while len(self._entries) > _PROVIDER_PROBE_CACHE_MAX_ENTRIES:
+                self._entries.pop(next(iter(self._entries)))
+        return True
 
     def _store_rejected(
         self,
@@ -1108,7 +1137,11 @@ def _provider_probe_pending(row: Mapping[str, Any]) -> bool:
     return row.get("status") == AUTH_PROBE_STATE_PROBING and auth_probe_pending(row)
 
 
-_OPENCODE_MODELS_CACHE = _TtlSingleFlightCache("opencode_models")
+_OPENCODE_MODELS_CACHE = _TtlSingleFlightCache(
+    "opencode_models",
+    # NF-2026-02421: every stored ok/failed probe is also persisted to disk.
+    on_store=lambda key, value: _persist_opencode_disk_record(key, value),
+)
 _DEEPSEEK_STATUS_CACHE = _TtlSingleFlightCache("deepseek_credential_status")
 _PROBE_CACHE_ENV_KEYS: tuple[str, ...] = (
     "HOME",
@@ -1193,6 +1226,10 @@ def _cached_opencode_models(
         subprocess.run,
         opencode_auth.owner_custom_provider_models,
     )
+    if _OPENCODE_MODELS_CACHE.observed_at(key) is None:
+        # NF-2026-02421: an in-process miss is seeded from the record another
+        # process persisted, when its key matches; otherwise unchanged.
+        _seed_opencode_models_from_disk(key)
 
     def cacheable(value: tuple[list[str], dict[str, Any] | None]) -> bool:
         record = value[1]
@@ -1376,6 +1413,191 @@ _BLOCKING_OPENCODE_PROBE: tuple[Any, ...] = (
     _opencode_models_probe_once,
     subprocess.run,
 )
+
+# NF-2026-02421: the in-process cache dies with every MCP process (the Manager
+# Chat panel starts one per turn), so each paid the ~20 s ``opencode models``
+# probe again.  An ok/failed record is also kept in one atomic JSON file under
+# the repository runtime directory; a new process seeds its cache from it when
+# the key matches, and the cache then serves it fresh or stale exactly as it
+# serves its own entries.  The callables in the cache key must be these
+# originals, so a test that patches the probe never reads or writes the file.
+_OPENCODE_DISK_RECORD_ORIGINALS: tuple[Any, ...] = (
+    *_BLOCKING_OPENCODE_PROBE,
+    opencode_auth.owner_custom_provider_models,
+)
+_OPENCODE_DISK_RECORD_PARTS: tuple[str, ...] = ("opencode_models_record",)
+_OPENCODE_DISK_RECORD_FILE = "opencode_models.json"
+_OPENCODE_DISK_RECORD_SCHEMA = "aiworkhub.opencode_models_record.v1"
+_OPENCODE_DISK_RECORD_MAX_BYTES = 256 * 1024
+_OPENCODE_DISK_RECORD_STATES = ("ok", "failed")
+# Measured outcomes of the disk record (seeded / written / named rejections).
+_OPENCODE_DISK_RECORD_COUNTERS: dict[str, int] = {}
+
+
+def _count_opencode_disk_record(event: str) -> None:
+    with _OPENCODE_PROBE_LOCK:
+        _OPENCODE_DISK_RECORD_COUNTERS[event] = (
+            _OPENCODE_DISK_RECORD_COUNTERS.get(event, 0) + 1
+        )
+
+
+def opencode_disk_record_stats() -> dict[str, int]:
+    """Counters of the persisted opencode probe record (NF-2026-02421)."""
+
+    with _OPENCODE_PROBE_LOCK:
+        return dict(_OPENCODE_DISK_RECORD_COUNTERS)
+
+
+def _opencode_disk_record_allowed(key: tuple[Any, ...]) -> bool:
+    """Only an unpatched probe, keyed by the unpatched callables, uses the file."""
+
+    originals = _OPENCODE_DISK_RECORD_ORIGINALS
+    current = (
+        _list_opencode_models,
+        _opencode_models_probe_once,
+        subprocess.run,
+        opencode_auth.owner_custom_provider_models,
+    )
+    return (
+        isinstance(key, tuple)
+        and len(key) == 3 + len(originals)
+        and all(a is b for a, b in zip(key[3:], originals))
+        and all(a is b for a, b in zip(current, originals))
+    )
+
+
+def _opencode_disk_record_path() -> Path | None:
+    directory = _reader_probe_dir(_OPENCODE_DISK_RECORD_PARTS)
+    return None if directory is None else directory / _OPENCODE_DISK_RECORD_FILE
+
+
+def _opencode_env_digest(env_token: Any) -> str:
+    # The environment part of the key is stored as a digest: the file never
+    # carries environment values.
+    encoded = json.dumps(list(env_token), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _opencode_stat_list(stat_token: Any) -> list[Any] | None:
+    return None if stat_token is None else list(stat_token)
+
+
+def _persist_opencode_disk_record(key: Any, value: Any) -> None:
+    """Atomically write one ok/failed probe value for ``key``; never raises."""
+
+    if not _opencode_disk_record_allowed(key):
+        return
+    if not (isinstance(value, tuple) and len(value) == 2):
+        return
+    listed, record = value
+    if not isinstance(record, Mapping) or record.get("state") not in (
+        _OPENCODE_DISK_RECORD_STATES
+    ):
+        # PROBE_PENDING / probing and malformed records are never persisted.
+        return
+    path = _opencode_disk_record_path()
+    if path is None:
+        return
+    payload = {
+        "schema": _OPENCODE_DISK_RECORD_SCHEMA,
+        "executable": key[0],
+        "stat_token": _opencode_stat_list(key[1]),
+        "env_digest": _opencode_env_digest(key[2]),
+        "probed_at": time.time(),
+        "listed": [str(model) for model in listed],
+        "record": {str(name): item for name, item in record.items()},
+    }
+    tmp_name: str | None = None
+    try:
+        encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+        if len(encoded) > _OPENCODE_DISK_RECORD_MAX_BYTES:
+            _count_opencode_disk_record("write_rejected_oversized")
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".opencode_models.", suffix=".tmp", dir=str(path.parent)
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+        os.replace(tmp_name, path)
+        tmp_name = None
+        _count_opencode_disk_record("written")
+    except (OSError, TypeError, ValueError):
+        _count_opencode_disk_record("write_failed")
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def _read_opencode_disk_record(path: Path) -> dict[str, Any] | None:
+    """The validated payload at ``path``, or None when absent/unreadable/malformed."""
+
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(_OPENCODE_DISK_RECORD_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _OPENCODE_DISK_RECORD_MAX_BYTES:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema") != _OPENCODE_DISK_RECORD_SCHEMA:
+        return None
+    listed = payload.get("listed")
+    record = payload.get("record")
+    probed_at = payload.get("probed_at")
+    if not isinstance(listed, list) or not all(isinstance(m, str) for m in listed):
+        return None
+    if not isinstance(record, dict) or record.get("state") not in (
+        _OPENCODE_DISK_RECORD_STATES
+    ):
+        return None
+    if not all(
+        isinstance(item, (str, int, float, bool)) or item is None
+        for item in record.values()
+    ):
+        return None
+    if isinstance(probed_at, bool) or not isinstance(probed_at, (int, float)):
+        return None
+    if probed_at != probed_at or probed_at in (float("inf"), float("-inf")):
+        return None
+    return payload
+
+
+def _seed_opencode_models_from_disk(key: tuple[Any, ...]) -> bool:
+    """Seed the in-process cache from a matching disk record; True when seeded."""
+
+    if not _opencode_disk_record_allowed(key):
+        return False
+    path = _opencode_disk_record_path()
+    if path is None:
+        return False
+    payload = _read_opencode_disk_record(path)
+    if payload is None:
+        if path.exists():
+            _count_opencode_disk_record("read_rejected_malformed")
+        return False
+    if (
+        payload.get("executable") != key[0]
+        or payload.get("stat_token") != _opencode_stat_list(key[1])
+        or payload.get("env_digest") != _opencode_env_digest(key[2])
+    ):
+        _count_opencode_disk_record("read_rejected_key_mismatch")
+        return False
+    age = time.time() - float(payload["probed_at"])
+    value = (list(payload["listed"]), dict(payload["record"]))
+    if not _OPENCODE_MODELS_CACHE.seed(key, value, age):
+        _count_opencode_disk_record("read_rejected_age")
+        return False
+    _count_opencode_disk_record("seeded")
+    return True
 
 # NF-2026-02324: the dashboard reader is single-threaded by owner requirement
 # (NF-2026-02287); its fence runs this module's refresh "thread" inline after
