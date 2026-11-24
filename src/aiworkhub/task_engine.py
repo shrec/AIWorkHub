@@ -1517,6 +1517,19 @@ def select_archivable_tasks(
             refused.append({**entry, "reason": "processing_refused"})
             continue
         selected.append(entry)
+    # A card an open NeedFix still holds (converted_task_id, non-terminal NF)
+    # must not be archived: the NF would point at a hidden card and never
+    # relaunch. One lookup for the whole batch; release = close the NF first.
+    from . import needfix_store  # local import: cycle-safe
+
+    held = needfix_store.open_needfix_ids_by_task(repo, [e["task_id"] for e in selected])
+    if held:
+        refused.extend(
+            {**e, "reason": "needfix_held_open", "needfix_id": held[e["task_id"]]}
+            for e in selected
+            if e["task_id"] in held
+        )
+        selected = [e for e in selected if e["task_id"] not in held]
     return {
         "selected": selected[:bounded_limit],
         "selected_count": min(len(selected), bounded_limit),

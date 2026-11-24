@@ -10826,6 +10826,18 @@ def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> di
     )
     if gate is not None:
         return gate
+    # An open NeedFix that still holds this card would be orphaned (pointing at
+    # a hidden card, never relaunched). Release = close/transition the NF first.
+    from . import needfix_store  # local import: cycle-safe
+
+    held_by = needfix_store.open_needfix_ids_by_task(repo_root(), [task_id]).get(task_id)
+    if held_by:
+        return _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"archive_failed:needfix_held_open:{held_by}",
+            command=command,
+        )
     ok, state = task_store.archive_task(
         repo_root(), task_id, actor=actor, reason=str(reason)[:200], operation="archived"
     )

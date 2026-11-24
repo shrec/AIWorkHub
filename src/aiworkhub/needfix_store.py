@@ -5283,6 +5283,45 @@ def _has_superseded_rebind_event(
     return False
 
 
+# SQLite's historical host-parameter ceiling is 999; stay well under it per query.
+_OPEN_NEEDFIX_LOOKUP_CHUNK = 500
+
+
+def open_needfix_ids_by_task(
+    repo_root: str | Path, task_ids: Sequence[str]
+) -> dict[str, str]:
+    """Map each task id an open (non-terminal) NeedFix still holds to that NF id.
+
+    The join is the exact ``converted_task_id``; a NeedFix whose status is in
+    :data:`NEEDFIX_TERMINAL_STATUSES` never holds its card. Read-only. A missing
+    store means no NeedFix can be linked, so the result is ``{}`` and no store
+    is created as a side effect. When several open NeedFixes point at one card
+    the lowest id is reported (deterministic).
+    """
+    wanted = sorted({str(t or "").strip() for t in task_ids} - {""})
+    if not wanted or not _db_path(repo_root).is_file():
+        return {}
+    terminal = sorted(NEEDFIX_TERMINAL_STATUSES)
+    status_marks = ", ".join("?" for _ in terminal)
+    held: dict[str, str] = {}
+    conn = _connect(repo_root)
+    try:
+        for start in range(0, len(wanted), _OPEN_NEEDFIX_LOOKUP_CHUNK):
+            chunk = wanted[start:start + _OPEN_NEEDFIX_LOOKUP_CHUNK]
+            id_marks = ", ".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT id, converted_task_id FROM needfix "
+                f"WHERE converted_task_id IN ({id_marks}) AND status NOT IN ({status_marks}) "
+                "ORDER BY id",
+                (*chunk, *terminal),
+            ).fetchall()
+            for row in rows:
+                held.setdefault(str(row[1]), str(row[0]))
+    finally:
+        conn.close()
+    return held
+
+
 def rebind_superseded_task_link(
     repo_root: str | Path,
     from_task_id: str,
