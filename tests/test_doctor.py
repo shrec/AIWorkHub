@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import time
+import threading
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -73,13 +73,24 @@ def test_non_dict_probe_is_unavailable() -> None:
 
 
 def test_timeout_probe_is_slow() -> None:
+    release = threading.Event()
+    finished = threading.Event()
+
     def slow() -> dict:
-        time.sleep(1.0)
+        # Held until the test releases it, so diagnose can only return by timing
+        # this probe out. No wall-clock bound is involved.
+        release.wait(30.0)
+        finished.set()
         return {"ok": True}
 
-    started = time.monotonic()
-    report = doctor.diagnose({"p": slow}, timeout_seconds=0.2)
-    assert time.monotonic() - started < 0.9
+    try:
+        report = doctor.diagnose({"p": slow}, timeout_seconds=0.2)
+        # Prompt return, checked without wall time: diagnose came back while the
+        # probe was still hung. ``finished`` is only set after release, so this
+        # cannot pass by the probe completing first.
+        assert not finished.is_set()
+    finally:
+        release.set()
     entry = _only(report, "p")
     assert entry["state"] == "slow"
     assert entry["summary"] == "timeout"
@@ -89,11 +100,18 @@ def test_timeout_probe_is_slow() -> None:
 def test_probe_queued_behind_a_hung_probe_is_not_started(monkeypatch) -> None:
     monkeypatch.setattr(doctor.os, "cpu_count", lambda: 1)
 
+    release = threading.Event()
+
     def slow() -> dict:
-        time.sleep(1.0)
+        # Holds the only worker until released, so probe "b" is queued behind it
+        # deterministically rather than by how long a fixed sleep happens to last.
+        release.wait(30.0)
         return {"ok": True}
 
-    report = doctor.diagnose({"a": slow, "b": lambda: {"ok": True}}, timeout_seconds=0.2)
+    try:
+        report = doctor.diagnose({"a": slow, "b": lambda: {"ok": True}}, timeout_seconds=0.2)
+    finally:
+        release.set()
     assert _only(report, "a")["summary"] == "timeout"
     assert _only(report, "b")["summary"] == "not_started"
     assert report["verdict"] == "unavailable"

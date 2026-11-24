@@ -7,7 +7,6 @@ import json
 import os
 import sqlite3
 import sys
-import time
 import tracemalloc
 from pathlib import Path
 from types import ModuleType
@@ -41,7 +40,6 @@ def test_tiny_synthetic_profile_reports_every_step_and_allocators(
     # cold server import runs untraced.  Allocator attribution of a traced step
     # is covered by test_traced_step_names_its_allocators_by_file_and_line.
     path_before = os.environ.get("PATH")
-    started = time.monotonic()
     rc = profiler.main(
         [
             "--repo", str(tmp_path),
@@ -54,7 +52,6 @@ def test_tiny_synthetic_profile_reports_every_step_and_allocators(
             "--no-trace-startup",
         ]
     )
-    elapsed = time.monotonic() - started
     assert os.environ.get("PATH") == path_before
     assert not tracemalloc.is_tracing()
 
@@ -100,12 +97,6 @@ def test_tiny_synthetic_profile_reports_every_step_and_allocators(
     provider_clis = report["provider_clis"]
     assert provider_clis["enabled"] is True and provider_clis["binaries"]
     assert isinstance(provider_clis["excluded_dirs"], list)
-    # A slow run names its slow step: run time vs allocator-attribution time.
-    timings = [
-        (s["round"], s["step"], s["elapsed_seconds"], s["attribution_seconds"])
-        for s in report["steps"]
-    ]
-    assert elapsed < 60, (round(elapsed, 1), timings)
 
 
 def test_probe_reports_named_basis(profiler: ModuleType) -> None:

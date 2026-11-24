@@ -66,6 +66,7 @@ def _blocking_size(monkeypatch, *, worktree_base: Path, block_after: int):
     set it in a ``finally`` so the background measurement thread never hangs."""
     real = worktree_storage.directory_size_bytes
     release = threading.Event()
+    reached = threading.Event()
     lock = threading.Lock()
     seen = {"n": 0}
 
@@ -77,10 +78,35 @@ def _blocking_size(monkeypatch, *, worktree_base: Path, block_after: int):
             seen["n"] += 1
             index = seen["n"]
         if index > block_after:
+            reached.set()
             release.wait(60.0)  # never released within the preview's deadline
         return real(path, **kwargs)
 
+    real_ready = storage_retention._ready_event
+
+    class _DeadlineAfterBlock:
+        """Stands in for the measurement's readiness event. The preview's deadline
+        is ``deadline_seconds`` of real time, which load can expire before the first
+        entries are measured. Here the deadline expires exactly when the walk has
+        reached the block: the wait returns "not ready" only once ``reached`` is set."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def wait(self, timeout=None):
+            assert timeout is not None and timeout > 0, timeout  # preview waits with its deadline
+            reached.wait(60.0)
+            return False
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
     monkeypatch.setattr(worktree_storage, "directory_size_bytes", blocking)
+    monkeypatch.setattr(
+        storage_retention,
+        "_ready_event",
+        lambda measurement: _DeadlineAfterBlock(real_ready(measurement)),
+    )
     return release
 
 

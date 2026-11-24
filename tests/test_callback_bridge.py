@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import types
+import unittest.mock
 import uuid
 from pathlib import Path
 
@@ -1441,7 +1442,7 @@ class _SidebandHarness:
         self._read_line()  # the initialize response
         self._to_mux.write(b'{"method": "initialized"}\n')
         self._to_mux.flush()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30  # generous condition-poll bound; the loop exits on readiness
         while not self.mux.ready:
             if time.monotonic() > deadline:
                 raise TimeoutError("mux never became ready")
@@ -1501,7 +1502,7 @@ def test_sideband_client_thread_resume_idle_roundtrip():
         h.close()
 
 
-def test_sideband_client_deliver_callback_idle_is_synchronous_ack_no_completed_wait():
+def test_sideband_client_deliver_callback_idle_is_synchronous_ack_no_completed_wait(monkeypatch):
     """The measured B409 fix: idle -> turn/start delivered by the
     matching synchronous response alone -- this must return promptly even
     though the fake server also emits async turn/started/turn/completed
@@ -1512,13 +1513,21 @@ def test_sideband_client_deliver_callback_idle_is_synchronous_ack_no_completed_w
         h.do_handshake()
         thread_id = f"thread-{uuid.uuid4()}"
         h.mark_thread_owned(thread_id)
-        started = time.monotonic()
+        recording_sent: list[str] = []
+        real_call = SidebandCallbackClient._call
+
+        def recording_call(self, method, *args, **kwargs):
+            recording_sent.append(method)
+            return real_call(self, method, *args, **kwargs)
+
+        monkeypatch.setattr(SidebandCallbackClient, "_call", recording_call)
         result = h.client().deliver_callback(
             thread_id, "TASK_SIDEBAND_IDLE", "review_ready",
             client_user_message_id="fixed-sideband-1", cwd="/repo/AIWorkHub",
         )
-        elapsed = time.monotonic() - started
-        assert elapsed < 4.0
+        # No completed-wait: idle delivery issues exactly one request (turn/start)
+        # and returns on its synchronous acknowledgement alone.
+        assert recording_sent == ["turn/start"]
         assert result["result"]["turn"]["status"] == "inProgress"
     finally:
         h.close()
@@ -2165,13 +2174,13 @@ def test_claim_pending_callback_batch_skips_not_due_thread_and_serves_other_due_
         _seed_review_task(conn, "E2E_B416_OTHER_THREAD", other_thread)
         conn.close()
 
-        started = time.monotonic()
         conn = taskdb.open_db(db_path)
-        next_claim = taskdb.claim_pending_callback_batch(conn, lease_seconds=30)
+        with unittest.mock.patch.object(time, "sleep", wraps=time.sleep) as sleep_spy:
+            next_claim = taskdb.claim_pending_callback_batch(conn, lease_seconds=30)
         conn.close()
-        elapsed = time.monotonic() - started
 
-        assert elapsed < 1.0, "claim must skip the not-due batch without sleeping"
+        # Counted, not timed: skipping the not-due batch must never sleep.
+        assert sleep_spy.call_count == 0, "claim must skip the not-due batch without sleeping"
         assert next_claim is not None
         assert next_claim["origin_thread_id"] == other_thread
         assert [m["task_id"] for m in next_claim["members"]] == ["E2E_B416_OTHER_THREAD"]

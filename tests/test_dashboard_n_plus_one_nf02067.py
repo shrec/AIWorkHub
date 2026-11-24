@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -397,15 +396,22 @@ def test_warm_cost_ledger_and_needfix_join_stay_under_one_second(
         [_usage(f"T-{index % 120:03d}", f"req-{index}") for index in range(3000)],
     )
 
-    def snapshot_branches() -> float:
-        started = time.perf_counter()
+    def snapshot_branches() -> None:
         cost_ledger.build_cost_ledger(repo_root=root, include_tasks=True)
         _partial_reports(root)
-        return time.perf_counter() - started
 
+    reads = _count_store_reads(monkeypatch)  # installed once, before both passes
     snapshot_branches()  # cold: fills the ledger memo, runs the reconciles
-    warm = snapshot_branches()
+    cold_full_builds = cost_ledger.LEDGER_CACHE_STATS["full_builds"]
+    cold_reads = dict(reads)
+    snapshot_branches()  # warm: judged by counted work, never by elapsed time
+    warm_get_task = reads["get_task"] - cold_reads["get_task"]
+    warm_get_tasks = reads["get_tasks"] - cold_reads["get_tasks"]
 
+    # Deterministic budget: the warm pass is a memo hit, rebuilds nothing, and
+    # stays within the batched join's store-read bounds asserted above.
     assert cost_ledger.LEDGER_CACHE_STATS["hits"] == 1
-    assert warm < 1.0, f"warm cost-ledger + NeedFix-join branches took {warm:.3f}s"
+    assert cost_ledger.LEDGER_CACHE_STATS["full_builds"] == cold_full_builds
+    assert warm_get_task <= 2
+    assert warm_get_tasks <= 4
     cost_ledger.reset_cost_ledger_cache()

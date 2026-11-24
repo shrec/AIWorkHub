@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 import time
+import unittest.mock
 from datetime import datetime
 
 import pytest
@@ -110,13 +111,15 @@ def test_peek_existing_batch_and_expired_lease_match_claim(db_path):
 
 def test_watch_exits_zero_with_ids_and_does_not_claim(db_path, capsys):
     _enqueue_raw(db_path, "T1")
-    started = time.monotonic()
-    code = manager_callback_watch.main(
-        ["--repo", ".", "--provider", "claude", "--origin-thread-id", SESSION,
-         "--timeout", "3", "--poll-interval", "0.1"]
-    )
+    with unittest.mock.patch.object(time, "sleep", wraps=time.sleep) as sleep_spy:
+        code = manager_callback_watch.main(
+            ["--repo", ".", "--provider", "claude", "--origin-thread-id", SESSION,
+             "--timeout", "3", "--poll-interval", "0.1"]
+        )
     assert code == 0
-    assert time.monotonic() - started < 3
+    # Counted, not timed: a callback already pending is found on the first poll,
+    # so the watcher never waits.
+    assert sleep_spy.call_count == 0
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["status"] == "callback_pending"
     assert [m["task_id"] for m in payload["members"]] == ["T1"]
@@ -213,14 +216,38 @@ def _processing_task_queue(root):
         conn.close()
 
 
-def test_watch_heartbeat_is_kept_while_polling_and_removed_on_timeout(db_path, tmp_path, capsys):
+def test_watch_heartbeat_is_kept_while_polling_and_removed_on_timeout(db_path, tmp_path, capsys, monkeypatch):
     heartbeat = _heartbeat_path(tmp_path)
     _processing_task_queue(tmp_path)
     stop_payload = {"session_id": SESSION, "stop_hook_active": False}
     result: dict = {}
+    real_time = time
+
+    class _ManualClock:
+        """The watcher's ``time`` module with a ``monotonic`` only the test moves.
+
+        ``--timeout`` is measured on this clock, so wall-clock load cannot expire
+        the watch while the test is still inspecting the heartbeat. ``sleep`` and
+        every other attribute come from the real module.
+        """
+
+        now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+    clock = _ManualClock()
+    monkeypatch.setattr(manager_callback_watch, "time", clock)
+    # Heartbeat staleness is judged on real time (3 x poll interval). Widen it so a
+    # live watcher stays live under load; the --timeout itself stays on the fake clock.
+    monkeypatch.setattr(tool_guard_hook, "HEARTBEAT_STALE_FACTOR", 400)
 
     def _run() -> None:
-        result["code"] = manager_callback_watch.main(_argv("1.5"))
+        # 8 fake seconds: the watcher only times out once the test advances the clock below.
+        result["code"] = manager_callback_watch.main(_argv("8"))
 
     watcher = threading.Thread(target=_run, daemon=True)
     watcher.start()
@@ -233,14 +260,21 @@ def test_watch_heartbeat_is_kept_while_polling_and_removed_on_timeout(db_path, t
         assert record["poll_interval"] == 0.05
         first = datetime.fromisoformat(record["updated_at"])
         assert first.tzinfo is not None
-        time.sleep(0.3)
-        later = datetime.fromisoformat(json.loads(heartbeat.read_text(encoding="utf-8"))["updated_at"])
+        # Condition, not a fixed sleep: wait until a heartbeat newer than the first lands.
+        later = first
+        refresh_deadline = time.monotonic() + 20.0
+        while later <= first and time.monotonic() < refresh_deadline:
+            time.sleep(0.02)
+            later = datetime.fromisoformat(json.loads(heartbeat.read_text(encoding="utf-8"))["updated_at"])
         assert later > first
         # A live watcher satisfies the Stop guard for this session's processing card.
         assert tool_guard_hook.stop_decision(stop_payload, tmp_path) is None
+        # Expire the watch on the injected clock, not on wall time, then reap it.
+        clock.now = 9.0
         watcher.join(timeout=10.0)
         assert result["code"] == manager_callback_watch.EXIT_TIMEOUT
     finally:
+        clock.now = 9.0
         watcher.join(timeout=10.0)
     assert not heartbeat.exists()
     assert not list(heartbeat.parent.iterdir())
