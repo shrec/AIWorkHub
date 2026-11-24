@@ -22,7 +22,7 @@ from aiworkhub import card_contract_advice, core, needfix_store, server, task_st
 
 NEEDFIX_ID = "NF-2026-02150"
 SCOPE = "src/aiworkhub/example_nf02150.py"
-RUNNER = "claude-worker-nf02150"
+RUNNER = "claude_sonnet-5"
 DIGEST = "c" * 64
 PLAN: dict[str, Any] = {
     "runner": RUNNER,

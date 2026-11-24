@@ -39,7 +39,7 @@ def _accepted_needfix(repo: Path) -> dict[str, Any]:
 
 def _plan(**overrides: Any) -> dict[str, Any]:
     plan: dict[str, Any] = {
-        "runner": "opencode_go_gemini-4-argon-contributor",
+        "runner": "claude_sonnet-5",
         "topic": "needfix-convert",
         "allowed_writes": [TARGET],
         "required_outputs": [TARGET],
@@ -142,7 +142,7 @@ def test_policy_module_plan_converts_to_the_scope_create_stores(
     policy.write_text("POLICY = None\n", encoding="utf-8")
     rec = _accepted_needfix(needfix_repo)
     plan = _plan(
-        runner="claude-worker",
+        runner="claude_sonnet-5",
         allowed_writes=[POLICY_SOURCE],
         required_outputs=[POLICY_SOURCE],
         callback_required=False,

@@ -3964,7 +3964,49 @@ def _card_input_refusal_reason(
             "reserved_topic:quality_review: this topic belongs to reviewer cards "
             "launched by aiworkhub_quality_reviewer_launch, not NeedFix cards"
         )
+    route_refusal = _runner_route_refusal(repo, card.get("runner"))
+    if route_refusal is not None:
+        return route_refusal
     return task_scope_contract.creation_scope_reason(repo, dict(card))
+
+
+def _runner_route_refusal(repo: Path, runner: Any) -> str | None:
+    """Refuse a card runner that launch would refuse, naming the routes it means.
+
+    Launch (``process_launcher.validate_workforce_identity``) refuses a runner
+    that is absent from the canonical workforce table and the catalog when
+    ``core.create_time_runner_route_warnings`` flags it, and refuses every
+    ``claude_*`` runner absent from the table (it pins a model on that family).
+    The table and the catalog are the only registered identities; an unreadable
+    catalog falls back to the table alone and never invents a refusal.
+    """
+    from . import core, process_launcher, workforce_catalog
+    from .runner_topic_policy import canonical_runner_id
+
+    identity = str(runner or "").strip()
+    if not identity or identity == core.CODEX_RUNNER:
+        return None
+    table_runners = {route for route, _adapter in process_launcher._CANONICAL_WORKFORCE}
+    try:
+        catalog_runners = set(workforce_catalog.catalog_launch_identities(repo))
+    except Exception:  # noqa: BLE001 - an unreadable catalog is table-only, never a refusal
+        catalog_runners = set()
+    if identity in table_runners or identity in catalog_runners:
+        return None
+    launch_refuses = bool(core.create_time_runner_route_warnings(identity)) or (
+        identity.startswith("claude_") and identity != "claude"
+    )
+    if not launch_refuses:
+        return None
+    registered = table_runners | catalog_runners
+    candidates = {
+        route for route in registered if route.startswith((f"{identity}-", f"{identity}_"))
+    }
+    folded = canonical_runner_id(identity, sorted(registered))
+    if folded is not None:
+        candidates.add(folded)
+    names = ",".join(sorted(candidates)) or "none"
+    return f"runner_route_absent:runner={identity}:candidates={names}"
 
 
 def default_task_card(needfix_snapshot: Mapping[str, Any]) -> dict[str, Any]:
