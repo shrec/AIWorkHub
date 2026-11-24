@@ -630,6 +630,69 @@ def _validation_fact_entry(card: dict[str, Any], lifecycle_state: str) -> dict[s
     }
 
 
+COMPLETION_PROCESS_SUMMARY_SCHEMA_ID = "aiworkhub.completion_process_summary.v2"
+_LIVE_PROCESS_STATES = frozenset({"launching", "running", "finalizing"})
+_BLOCKED_LIFECYCLE_STATE = "blocked"
+
+
+def fold_completion_inbox_reply(result: dict[str, Any]) -> dict[str, Any]:
+    """Pure MCP-layer fold of a built completion-inbox reply.
+
+    Keeps only live agent_processes rows (plus liveness-lost rows), drops
+    blocked-card latest_validation_facts, and returns a new dict; the input
+    is never mutated. Counts for every dropped row are kept under
+    ``processes_by_state`` / ``processes_omitted`` and
+    ``counts.latest_validation_facts_blocked_omitted``.
+    """
+    folded = dict(result)
+    processes_block = result.get("agent_processes")
+    if isinstance(processes_block, dict):
+        rows = processes_block.get("processes")
+        rows = rows if isinstance(rows, list) else []
+        review_ids = {
+            entry.get("task_id")
+            for key in ("review_queue", "quality_review_pending")
+            for entry in (result.get(key) or [])
+            if isinstance(entry, dict) and entry.get("task_id")
+        }
+        by_state: dict[str, int] = {}
+        kept: list[dict[str, Any]] = []
+        for row in rows:
+            state = str(row.get("state") or "") if isinstance(row, dict) else ""
+            by_state[state] = by_state.get(state, 0) + 1
+            if isinstance(row, dict) and (
+                state in _LIVE_PROCESS_STATES
+                or row.get("liveness_lost")
+                or (state == "review_ready" and row.get("task_id") in review_ids)
+            ):
+                kept.append(row)
+        folded["agent_processes"] = {
+            **processes_block,
+            "schema_id": COMPLETION_PROCESS_SUMMARY_SCHEMA_ID,
+            "processes": kept,
+            "processes_by_state": by_state,
+            "processes_omitted": len(rows) - len(kept),
+        }
+    facts = result.get("latest_validation_facts")
+    blocked_omitted = 0
+    if isinstance(facts, list):
+        kept_facts = [
+            fact
+            for fact in facts
+            if not (
+                isinstance(fact, dict)
+                and fact.get("lifecycle_state") == _BLOCKED_LIFECYCLE_STATE
+            )
+        ]
+        blocked_omitted = len(facts) - len(kept_facts)
+        folded["latest_validation_facts"] = kept_facts
+    counts = dict(result.get("counts") or {})
+    counts["latest_validation_facts_blocked_omitted"] = blocked_omitted
+    folded["counts"] = counts
+    folded["blocked_validation_facts_detail_tool"] = "aiworkhub_task_show"
+    return folded
+
+
 def build_completion_inbox(
     topic: str | None = None,
     limit: int = 200,

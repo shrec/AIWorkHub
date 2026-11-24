@@ -750,7 +750,7 @@ def test_completion_inbox_mcp_tool_surfaces_adapter_readiness(monkeypatch, tmp_p
     _write_credential(path)
     monkeypatch.setenv(dc.CREDENTIAL_PATH_ENV, str(path))
     monkeypatch.setattr(server.completion_inbox, "build_completion_inbox",
-                        lambda **_k: {"review_queue": [], "stale_processing": []})
+                        lambda **_k: {"review_queue": [{"task_id": "T1"}], "stale_processing": []})
     monkeypatch.setattr(server.process_launcher, "default_manager",
                         lambda: SimpleNamespace(list_processes=lambda limit: {
                             "ok": True,
@@ -778,7 +778,7 @@ def test_completion_inbox_mcp_tool_surfaces_adapter_readiness(monkeypatch, tmp_p
     assert ds["credential_present"] is True
     assert ds["endpoint"] == dc.DEEPSEEK_BASE_URL
     process_report = result["agent_processes"]
-    assert process_report["schema_id"] == "aiworkhub.completion_process_summary.v1"
+    assert process_report["schema_id"] == "aiworkhub.completion_process_summary.v2"
     assert process_report["detail_fields_omitted"] is True
     assert process_report["processes"] == [{
         "request_id": "r1",

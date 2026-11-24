@@ -7200,7 +7200,7 @@ def aiworkhub_completion_inbox(
     claimed -- a local pure replica of
     ``AITools/taskctl.py::_runner_task_batch_mismatch``), and
     ``latest_validation_facts`` (the most recently recorded validation_status/
-    validation_error/blocker_reason per task).
+    validation_error/blocker_reason per task). The MCP reply is then folded: live processes only, no blocked facts.
 
     FROZEN READ-ONLY CONTRACT -- no write-gate toggle, no mutation
     parameters. Only issues `taskctl list`/`taskctl show` (both read-only).
@@ -7329,7 +7329,7 @@ def aiworkhub_completion_inbox(
     result["operational_failures"] = _enrich_operational_failures_from_processes(
         result.get("operational_failures"), compact_processes
     )
-    return result
+    return completion_inbox.fold_completion_inbox_reply(result)
 
 
 REVIEW_PACKET_BATCH_MAX = 8

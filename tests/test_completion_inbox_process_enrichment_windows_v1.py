@@ -183,5 +183,5 @@ def test_integration_completion_inbox_invokes_helper_after_compact(
     }
     assert (
         result["agent_processes"]["schema_id"]
-        == "aiworkhub.completion_process_summary.v1"
+        == "aiworkhub.completion_process_summary.v2"
     )
