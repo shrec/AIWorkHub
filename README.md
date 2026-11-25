@@ -177,10 +177,13 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.13
+## What's new in 0.13.14
 
-- Manager Chat panel: messages sent with Claude selected as the coordinator no longer fail with `verified_manager_identity_required`; the panel is verified through its window's bound route.
-- Accept-time host validation stage: its pytest scratch moved under `.aiworkhub/temp`, so host-stage runs no longer fail with `gc_workspace_shape_mismatch`.
+- Manager Chat panel: no wake for an already-terminal card and no redelivered wake; rotation happens before the provider's auto-compaction point; turn teardown stops the worker supervisors it launched; a Claude turn no longer ends early on an injected task notification.
+- Callbacks for cards created by a Claude or Codex session stay on that session instead of moving to the Manager Chat panel.
+- Disk: terminal task worktrees, worker logs and earlier releases' pytest scratch are reclaimed; worker workspaces refuse a path that is not a git toplevel.
+- Review and accept: no replay of a reviewer whose receipt is gone, per-finding diff context in `review_packet`, neighbour tests never silently cut, `stored_hash_mismatch` names its paths, and per-sub-phase accept timing.
+- `needfix_convert` can launch the card in the same call; `claude_*` runners prefer `claude_cli`.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

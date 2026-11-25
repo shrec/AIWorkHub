@@ -94,10 +94,12 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.13
+## What's new in 0.13.14
 
-- Manager Chat panel: messages sent with Claude selected as the coordinator no longer fail with `verified_manager_identity_required`.
-- The accept-time host validation stage keeps its scratch under `.aiworkhub/temp`, so host-stage runs no longer fail with `gc_workspace_shape_mismatch`.
+- Manager Chat panel: no wake for an already-terminal card and no redelivered wake; rotation before the provider's auto-compaction point; turn teardown stops the worker supervisors it launched; a Claude turn no longer ends early on an injected task notification.
+- Callbacks for cards created by a Claude or Codex session stay on that session instead of moving to the Manager Chat panel.
+- Terminal task worktrees, worker logs and earlier releases' test scratch are reclaimed; worker workspaces refuse a path that is not a git toplevel.
+- Review and accept fixes: no replay of a reviewer whose receipt is gone, per-finding diff context, neighbour tests never silently cut, per-sub-phase accept timing.
 
 ## Get started
 

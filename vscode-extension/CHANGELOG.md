@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.13.14 — 2026-11-25
+
+### Fixed
+
+- Manager Chat panel: no wake for a card that is already terminal and no redelivered wake; the session rotates before the provider's auto-compaction point; a turn's teardown stops the worker supervisors it launched on Windows; a Claude turn no longer ends early on an injected task notification.
+- Callbacks for a card created by a Claude or Codex session stay on that session instead of moving to the Manager Chat panel.
+- Bundles runtime 0.13.14: terminal task worktrees, worker logs and earlier releases' test scratch are reclaimed (tens of GB measured on long-running hosts); a workspace path that is not a git toplevel is refused instead of registering worktrees in an enclosing repository; review replay, review packet, accept, task lifecycle and adapter routing fixes; smaller completion-inbox replies and cheaper task hygiene scans.
+
 ## 0.13.13 — 2026-11-24
 
 ### Fixed

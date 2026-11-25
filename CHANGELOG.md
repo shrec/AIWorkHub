@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.14] - 2026-11-25
+
+### Added
+
+- `needfix_convert` takes a launch option: convert a NeedFix and launch its card in one call, through the same launch gates (NF-2026-02175).
+- `accept_review` records per-sub-phase timing, so the cost of a slow accept (about 190 s for a medium card) can be attributed to its phase (NF-2026-02425).
+
+### Fixed
+
+- Manager Chat panel: a `review_ready`/`worker_failed` wake is never delivered for a card that is already terminal and never redelivered once delivered (NF-2026-02406); the session rotates before the provider's observed auto-compaction point (NF-2026-02420); a turn's teardown tree-kills the worker supervisors its per-turn MCP server launched on Windows (NF-2026-02423); a Claude turn no longer ends on a zero-usage result for an injected task notification, which cut answers short and left empty handoffs (NF-2026-02424).
+- Callbacks: rows for a card created by a Claude or Codex session stay on that creator's thread instead of moving to the seated Manager Chat session (NF-2026-02430); the Claude manager contract, dispatcher health and callback docs name the `manager_callback_watch` wake loop (NF-2026-02415).
+- Storage: terminal task worktrees and worker logs are reclaimed on a long-running host, where 114 worktree directories held 44 GB and logs 4.7 GB (NF-2026-02412); a workspace held by a live candidate is no longer reported as a cleanup failure (NF-2026-02399); `release_cut` prunes earlier versions' host pytest basetemps in the background (46.87 GB measured) and never follows a link out of the repository (NF-2026-02429).
+- Worker workspaces: creating a workspace for a path that is not its git toplevel is refused with `repo_not_git_toplevel` instead of registering worktrees in an enclosing repository, and `GIT_CEILING_DIRECTORIES` is kept (NF-2026-02428).
+- Review: a reviewer whose terminal receipt is gone is never replayed; that lens gets a fresh reviewer (NF-2026-02397). `review_packet` attaches per-finding diff context (NF-2026-02396), reads changed-path callers from the candidate and never reports `complete: true` after dropping a caller (NF-2026-01145), and treats an empty `request_ids` beside `request_id` as absent (NF-2026-02426).
+- Accept: neighbour tests that import or monkeypatch a changed module are never cut by the 12-file cap (NF-2026-02390), and a neighbour-test refusal always names the failing tests or carries the output tail (NF-2026-02408); `stored_hash_mismatch` names the paths and the cause (NF-2026-02409); combined validation trees run the repository `workspace_prepare` hook (NF-2026-02410); the host validation stage accepts env-skip-routed rows with a quoted multi-word argument (NF-2026-02400); the accept auto-commit stages only the promoted paths git reports changed, so a deletion already absent from disk and index no longer fails with `git_add_failed` (NF-2026-02401).
+- Validation: a declared command killed at its per-command deadline stops the batch; every later step is reported `skipped_after_timeout` instead of running on the half-built tree, and the batch carries the runner-measured `validation_command_timed_out` signature, so it is routed to the validation-only replay as `validation_environment` instead of being rejected as candidate code (NF-2026-02096).
+- Task lifecycle: `task_archive` refuses a card an open NeedFix still holds (NF-2026-02398); a capped continuation of an already-continued card numbers on the chain root (`X-c2`, never `X-c1-c1`) (NF-2026-02418); a queued launch's original request id points to the request that relaunched it (NF-2026-02411); a write-gated reconcile leaves a dead finalizer `finalizing` instead of deciding `finalize_failed` (NF-2026-02417); a takeover finalizer validating a normally exited worker reports `finalizing`, not lost (NF-2026-01966).
+- Routing: `claude_*` runners prefer `claude_cli` over `vscode_lm` (NF-2026-01343); NeedFix preview and convert refuse a runner that launch would refuse with `workforce_route_absent` (NF-2026-02328), and an invalid `work_kind` or missing behavioural validation roles before any NeedFix is promoted, naming the allowed values (NF-2026-02403); the opencode models probe record persists across MCP processes (NF-2026-02421); a `vscode_lm` credential rejection trips the route circuit, a reviewer route whose credential has not recovered is kept only as the last resort, and a lens's dead earlier reviewer attempts are archived once a replacement verifies it (NF-2026-02404).
+- Performance and memory: the `aiworkhub_completion_inbox` reply on an empty queue shrinks from 64 KB to under 16 KB (NF-2026-02395); task hygiene runs card-local fences before the dependency scan and never scans archived or decided cards (NF-2026-02419); the `closure_events` cold path prefilters ledger lines before parsing them (NF-2026-02422); the arena cap and per-call heap trim also apply on the mcp-SDK backend, with backend and peak attribution in the heap census (NF-2026-02407).
+
+### Changed
+
+- The quality-reviewer cluster moved from `process_launcher.py` into `process_launcher_quality_reviewer.py`; the module-size ratchet cap drops to 13253 lines (NF-2026-02379).
+- Release-cut timing tests hold under full-suite xdist load (NF-2026-02313).
+
 ## [0.13.13] - 2026-11-24
 
 ### Fixed
