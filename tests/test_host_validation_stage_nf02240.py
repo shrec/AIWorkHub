@@ -223,7 +223,8 @@ def test_spec_accepts_argv_lists_and_a_bounded_sweep():
     [
         ("git diff", None, "host_commands_invalid"),
         ([[]], None, "host_command_invalid:0:argv"),
-        ([["git", "diff --check"]], None, "host_command_invalid:0:argv"),
+        ([["git", "diff\0--check"]], None, "host_command_invalid:0:argv"),
+        ([["git", ""]], None, "host_command_invalid:0:argv"),
         ([["git"], [1]], None, "host_command_invalid:1:argv"),
         ([["x"]] * 17, None, "host_commands_invalid"),
         (None, {"tests": [], "processes": 1}, "host_sweep_tests_invalid"),

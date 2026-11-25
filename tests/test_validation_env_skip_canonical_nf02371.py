@@ -216,11 +216,13 @@ def test_existing_host_commands_are_kept_and_deduplicated() -> None:
 
 
 def test_unroutable_command_fails_closed_at_host_spec() -> None:
+    # NF-2026-02400: a quoted spaced argument now routes; an unparseable one never does.
+    unparseable = "python -c 'x y"
     row = _canonical_row()
-    row[audit.HOST_STAGE_COMMAND] = "python -c 'x y'"
-    card = hvs.card_with_env_skip_host_commands({"validation": ["python -c 'x y'"]}, [row])
+    row[audit.HOST_STAGE_COMMAND] = unparseable
+    card = hvs.card_with_env_skip_host_commands({"validation": [unparseable]}, [row])
     assert hvs.card_requests_host_stage(card)
-    with pytest.raises(hvs.HostStageError):
+    with pytest.raises(hvs.HostStageError, match="host_command_invalid:0:argv"):
         hvs.parse_host_spec(card)
 
 

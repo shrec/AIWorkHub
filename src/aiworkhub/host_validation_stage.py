@@ -38,6 +38,7 @@ import math
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -146,6 +147,14 @@ def _whitespace_or_nul(value: str) -> bool:
 
 
 def _commands(raw: object) -> tuple[tuple[str, ...], ...]:
+    """Validated ``host_commands``; each argv must read back unchanged.
+
+    NF-2026-02400: a token may carry inner whitespace (``-k "adapter or
+    derive"``) -- the host stage runs argv shell-free, so it stays one
+    argument. Empty and NUL-bearing tokens are refused; the round-trip quotes
+    with ``shlex.join``, which the POSIX-quote validation tokenizer (on every
+    platform) reads back to the identical argv.
+    """
     if not isinstance(raw, list) or len(raw) > MAX_HOST_COMMANDS:
         raise HostStageError(f"host_commands_invalid:list_of_at_most_{MAX_HOST_COMMANDS}")
     from . import worker_workspace
@@ -160,13 +169,13 @@ def _commands(raw: object) -> tuple[tuple[str, ...], ...]:
                 not isinstance(token, str)
                 or not token
                 or len(token) > MAX_TOKEN_CHARS
-                or _whitespace_or_nul(token)
+                or "\0" in token
                 for token in argv
             )
         ):
             raise HostStageError(f"host_command_invalid:{index}:argv")
         try:
-            parsed = worker_workspace.validation_argv(" ".join(argv))
+            parsed = worker_workspace.validation_argv(shlex.join(argv))
         except worker_workspace.WorkspaceError as exc:
             raise HostStageError(f"host_command_invalid:{index}:{exc}"[:200]) from exc
         if parsed != list(argv):
@@ -335,9 +344,10 @@ def _env_skip_routes(
     """``(argv, skipped paths)`` of every routed (canonical or candidate-changed) env-skip row.
 
     Fail closed, never dropped: a command that is not exactly one of the card's
-    *declared* validation commands, or whose paths are not a list of strings,
-    becomes argv ``[""]``, and a command the validation parser cannot read is
-    kept as its whitespace split, so ``parse_host_spec`` refuses either.
+    *declared* validation commands, whose paths are not a list of strings, or
+    that the validation parser cannot read becomes argv ``[""]``, so
+    ``parse_host_spec`` refuses it.  (NF-2026-02400: a whitespace split is no
+    longer refused once ``_commands`` admits spaced tokens, so it is not used.)
     """
     from . import validation_skip_audit, worker_workspace
 
@@ -363,7 +373,7 @@ def _env_skip_routes(
             try:
                 argv = worker_workspace.validation_argv(text)
             except worker_workspace.WorkspaceError:
-                argv = text.split() or [""]
+                argv = [""]
         paths = list(skipped) if paths_ok else []
         for route_argv, route_paths in routes:
             if route_argv == argv:
