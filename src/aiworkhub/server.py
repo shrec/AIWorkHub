@@ -8177,23 +8177,40 @@ def aiworkhub_agent_accept_review(
     ``manager_correction`` -- unset by default, and every other behaviour is
     then exactly as before -- accepts the sealed candidate PLUS a manager patch
     instead of rejecting it:
-    ``{"patch": <unified diff>, "finding_ids": ["reviewer:<lens>:<id>", ...],
-    "reason": str}``. It lifts the ``refinement_required`` blocker of each
-    named finding that a selected reviewer reported and
-    ``aiworkhub_manager_review_finding_dispose`` already recorded as
-    ``confirmed``, provided its severity is not blocking. The patch is
-    validated before any promotion or state change and refuses with
+    ``{"patch": <unified diff>, "finding_ids": [<id>, ...], "reason": str,
+    "allowed_writes_amendment": [<path>, ...], "manager_measured": {...}}``
+    (``allowed_writes_amendment`` and ``manager_measured`` are optional). Each
+    ``finding_ids`` entry is one of:
+    ``reviewer:<lens>:<id>`` -- lifts the ``refinement_required`` blocker of a
+    reviewer finding that ``aiworkhub_manager_review_finding_dispose`` recorded
+    as ``confirmed`` and that is not blocking;
+    ``manager:<repo-relative path>@<sha256>`` -- evidence the manager's own gate
+    or test run measured, in ``.scratch/`` or ``.aiworkhub/runtime/`` of the
+    canonical repo; it lifts no finding, it only lets the correction ride
+    instead of a rework round;
+    ``validation:<index>`` -- for a ``validation_failed`` candidate, the failed
+    declared-validation row it repairs; a row that did not fail is refused by
+    name.
+    ``manager_measured`` is ``{"command": str, "failing_output": str}``, both
+    non-empty and capped at 1000 and 4000 characters, for a failure the manager
+    measured itself, such as a red neighbour or validation test no reviewer
+    flagged. It lifts no reviewer blocker and lets ``finding_ids`` be empty; its
+    canonical-JSON sha256 is recorded as ``manager_measured_sha256``. Any other
+    shape refuses ``manager_measured_invalid``.
+    The patch is validated before any promotion or state change and refuses with
     ``manager_correction_invalid:<reason>`` when the manager is unverified, the
     patch does not apply to the sealed candidate bytes, a touched path is
     outside the card's ``allowed_writes`` or not part of the candidate, no
-    finding is named, or a named finding is unconfirmed or blocking. The
-    declared validations and the mechanical gate then run on the CORRECTED
-    bytes, those are the bytes promoted, and the accepted-outcome receipt binds
-    the patch digest with the candidate and corrected hashes.
+    finding is named and no ``manager_measured`` is given, or a named finding is
+    unconfirmed or blocking. The declared validations and the mechanical gate
+    then run on the CORRECTED bytes, those are the bytes promoted, and the
+    accepted-outcome receipt binds the patch digest with the candidate and
+    corrected hashes.
     An optional ``"allowed_writes_amendment": [<repo-relative path>, ...]``
-    (NF-2026-02241) lets the patch also touch those exact paths -- e.g. a
-    neighbour test the accept revalidation showed red. Every amended path must
-    be touched by the patch and obey the allowed_writes path rules
+    (NF-2026-02241) lets the patch also touch those exact paths, e.g. a
+    neighbour test the accept revalidation showed red (a red neighbour can also
+    be corrected via ``manager_measured``). Every amended path must be touched
+    by the patch and obey the allowed_writes path rules
     (``allowed_writes_amendment_*`` refusals otherwise); a path outside the
     candidate is patched against its canonical bytes and promoted with it.
     After the accept lands the paths are added to the card's allowed_writes,
