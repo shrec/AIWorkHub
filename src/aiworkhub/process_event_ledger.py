@@ -11,6 +11,7 @@ import hashlib
 import heapq
 import json
 import os
+import re
 import stat
 import threading
 import time
@@ -18,7 +19,7 @@ import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field as _dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -27,6 +28,9 @@ from .platform_io import atomic_replace, chmod_fd, lock_fd, unlock_fd
 
 
 ACTIVE_LEDGER_MAX_BYTES = 48 * 1024 * 1024
+# Rotated archives beyond the newest this-many bytes are compacted
+# (NF-2026-02443): eight active-file generations of history stay verbatim.
+ARCHIVE_LEDGER_MAX_BYTES = 8 * ACTIVE_LEDGER_MAX_BYTES
 _LATEST_EVENT_CACHE_MAX_ENTRIES = 32
 # Estimated retained bytes across every cached latest-event projection; the
 # entry cap alone let 32 projections of a 48 MiB ledger stay resident.
@@ -71,7 +75,11 @@ def _is_spill(path: Path, candidate: Path) -> bool:
 
 
 def ledger_paths(path: Path) -> list[Path]:
-    """Return immutable rotations oldest-first, followed by the active file."""
+    """Return immutable rotations oldest-first, followed by the active file.
+
+    The older members of a published-but-unretired archive merge are left
+    out (``_pending_merge_members``): their rows already live in the merge
+    target, so listing them would show each of those rows twice."""
 
     archives: list[Path] = []
     if path.parent.is_dir():
@@ -82,6 +90,10 @@ def ledger_paths(path: Path) -> list[Path]:
                 continue
             if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                 archives.append(candidate)
+    if archives:
+        hidden = _pending_merge_members(path)
+        if hidden:
+            archives = [item for item in archives if item.name not in hidden]
     archives.sort(key=lambda item: item.name)
     try:
         active_info = path.lstat()
@@ -384,6 +396,8 @@ def append_event(
     event: dict[str, Any],
     *,
     max_active_bytes: int = ACTIVE_LEDGER_MAX_BYTES,
+    max_archive_bytes: int = ARCHIVE_LEDGER_MAX_BYTES,
+    skip_unchanged: bool = False,
 ) -> dict[str, Any]:
     """Append one JSON row, rotating the active file before the size bound.
 
@@ -396,11 +410,24 @@ def append_event(
     The one exception is a causeless workspace-GC row (NF-2026-01174): it is
     persisted without ``terminal_reason`` so the merge fold of
     ``latest_events`` keeps the reason already recorded for the request.
+
+    ``skip_unchanged`` (NF-2026-02443) writes nothing when the row, minus
+    ``timestamp``, equals the request's latest persisted row. The comparison
+    uses a process-local per-request digest kept in step with the active file
+    by reading only the bytes appended since this process last looked -- never
+    a ledger scan -- so an unknown digest (cold process, evicted key, a spill
+    present) always appends. The row is returned either way.
+
+    Each rotation enforces ``max_archive_bytes`` of rotated history
+    (``_enforce_archive_retention``); only pure-duplicate rows are ever removed.
     """
 
     if max_active_bytes < 1024:
         raise ValueError("process_ledger_max_bytes_too_small")
     persisted_event = event.copy()
+    # Reserved for archive compaction (NF-2026-02443): a caller-supplied value
+    # would inflate the request's persisted row count.
+    persisted_event.pop(COLLAPSED_COUNT_FIELD, None)
     # The seal is set once as a Mapping on the reservation row (NF-2026-01131);
     # a non-Mapping value is never a seal and must not overlay it in the merge fold.
     if not isinstance(persisted_event.get("quality_review_attempt"), Mapping):
@@ -438,17 +465,31 @@ def append_event(
         raise ValueError("process_event_exceeds_active_ledger_bound")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
+    request_value = persisted_event.get("request_id")
+    request_key = request_value if isinstance(request_value, str) and request_value else None
     try:
         with _append_lock(path):
             try:
                 info = path.lstat()
             except FileNotFoundError:
                 info = None
-            if info is not None:
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                    raise OSError("process_event_ledger_invalid")
-                if info.st_size and info.st_size + len(payload) > max_active_bytes:
-                    _rotate(path)
+            if info is not None and (
+                stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+            ):
+                raise OSError("process_event_ledger_invalid")
+            if (
+                skip_unchanged
+                and request_key is not None
+                and _append_repeats_latest(path, info, request_key, persisted_event)
+            ):
+                return persisted_event
+            rotated = bool(
+                info is not None
+                and info.st_size
+                and info.st_size + len(payload) > max_active_bytes
+            )
+            if rotated:
+                _rotate(path)
             flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -458,11 +499,1014 @@ def append_event(
                 written = os.write(fd, payload)
                 if written != len(payload):
                     raise OSError("short_process_event_write")
+                written_info = os.fstat(fd)
             finally:
                 os.close(fd)
+            _record_append(
+                path,
+                previous=info,
+                written=written_info,
+                request_key=request_key,
+                row=persisted_event,
+                payload_bytes=len(payload),
+                create=skip_unchanged,
+            )
+            if rotated:
+                _enforce_archive_retention(
+                    path, max_archive_bytes=max_archive_bytes, merge_bytes=max_active_bytes
+                )
     except TimeoutError:
         _write_immutable_spill(path, payload)
     return persisted_event
+
+
+# --- Identical-snapshot append guard (NF-2026-02443) -------------------------
+#
+# A reconciler re-appended an unchanged status snapshot on every pass: one
+# review_ready request wrote 2,808 rows differing only in ``timestamp``,
+# another 71k. ``append_event(skip_unchanged=True)`` drops such a row. The
+# latest persisted digest per request is process-local and kept exact by
+# folding only the bytes other writers appended since this process last
+# looked (a rotation is followed into the archive that kept the inode). Any
+# state it cannot follow exactly resets it to empty, which only means the next
+# repeat is written once more -- never that a changed row is dropped.
+
+_APPEND_DIGEST_MAX_KEYS = 16_384
+_APPEND_DIGEST_MAX_LEDGERS = 8
+
+
+def _snapshot_digest(row: Mapping[str, Any]) -> bytes:
+    """Digest of ``row`` minus ``timestamp`` (and compaction's
+    ``collapsed_count``): the one definition of "the same snapshot" shared by
+    the append guard and archive compaction."""
+
+    body = {
+        key: value
+        for key, value in row.items()
+        if key != "timestamp" and key != COLLAPSED_COUNT_FIELD
+    }
+    text = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).digest()
+
+
+def _skippable_snapshot(row: Mapping[str, Any]) -> bool:
+    """A plain status snapshot: no non-empty ``error`` and no failure-terminal
+    ``state``. Only such a row may be dropped as an unchanged repeat."""
+
+    if row.get("error") not in (None, "", [], {}):
+        return False
+    state = row.get("state")
+    return not (
+        isinstance(state, str) and state.strip().lower() in _FAILURE_TERMINAL_STATES
+    )
+
+
+def _row_request_key(row: Mapping[str, Any]) -> str | None:
+    value = row.get("request_id")
+    return value if isinstance(value, str) and value else None
+
+
+@dataclass
+class _AppendDigests:
+    """Latest persisted snapshot digest per request for one ledger, valid for
+    exactly the first ``offset`` bytes of the file with ``identity``."""
+
+    identity: tuple[int, int] | None
+    offset: int
+    digests: OrderedDict[str, bytes]
+
+
+_APPEND_DIGEST_LOCK = threading.Lock()
+_APPEND_DIGESTS: OrderedDict[str, _AppendDigests] = OrderedDict()
+
+
+def reset_append_digest_cache() -> None:
+    """Forget every append digest (the next repeat per request is written)."""
+
+    with _APPEND_DIGEST_LOCK:
+        _APPEND_DIGESTS.clear()
+
+
+def _remember_digest(index: _AppendDigests, key: str, digest: bytes) -> None:
+    index.digests[key] = digest
+    index.digests.move_to_end(key)
+    while len(index.digests) > _APPEND_DIGEST_MAX_KEYS:
+        index.digests.popitem(last=False)
+
+
+def _fold_digest_bytes(
+    index: _AppendDigests, ledger: Path, start: int, end: int
+) -> int:
+    """Fold the complete rows of ``ledger[start:end]``; returns bytes consumed."""
+
+    if end <= start:
+        return 0
+    with ledger.open("rb") as handle:
+        handle.seek(start)
+        payload = handle.read(end - start)
+    complete = payload.rfind(b"\n") + 1
+    for row in _parse_complete_jsonl(payload[:complete]):
+        key = _row_request_key(row)
+        if key is not None:
+            _remember_digest(index, key, _snapshot_digest(row))
+    return complete
+
+
+def _identity_of(info: os.stat_result | None) -> tuple[int, int] | None:
+    return None if info is None else (int(info.st_dev), int(info.st_ino))
+
+
+def _catch_up_digests(
+    path: Path, index: _AppendDigests, info: os.stat_result | None
+) -> bool:
+    """Bring ``index`` up to the current active file; ``False`` when that
+    cannot be done exactly (the caller then resets it)."""
+
+    current = _identity_of(info)
+    size = int(info.st_size) if info is not None else 0
+    if index.identity is not None and index.identity == current:
+        if size < index.offset:
+            return False
+        index.offset += _fold_digest_bytes(index, path, index.offset, size)
+        return True
+    if index.identity is None:
+        return False
+    # The file this index followed was rotated: finish it in the archive that
+    # kept its inode, fold every newer archive whole, then the new active.
+    archives = [item for item in ledger_paths(path) if item != path]
+    if any(_is_spill(path, item) for item in archives):
+        return False
+    start = None
+    for position, archive in enumerate(archives):
+        archive_info = archive.lstat()
+        if _identity_of(archive_info) == index.identity:
+            if archive_info.st_size < index.offset:
+                return False
+            start = position
+            break
+    if start is None:
+        return False
+    for position, archive in enumerate(archives[start:]):
+        begin = index.offset if position == 0 else 0
+        _fold_digest_bytes(index, archive, begin, int(archive.lstat().st_size))
+    index.identity = current
+    index.offset = _fold_digest_bytes(index, path, 0, size) if info is not None else 0
+    return True
+
+
+def _spill_present(path: Path) -> bool:
+    if not path.parent.is_dir():
+        return False
+    return any(path.parent.glob(f"{_spill_marker(path)}*{path.suffix}"))
+
+
+def _append_repeats_latest(
+    path: Path,
+    info: os.stat_result | None,
+    request_key: str,
+    row: Mapping[str, Any],
+) -> bool:
+    """True when ``row`` minus timestamp equals ``request_key``'s latest
+    persisted row. Called under the append lock; reads appended bytes only.
+
+    Only a plain status snapshot is ever skippable: a row carrying a
+    non-empty ``error`` or a failure-terminal ``state`` is always written,
+    because a repeat of it is itself evidence (the launcher's lineage fold
+    reads a repeated sparse error row as ``retention_error``)."""
+
+    if not _skippable_snapshot(row):
+        return False
+    resolved = str(path.resolve(strict=False))
+    with _APPEND_DIGEST_LOCK:
+        index = _APPEND_DIGESTS.get(resolved)
+        if index is not None:
+            _APPEND_DIGESTS.move_to_end(resolved)
+        try:
+            synced = index is not None and _catch_up_digests(path, index, info)
+        except (OSError, ValueError, RecursionError):
+            synced = False
+        if not synced:
+            # Cold: nothing is known about rows before this point.
+            index = _AppendDigests(
+                identity=_identity_of(info),
+                offset=int(info.st_size) if info is not None else 0,
+                digests=OrderedDict(),
+            )
+            _APPEND_DIGESTS[resolved] = index
+            while len(_APPEND_DIGESTS) > _APPEND_DIGEST_MAX_LEDGERS:
+                _APPEND_DIGESTS.popitem(last=False)
+            return False
+        assert index is not None
+        latest = index.digests.get(request_key)
+    # A spill is merged by timestamp and never seen by the index, so its row
+    # may be the request's real latest one: never skip while one exists.
+    return latest == _snapshot_digest(row) and not _spill_present(path)
+
+
+def _record_append(
+    path: Path,
+    *,
+    previous: os.stat_result | None,
+    written: os.stat_result,
+    request_key: str | None,
+    row: Mapping[str, Any],
+    payload_bytes: int,
+    create: bool,
+) -> None:
+    """Advance the digest index past this process's own append. The index
+    stays exact only when it covered every byte before the append; otherwise
+    it is reset to start exactly after it."""
+
+    resolved = str(path.resolve(strict=False))
+    with _APPEND_DIGEST_LOCK:
+        index = _APPEND_DIGESTS.get(resolved)
+        if index is None and not create:
+            return
+        start = int(written.st_size) - payload_bytes
+        same_file = _identity_of(previous) == _identity_of(written)
+        synced = (
+            index is not None
+            and previous is not None
+            and index.identity == _identity_of(previous)
+            and index.offset == int(previous.st_size)
+            # Either a plain append right after the folded bytes, or the first
+            # row of the file this call just rotated to.
+            and (start == int(previous.st_size) if same_file else start == 0)
+        )
+        if not synced or index is None:
+            index = _AppendDigests(
+                identity=None, offset=0, digests=OrderedDict()
+            )
+            _APPEND_DIGESTS[resolved] = index
+            while len(_APPEND_DIGESTS) > _APPEND_DIGEST_MAX_LEDGERS:
+                _APPEND_DIGESTS.popitem(last=False)
+        index.identity = _identity_of(written)
+        index.offset = int(written.st_size)
+        if request_key is not None:
+            _remember_digest(index, request_key, _snapshot_digest(row))
+
+
+# --- Bounded archive retention (NF-2026-02443) -------------------------------
+#
+# Rotated segments were never pruned (measured: 49 segments, 2.3 GB, most of
+# it rows repeating the previous row of the same request). After a rotation,
+# archives older than the newest ``max_archive_bytes`` are compacted: a run of
+# rows of one request identical except ``timestamp`` keeps only its last
+# ``_COMPACTION_KEEP_RUN`` rows, which is the only removal ever made. The first
+# survivor records how many rows it absorbed in ``collapsed_count``
+# (``persisted_row_count`` adds them back, so the launcher's ``event_count`` is
+# unchanged) and every latest-row fold strips that field. Every later row of a
+# run carries every field the dropped row carried, so the merge and replace
+# folds under every key field, skip set and field filter -- and therefore
+# ``latest_events`` and the launcher's ``status`` -- are unchanged; two rows
+# (not one) are kept because the launcher's lineage fold records a repeated
+# sparse ``error`` a second time as ``retention_error``. History that is not a
+# pure duplicate is never dropped, so a ledger whose old rows are all distinct
+# stays over budget (counted as ``over_budget``).
+#
+# Each archive is compacted once (a manifest beside the checkpoints remembers
+# which), merged into its older compacted neighbour in the same step when the
+# result fits one active file, and adjacent compacted archives are merged
+# while they fit -- which is how the oldest archives disappear. A merge
+# publishes into the NEWEST member's name, records the older members as
+# pending, then truncates and unlinks them. While that pending record names a
+# target whose mark matches, ``ledger_paths`` hides the members, so neither a
+# crash nor a failed retire ever shows a row twice; the next rotation finishes
+# the retire. Retention only ever opens, truncates or rewrites regular files
+# (``lstat``-checked, ``O_NOFOLLOW`` where available): a symlink or other
+# non-regular entry named like an archive is at most unlinked, never followed.
+#
+# Work per call is bounded: at most ``_RETENTION_STEPS_PER_CALL`` steps, one
+# step being one archive compaction or one merge (each reads and writes at
+# most a few active-file sizes), so an append never pays a legacy backlog
+# under its lock. One step per rotation keeps pace with the archive that
+# rotation adds; the second drains a backlog over later rotations.
+#
+# Spills: readers merge spill rows by timestamp (``iter_events``). Removing a
+# row from, or concatenating adjacent, archives whose rows are already in
+# timestamp order leaves that merge's output unchanged, so a spill never
+# disables retention: while one exists a step only touches archives known to
+# be ordered (``order`` in the manifest); any other archive waits for a later,
+# spill-free rotation.
+#
+# Parallelism: retention runs inside the single-writer append lock, so it is
+# one sequential IO-bound pass by construction (not separately measured);
+# concurrent workers would only contend for the same lock and disk.
+
+COLLAPSED_COUNT_FIELD = "collapsed_count"
+_COMPACTION_KEEP_RUN = 2
+_RETENTION_STEPS_PER_CALL = 2
+# Upper bound on the bytes a rewritten survivor grows by (the added
+# ``collapsed_count`` member), used only to estimate a merge's output size.
+_COLLAPSED_FIELD_MAX_BYTES = 40
+_RETENTION_SCHEMA_ID = "aiworkhub.process_event_retention.v1"
+_RETENTION_MANIFEST_MAX_BYTES = 1024 * 1024
+_RETENTION_ORDER_KEY_MAX_CHARS = 64
+_RETENTION_ORPHAN_SECONDS = 3600
+_RETENTION_STATS_LOCK = threading.Lock()
+_RETENTION_STATS: dict[str, int] = {
+    "compacted": 0,
+    "merged": 0,
+    "rows_dropped": 0,
+    "archives_removed": 0,
+    "skipped_spill": 0,
+    "over_budget": 0,
+    "failed": 0,
+}
+
+
+def _collapsed_count(row: Mapping[str, Any]) -> int:
+    value = row.get(COLLAPSED_COUNT_FIELD)
+    return value if type(value) is int and value > 0 else 0
+
+
+def persisted_row_count(rows: Iterable[Mapping[str, Any]]) -> int:
+    """How many rows were persisted for ``rows``' history: each row plus the
+    pure duplicates archive compaction collapsed into it."""
+
+    return sum(1 + _collapsed_count(row) for row in rows)
+
+
+def _merge_order_key(row: Mapping[str, Any]) -> str:
+    """The key ``iter_events`` merges spill and ledger streams by."""
+
+    return str(row.get("timestamp") or "")
+
+
+def _count_retention(outcome: str, amount: int = 1) -> None:
+    with _RETENTION_STATS_LOCK:
+        _RETENTION_STATS[outcome] = _RETENTION_STATS.get(outcome, 0) + amount
+
+
+def ledger_retention_stats() -> dict[str, int]:
+    """Process-local counts of archive compactions, merges and removals."""
+
+    with _RETENTION_STATS_LOCK:
+        return dict(_RETENTION_STATS)
+
+
+def _retention_manifest_path(path: Path) -> Path:
+    return checkpoint_dir(path) / "retention.json"
+
+
+def _archive_mark(archive: Path) -> list[int]:
+    info = archive.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("process_event_archive_not_regular")
+    return [int(info.st_size), int(info.st_mtime_ns)]
+
+
+def _is_mark(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(type(item) is int for item in value)
+    )
+
+
+def _is_order_bounds(value: Any) -> bool:
+    """``[]`` (an ordered archive without rows) or ``[first, last]`` merge keys."""
+
+    return (
+        isinstance(value, list)
+        and len(value) in (0, 2)
+        and all(
+            isinstance(item, str) and len(item) <= _RETENTION_ORDER_KEY_MAX_CHARS
+            for item in value
+        )
+        and (not value or value[0] <= value[1])
+    )
+
+
+def _is_archive_name(path: Path, name: Any) -> bool:
+    return (
+        isinstance(name, str)
+        and Path(name).name == name
+        and name != path.name
+        and name.startswith(f"{path.stem}.")
+        and name.endswith(path.suffix)
+        and not name.startswith(_spill_marker(path))
+    )
+
+
+def _load_retention_manifest(path: Path) -> dict[str, Any]:
+    """The compaction manifest, or an empty one when it is absent or invalid
+    (that costs one re-read of the dropped archives, never a different
+    answer: compaction is idempotent)."""
+
+    manifest: dict[str, Any] = {
+        "compacted": {},
+        "pending": None,
+        "order": {},
+        "deferred": {},
+    }
+    target = _retention_manifest_path(path)
+    try:
+        info = target.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > _RETENTION_MANIFEST_MAX_BYTES
+        ):
+            return manifest
+        data = json.loads(target.read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return manifest
+    if not isinstance(data, dict) or data.get("schema_id") != _RETENTION_SCHEMA_ID:
+        return manifest
+    for table in ("compacted", "deferred"):
+        marks = data.get(table)
+        if isinstance(marks, dict):
+            manifest[table] = {
+                name: mark
+                for name, mark in marks.items()
+                if _is_archive_name(path, name) and _is_mark(mark)
+            }
+    order = data.get("order")
+    if isinstance(order, dict):
+        manifest["order"] = {
+            name: list(bounds)
+            for name, bounds in order.items()
+            if _is_archive_name(path, name) and _is_order_bounds(bounds)
+        }
+    pending = data.get("pending")
+    if (
+        isinstance(pending, dict)
+        and _is_archive_name(path, pending.get("target"))
+        and _is_mark(pending.get("mark"))
+        and isinstance(pending.get("members"), list)
+        and all(_is_archive_name(path, name) for name in pending["members"])
+    ):
+        manifest["pending"] = {
+            "target": pending["target"],
+            "mark": pending["mark"],
+            "members": list(pending["members"]),
+        }
+    return manifest
+
+
+def _save_retention_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
+    directory = checkpoint_dir(path)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise OSError("process_event_checkpoint_dir_invalid")
+    payload = json.dumps(
+        {
+            "schema_id": _RETENTION_SCHEMA_ID,
+            "compacted": manifest["compacted"],
+            "pending": manifest["pending"],
+            "order": manifest.get("order", {}),
+            "deferred": manifest.get("deferred", {}),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    ).encode("ascii")
+    if len(payload) > _RETENTION_MANIFEST_MAX_BYTES:
+        raise ValueError("process_event_retention_manifest_too_large")
+    temporary = directory / f".retention.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    published = False
+    try:
+        with os.fdopen(os.open(temporary, flags, 0o600), "wb") as handle:
+            chmod_fd(handle.fileno(), 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(temporary, _retention_manifest_path(path))
+        published = True
+    finally:
+        if not published:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+_PENDING_MEMBERS_LOCK = threading.Lock()
+_PENDING_MEMBERS_MAX_LEDGERS = 8
+# manifest path -> (manifest stat signature, (target, mark, members) | None)
+_PENDING_MEMBERS: OrderedDict[
+    str,
+    tuple[tuple[int, int, int, int], tuple[str, tuple[int, int], frozenset[str]] | None],
+] = OrderedDict()
+
+
+def _pending_merge_members(path: Path) -> frozenset[str]:
+    """Archive names whose rows already live in a published merge target.
+
+    A merge publishes its target before it retires the older members; until
+    the retire finishes (a crash, or a member that cannot be truncated yet)
+    those members would show every row twice. Readers skip them exactly while
+    the manifest's pending target still carries the published mark. The
+    parsed pending record is cached per manifest stat, so the common call
+    costs one ``lstat`` (two while a merge is pending)."""
+
+    manifest_path = _retention_manifest_path(path)
+    try:
+        info = manifest_path.lstat()
+    except OSError:
+        return frozenset()
+    signature = (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+    )
+    key = str(manifest_path)
+    with _PENDING_MEMBERS_LOCK:
+        cached = _PENDING_MEMBERS.get(key)
+        if cached is not None:
+            _PENDING_MEMBERS.move_to_end(key)
+    if cached is not None and cached[0] == signature:
+        entry = cached[1]
+    else:
+        pending = _load_retention_manifest(path)["pending"]
+        entry = (
+            None
+            if pending is None
+            else (
+                pending["target"],
+                (pending["mark"][0], pending["mark"][1]),
+                frozenset(pending["members"]),
+            )
+        )
+        with _PENDING_MEMBERS_LOCK:
+            _PENDING_MEMBERS[key] = (signature, entry)
+            _PENDING_MEMBERS.move_to_end(key)
+            while len(_PENDING_MEMBERS) > _PENDING_MEMBERS_MAX_LEDGERS:
+                _PENDING_MEMBERS.popitem(last=False)
+    if entry is None:
+        return frozenset()
+    target, mark, members = entry
+    try:
+        current = _archive_mark(path.with_name(target))
+    except OSError:
+        return frozenset()
+    return members if (current[0], current[1]) == mark else frozenset()
+
+
+def _parse_ledger_line(raw: bytes) -> dict[str, Any] | None:
+    try:
+        row = json.loads(raw.decode("utf-8", errors="replace"))
+    except (ValueError, RecursionError):
+        return None
+    return row if isinstance(row, dict) else None
+
+
+def _open_archive(source: Path) -> Any:
+    """Open one archive for reading, refusing anything but the regular file
+    ``lstat`` saw (no symlink is ever followed, no device or FIFO opened)."""
+
+    info = source.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("process_event_archive_not_regular")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(source, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or _identity_of(opened) != _identity_of(info):
+            raise OSError("process_event_archive_changed")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@dataclass
+class _CompactionPlan:
+    """What compacting ``sources``, read in order as one stream, does."""
+
+    drop: set[tuple[int, int]]
+    # Survivor position -> the ``collapsed_count`` it must carry.
+    collapsed: dict[tuple[int, int], int]
+    kept_bytes: int
+    # Rows in non-decreasing ``_merge_order_key`` order, and its first/last key.
+    ordered: bool
+    bounds: list[str]
+
+
+def _duplicate_lines(sources: Sequence[Path]) -> _CompactionPlan:
+    """Plan the compaction of ``sources`` read in order: drop all but the
+    last ``_COMPACTION_KEEP_RUN`` rows of each run of one request's
+    consecutive rows that are identical except ``timestamp`` (and
+    ``collapsed_count``), moving each dropped row's weight onto the next row
+    of its run. Rows without a request id, and unparsable lines, are kept."""
+
+    # request -> (snapshot digest, live run members as
+    #             [position, line bytes, collapsed_count read, weight])
+    runs: dict[str, tuple[bytes, list[list[Any]]]] = {}
+    plan = _CompactionPlan(drop=set(), collapsed={}, kept_bytes=0, ordered=True, bounds=[])
+    first: str | None = None
+    last: str | None = None
+
+    def settle(members: list[list[Any]]) -> None:
+        for position, _length, original, weight in members:
+            if weight != original:
+                plan.collapsed[position] = weight
+                plan.kept_bytes += _COLLAPSED_FIELD_MAX_BYTES
+
+    for source_index, source in enumerate(sources):
+        with _open_archive(source) as handle:
+            for line_index, raw in enumerate(handle):
+                length = len(raw) if raw.endswith(b"\n") else len(raw) + 1
+                plan.kept_bytes += length
+                row = _parse_ledger_line(raw)
+                if row is None:
+                    continue
+                order_key = _merge_order_key(row)
+                if last is not None and order_key < last:
+                    plan.ordered = False
+                first = order_key if first is None else first
+                last = order_key
+                key = _row_request_key(row)
+                if key is None:
+                    continue
+                own = _collapsed_count(row)
+                member = [(source_index, line_index), length, own, own]
+                digest = _snapshot_digest(row)
+                run = runs.get(key)
+                if run is not None and run[0] == digest:
+                    members = run[1]
+                    members.append(member)
+                    if len(members) > _COMPACTION_KEEP_RUN:
+                        position, dropped_length, _original, weight = members.pop(0)
+                        plan.drop.add(position)
+                        plan.kept_bytes -= dropped_length
+                        members[0][3] += 1 + weight
+                else:
+                    if run is not None:
+                        settle(run[1])
+                    runs[key] = (digest, [member])
+    for _digest, members in runs.values():
+        settle(members)
+    if first is not None and last is not None:
+        if (
+            len(first) > _RETENTION_ORDER_KEY_MAX_CHARS
+            or len(last) > _RETENTION_ORDER_KEY_MAX_CHARS
+        ):
+            plan.ordered = False  # unrecordable: treated as unknown order
+        plan.bounds = [first, last]
+    return plan
+
+
+def _write_compacted(
+    path: Path,
+    sources: Sequence[Path],
+    drop: set[tuple[int, int]],
+    collapsed: Mapping[tuple[int, int], int] | None = None,
+) -> Path:
+    """Write ``sources`` in order, minus ``drop`` and with each ``collapsed``
+    survivor's count recorded, to a new 0600 temporary beside the ledger (its
+    leading dot keeps it out of ``ledger_paths``)."""
+
+    collapsed = collapsed or {}
+    temporary = path.with_name(
+        f".{path.name}.compact.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        with os.fdopen(os.open(temporary, flags, 0o600), "wb") as handle:
+            chmod_fd(handle.fileno(), 0o600)
+            for source_index, source in enumerate(sources):
+                with _open_archive(source) as reader:
+                    for line_index, raw in enumerate(reader):
+                        position = (source_index, line_index)
+                        if position in drop:
+                            continue
+                        count = collapsed.get(position)
+                        row = None if count is None else _parse_ledger_line(raw)
+                        if row is not None and count is not None:
+                            row[COLLAPSED_COUNT_FIELD] = count
+                            raw = (
+                                json.dumps(row, ensure_ascii=False, sort_keys=True)
+                                + "\n"
+                            ).encode("utf-8")
+                        # A member's unterminated tail must not swallow the
+                        # next member's first row once they are concatenated.
+                        handle.write(raw if raw.endswith(b"\n") else raw + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+    return temporary
+
+
+def _publish_compacted(temporary: Path, target: Path) -> None:
+    try:
+        atomic_replace(temporary, target)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _retire_member(member: Path) -> bool:
+    """Empty, then unlink, one merged-away archive. Truncation is what removes
+    its rows (it works while a reader holds the file open); an empty archive
+    whose unlink failed holds no rows and is merged away by a later pass.
+
+    Only the regular file itself is ever truncated: a symlink (or any other
+    non-regular entry) under an archive name is unlinked, never followed.
+    Readers never list a non-regular entry, so it holds no ledger rows and
+    counts as retired even when its name cannot be removed (a directory)."""
+
+    try:
+        info = os.lstat(member)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        try:
+            member.unlink()
+        except OSError:
+            pass
+        return True
+    flags = os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(member, flags)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or _identity_of(opened) != _identity_of(info):
+            return False
+        os.ftruncate(fd, 0)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    try:
+        member.unlink()
+    except OSError:
+        pass
+    return True
+
+
+def _finish_pending_merge(path: Path, manifest: dict[str, Any]) -> bool:
+    """Complete a merge whose publish happened; ``False`` while a member
+    still cannot be retired (no further retention work runs until it is,
+    and readers keep skipping the members meanwhile)."""
+
+    pending = manifest["pending"]
+    if pending is None:
+        return True
+    try:
+        mark: list[int] | None = _archive_mark(path.with_name(pending["target"]))
+    except OSError:
+        mark = None
+    if mark != pending["mark"]:
+        # The publish never happened, so the members are still the only copy.
+        manifest["pending"] = None
+        return True
+    retired = True
+    for name in pending["members"]:
+        member = path.with_name(name)
+        try:
+            member.lstat()
+        except FileNotFoundError:
+            manifest["compacted"].pop(name, None)
+            manifest["order"].pop(name, None)
+            continue
+        except OSError:
+            retired = False
+            continue
+        if _retire_member(member):
+            _count_retention("archives_removed")
+            manifest["compacted"].pop(name, None)
+            manifest["order"].pop(name, None)
+        else:
+            retired = False
+    if retired:
+        manifest["pending"] = None
+    return retired
+
+
+def _remove_orphan_compactions(path: Path) -> None:
+    horizon = time.time() - _RETENTION_ORPHAN_SECONDS
+    for orphan in path.parent.glob(f".{path.name}.compact.*.tmp"):
+        try:
+            info = orphan.lstat()
+            if info.st_mtime < horizon:
+                orphan.unlink()
+        except OSError:
+            pass
+
+
+def _enforce_archive_retention(
+    path: Path, *, max_archive_bytes: int, merge_bytes: int
+) -> None:
+    """Apply archive retention after a rotation; never fails the append that
+    triggered it (a failure is counted and retried by the next rotation)."""
+
+    try:
+        _apply_archive_retention(
+            path, max_archive_bytes=max_archive_bytes, merge_bytes=merge_bytes
+        )
+    except (OSError, ValueError, RecursionError):
+        _count_retention("failed")
+
+
+def _ordered_chain(order: Mapping[str, list[str]], group: Sequence[Path]) -> bool:
+    """True when every member's rows are known to be in merge-key order and
+    each member's last key precedes the next member's first."""
+
+    previous: str | None = None
+    for member in group:
+        bounds = order.get(member.name)
+        if bounds is None:
+            return False
+        if not bounds:
+            continue
+        if previous is not None and bounds[0] < previous:
+            return False
+        previous = bounds[1]
+    return True
+
+
+def _record_order(manifest: dict[str, Any], name: str, plan: _CompactionPlan) -> None:
+    if plan.ordered:
+        manifest["order"][name] = list(plan.bounds)
+    else:
+        manifest["order"].pop(name, None)
+
+
+def _merge_archives(
+    path: Path, manifest: dict[str, Any], group: Sequence[Path], *, spill: bool
+) -> bool:
+    """Merge ``group`` (adjacent, oldest first) into its newest member's name;
+    ``False`` when a spill makes the merge unsafe (nothing was written)."""
+
+    plan = _duplicate_lines(group)
+    if spill and not plan.ordered:
+        return False
+    temporary = _write_compacted(path, group, plan.drop, plan.collapsed)
+    try:
+        manifest["pending"] = {
+            "target": group[-1].name,
+            "mark": _archive_mark(temporary),
+            "members": [member.name for member in group[:-1]],
+        }
+        _save_retention_manifest(path, manifest)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+    _publish_compacted(temporary, group[-1])
+    _count_retention("merged")
+    _count_retention("rows_dropped", len(plan.drop))
+    manifest["compacted"][group[-1].name] = _archive_mark(group[-1])
+    for member in group:
+        manifest.setdefault("deferred", {}).pop(member.name, None)
+    _record_order(manifest, group[-1].name, plan)
+    _finish_pending_merge(path, manifest)
+    _save_retention_manifest(path, manifest)
+    return True
+
+
+def _compact_archive(
+    path: Path,
+    manifest: dict[str, Any],
+    archive: Path,
+    older: Path | None,
+    *,
+    spill: bool,
+    merge_bytes: int,
+) -> None:
+    """One step for an archive not compacted yet: merge it into its older
+    compacted neighbour when the result fits one active file, otherwise
+    compact it in place. While a spill exists an archive not in merge-key
+    order is only recorded, never rewritten."""
+
+    plan = _duplicate_lines([archive])
+    _record_order(manifest, archive.name, plan)
+    if (
+        older is not None
+        and _archive_mark(older)[0] + plan.kept_bytes <= merge_bytes
+        and (not spill or _ordered_chain(manifest["order"], [older, archive]))
+        and _merge_archives(path, manifest, [older, archive], spill=spill)
+    ):
+        return
+    deferred = manifest.setdefault("deferred", {})
+    if spill and not plan.ordered:
+        _count_retention("skipped_spill")
+        # Deferred, not compacted: retried once the spill is gone.
+        deferred[archive.name] = _archive_mark(archive)
+        return
+    if plan.drop:
+        _publish_compacted(
+            _write_compacted(path, [archive], plan.drop, plan.collapsed), archive
+        )
+        _count_retention("compacted")
+        _count_retention("rows_dropped", len(plan.drop))
+    deferred.pop(archive.name, None)
+    manifest["compacted"][archive.name] = _archive_mark(archive)
+
+
+def _retention_step(
+    path: Path, manifest: dict[str, Any], *, max_archive_bytes: int, merge_bytes: int
+) -> bool:
+    """Run the oldest pending retention step; ``False`` when none is due."""
+
+    segments = [item for item in ledger_paths(path) if item != path]
+    archives = [item for item in segments if not _is_spill(path, item)]
+    spill = len(archives) != len(segments)
+    sizes = [_archive_mark(item)[0] for item in archives]
+    kept_bytes = 0
+    split = len(archives)
+    while split and kept_bytes + sizes[split - 1] <= max_archive_bytes:
+        split -= 1
+        kept_bytes += sizes[split]
+    dropped = archives[:split]
+    compacted: dict[str, list[int]] = manifest["compacted"]
+    deferred: dict[str, list[int]] = manifest.setdefault("deferred", {})
+    marks = [_archive_mark(item) for item in dropped]
+    done = [
+        compacted.get(item.name) == mark for item, mark in zip(dropped, marks)
+    ]
+    for position, archive in enumerate(dropped):
+        if not done[position]:
+            if spill and deferred.get(archive.name) == marks[position]:
+                # Recorded beside a spill and left byte-identical; it is
+                # compacted once the spill is gone. Never a merge member.
+                continue
+            older = dropped[position - 1] if position and done[position - 1] else None
+            _compact_archive(
+                path, manifest, archive, older, spill=spill, merge_bytes=merge_bytes
+            )
+            return True
+        # Greedy: the oldest run of adjacent compacted archives that fits one
+        # active file is merged; a lone one moves the window on.
+        group = [archive]
+        group_bytes = sizes[position]
+        for offset in range(position + 1, len(dropped)):
+            if not done[offset] or group_bytes + sizes[offset] > merge_bytes:
+                break
+            group.append(dropped[offset])
+            group_bytes += sizes[offset]
+        if len(group) < 2:
+            continue
+        if spill and not _ordered_chain(manifest["order"], group):
+            continue
+        if _merge_archives(path, manifest, group, spill=spill):
+            return True
+    return False
+
+
+def _apply_archive_retention(
+    path: Path, *, max_archive_bytes: int, merge_bytes: int
+) -> bool:
+    """Run at most ``_RETENTION_STEPS_PER_CALL`` retention steps; ``True``
+    when one ran (more may be due: the next rotation continues)."""
+
+    manifest = _load_retention_manifest(path)
+    before = json.dumps(manifest, sort_keys=True)
+    if manifest["pending"] is not None:
+        finished = _finish_pending_merge(path, manifest)
+        _save_retention_manifest(path, manifest)
+        if not finished:
+            return False
+    _remove_orphan_compactions(path)
+    steps = 0
+    while steps < _RETENTION_STEPS_PER_CALL and _retention_step(
+        path, manifest, max_archive_bytes=max_archive_bytes, merge_bytes=merge_bytes
+    ):
+        steps += 1
+        if manifest["pending"] is not None:
+            break  # a member could not be retired; the next rotation retries
+    present = {item.name for item in ledger_paths(path)}
+    for table in (
+        manifest["compacted"],
+        manifest["order"],
+        manifest.setdefault("deferred", {}),
+    ):
+        for name in [name for name in table if name not in present]:
+            del table[name]
+    if json.dumps(manifest, sort_keys=True) != before:
+        _save_retention_manifest(path, manifest)
+    # Counted per call that ends above the budget: either work is still due
+    # or the history beyond the budget is all distinct rows.
+    remaining = sum(
+        _archive_mark(item)[0] for item in ledger_paths(path) if item != path
+    )
+    if remaining > max_archive_bytes:
+        _count_retention("over_budget")
+    return bool(steps)
 
 
 def _iter_ledger_file(path: Path) -> Iterator[dict[str, Any]]:
@@ -503,11 +1547,29 @@ def _key_token(key: Any) -> bytes | None:
     return None
 
 
+# Above this many tokens a per-token substring test costs tokens x line bytes
+# per line (a 4096-key request projection would be thousands of scans per
+# row), so the line's JSON string literals are matched against a set instead.
+_MANY_TOKENS = 16
+# One complete JSON string literal. Scanning a valid JSON line left to right
+# meets only real openers (nothing outside a string contains a quote), so the
+# literals found are exactly the line's strings and an exact token -- a string
+# JSON writes without escapes -- is in the line iff it is one of them.
+_JSON_STRING_LITERAL = re.compile(rb'"(?:[^"\\]|\\.)*"', re.DOTALL)
+
+
 def _rows_containing(lines: Iterable[bytes], tokens: list[bytes]) -> Iterator[dict[str, Any]]:
     """Parse only the raw lines that contain one of ``tokens``."""
 
+    wanted = frozenset(tokens) if len(tokens) > _MANY_TOKENS else None
     for raw_line in lines:
-        if not any(token in raw_line for token in tokens):
+        if wanted is None:
+            if not any(token in raw_line for token in tokens):
+                continue
+        elif not any(
+            match.group(0) in wanted
+            for match in _JSON_STRING_LITERAL.finditer(raw_line)
+        ):
             continue
         try:
             row = json.loads(raw_line.decode("utf-8", errors="replace"))
@@ -590,7 +1652,7 @@ def iter_events(path: Path) -> Iterator[dict[str, Any]]:
             continue
         heapq.heappush(
             heap,
-            (str(row.get("timestamp") or ""), index, 0, row),
+            (_merge_order_key(row), index, 0, row),
         )
     while heap:
         _timestamp, index, _ordinal, row = heapq.heappop(heap)
@@ -603,7 +1665,7 @@ def iter_events(path: Path) -> Iterator[dict[str, Any]]:
         heapq.heappush(
             heap,
             (
-                str(following.get("timestamp") or ""),
+                _merge_order_key(following),
                 index,
                 ordinals[index],
                 following,
@@ -696,6 +1758,10 @@ def _merge_latest_row(
     key = str(row.get(key_field) or "")
     if not key:
         return None
+    if COLLAPSED_COUNT_FIELD in row:
+        # Retention bookkeeping, never event data: no fold may expose it, so
+        # a compacted ledger folds exactly as its uncompacted history did.
+        row = {k: v for k, v in row.items() if k != COLLAPSED_COUNT_FIELD}
     if keep_fields:
         row = {k: v for k, v in row.items() if k in keep_fields}
         if not any(k != key_field for k in row):
@@ -1563,8 +2629,14 @@ def sealed_request_field(path: Path, field: str) -> dict[str, Any]:
 # and a subsequent append parses only the bytes added after the last complete
 # row -- it never discards the rows already folded for unrelated requests.
 
-_REQUEST_EVENT_PROJECTION_MAX_KEYS = 64
+# NF-2026-02443: a cap of 64 keys let a reconciler that tracks more launched
+# requests evict its own keys every pass, so every status call was a cold miss
+# re-reading all history. The key cap is now generous and memory is bounded by
+# estimated retained bytes through ``_cache_bounded_projection``'s weight:
+# keys the current call did not ask for are trimmed first.
+_REQUEST_EVENT_PROJECTION_MAX_KEYS = 4096
 _REQUEST_EVENT_CACHE_MAX_ENTRIES = 8
+_REQUEST_EVENT_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -1572,6 +2644,9 @@ class _RequestEventProjection:
     signatures: tuple[_FileSignature, ...]
     complete_active_offset: int
     events: dict[str, list[dict[str, Any]]]
+    # Estimated retained bytes per tracked key, and their sum (the weight).
+    key_bytes: Mapping[str, int] = _dataclass_field(default_factory=dict)
+    estimated_bytes: int = 0
 
 
 # (resolved ledger path, key field).  The key field joins the identity for the
@@ -1620,12 +2695,14 @@ def _fold_request_rows(
     events: dict[str, list[dict[str, Any]]],
     rows: Iterable[dict[str, Any]],
     key_field: str,
+    key_bytes: dict[str, int] | None = None,
 ) -> None:
     """Append each row to its tracked bucket, by exact key identity.
 
     A row whose key is untracked is skipped, never created: a key that was
     never asked for must not silently start being retained, and a key that was
-    asked for always has a bucket already.
+    asked for always has a bucket already. ``key_bytes``, when given, gains
+    each appended row's estimated retained bytes under its key.
     """
 
     for row in rows:
@@ -1635,6 +2712,12 @@ def _fold_request_rows(
         bucket = events.get(value)
         if bucket is not None:
             bucket.append(row)
+            if key_bytes is not None:
+                key_bytes[value] = key_bytes.get(value, 0) + _estimate_value_bytes(row)
+
+
+def _bucket_bytes(key: str, rows: Iterable[Mapping[str, Any]]) -> int:
+    return _estimate_value_bytes(key) + sum(_estimate_value_bytes(row) for row in rows)
 
 
 def _complete_lines(
@@ -1751,6 +2834,7 @@ def _cache_request_projection(
         cache_key,
         projection,
         _REQUEST_EVENT_CACHE_MAX_ENTRIES,
+        max_bytes=_REQUEST_EVENT_CACHE_MAX_BYTES,
     )
 
 
@@ -1783,6 +2867,7 @@ def _rebuild_request_events(
     key_field: str,
     cache_key: _RequestProjectionKey,
     base: _RequestEventProjection | None = None,
+    requested: Sequence[str] = (),
 ) -> dict[str, list[dict[str, Any]]]:
     """Collect ``keys`` and cache them as one projection.
 
@@ -1814,12 +2899,32 @@ def _rebuild_request_events(
                     offset = None
     if offset is None or snapshot is None:
         return events
+    known = base.key_bytes if base is not None else {}
+    key_bytes = {
+        key: known[key] if key in known and key in tracked else _bucket_bytes(key, rows)
+        for key, rows in events.items()
+    }
+    # Memory bound: the keys this call did not ask for are dropped, last
+    # tracked first, until the projection fits its byte budget. A projection
+    # whose requested keys alone exceed it is answered but not retained.
+    asked = set(requested)
+    total = sum(key_bytes.values())
+    retained = dict(events)
+    for key in reversed(keys):
+        if total <= _REQUEST_EVENT_CACHE_MAX_BYTES:
+            break
+        if key in asked:
+            continue
+        total -= key_bytes.pop(key)
+        retained.pop(key)
     _cache_request_projection(
         cache_key,
         _RequestEventProjection(
             signatures=snapshot,
             complete_active_offset=offset,
-            events=events,
+            events=retained,
+            key_bytes=key_bytes,
+            estimated_bytes=total,
         ),
     )
     return events
@@ -1879,9 +2984,16 @@ def _replay_appended_request_events(
 
     complete_length = payload.rfind(b"\n") + 1
     events = {key: list(rows) for key, rows in cached.events.items()}
+    key_bytes = {
+        key: cached.key_bytes[key] if key in cached.key_bytes else _bucket_bytes(key, rows)
+        for key, rows in events.items()
+    }
     if complete_length:
         _fold_request_rows(
-            events, _parse_complete_jsonl(payload[:complete_length]), key_field
+            events,
+            _parse_complete_jsonl(payload[:complete_length]),
+            key_field,
+            key_bytes,
         )
     if _ledger_signatures(path) != current:
         return None
@@ -1889,6 +3001,8 @@ def _replay_appended_request_events(
         signatures=current,
         complete_active_offset=start + complete_length,
         events=events,
+        key_bytes=key_bytes,
+        estimated_bytes=sum(key_bytes.values()),
     )
     _cache_request_projection(cache_key, projection)
     return projection
@@ -1958,7 +3072,12 @@ def events_for_requests(
         requested, retained.events.keys() if retained is not None else ()
     )
     rebuilt = _rebuild_request_events(
-        path, keys=keys, key_field=key_field, cache_key=cache_key, base=projection
+        path,
+        keys=keys,
+        key_field=key_field,
+        cache_key=cache_key,
+        base=projection,
+        requested=requested,
     )
     return _request_slice(rebuilt, requested)
 

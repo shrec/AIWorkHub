@@ -4564,7 +4564,16 @@ class ProcessManager:
         # Return what the ledger wrote: a failure-terminal row gains a canonical
         # terminal_reason on the way in, so ``clean`` was an event whose own
         # replay would not compare equal to it.
-        return process_event_ledger.append_event(self.process_log_path, clean)
+        # NF-2026-02443: reconciliation re-recorded unchanged snapshots on every
+        # pass (2,808 identical review_ready rows for one request, 71k for
+        # another); a row equal to the request's latest one minus timestamp is
+        # not written again. The ledger answers that from a per-request digest
+        # of appended bytes, never a scan, and never skips a row carrying an
+        # error or a failure-terminal state (a repeated sparse error row is
+        # what the lineage fold reports as retention_error).
+        return process_event_ledger.append_event(
+            self.process_log_path, clean, skip_unchanged=True
+        )
 
     def _retention_event(self, event: dict[str, Any], *, disposition: str) -> dict[str, Any]:
         """Record terminal retention evidence and enqueue repository hygiene."""
@@ -11697,7 +11706,9 @@ class ProcessManager:
             "task_state": core._lifecycle_state(card) if card else "unknown",
             "task_card": card,
             "task_card_read": card_read,
-            "event_count": len(events),
+            # Rows persisted, including pure duplicates archive compaction
+            # collapsed into a survivor (NF-2026-02443).
+            "event_count": process_event_ledger.persisted_row_count(events),
             # NF-2026-02411: an admission-queued request points at the request
             # that relaunched it; absent for every other request.
             **(
