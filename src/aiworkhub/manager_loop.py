@@ -118,6 +118,10 @@ class ManagerSession:
     ``updated_at`` is when the owner last picked it (continue, restore, a route); that
     pick renews the manager seat lease like a turn does. ``context_baseline_tokens`` is
     the first measured turn's context on the provider conversation now bound to it.
+    ``provider_compact_tokens`` is the newest observed ``provider_compacted.pre_tokens``:
+    the point where the provider compacts on its own, carried into a successor.
+    ``provider_compact_window`` is the ``context_window`` that compacting turn reported; the
+    bound applies only to turns reporting that same window.
     """
 
     session_id: str
@@ -134,6 +138,8 @@ class ManagerSession:
     title: str = ""
     updated_at: str = ""
     context_baseline_tokens: int | None = None
+    provider_compact_tokens: int | None = None
+    provider_compact_window: int | None = None
 
     @property
     def passive(self) -> bool:
@@ -333,17 +339,50 @@ def _measured_fill(events: Iterable[Mapping[str, Any]]) -> float | None:
     return float(fill)
 
 
+def _measured_window(events: Iterable[Mapping[str, Any]]) -> int | None:
+    """The last ``turn_end``'s provider-reported ``usage.context_window``; ``None`` unless a positive int."""
+    usage = _last_turn_usage(events)
+    window = usage.get("context_window") if usage is not None else None
+    return _valid_bound(window)
+
+
 def _measured_tokens(events: Iterable[Mapping[str, Any]]) -> int | None:
     """The last call's context tokens (``context_fill`` x ``context_window``); ``None`` unless both are valid."""
-    usage = _last_turn_usage(events)
+    events = list(events)
     fill = _measured_fill(events)
-    window = usage.get("context_window") if usage is not None else None
-    if fill is None or isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+    window = _measured_window(events)
+    if fill is None or window is None:
         return None
     try:
         return round(fill * window)
     except OverflowError:
         return None
+
+
+def _valid_bound(value: Any) -> int | None:
+    """``value`` when it is a positive int (never a bool); otherwise ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _compaction_observation(events: Iterable[Mapping[str, Any]]) -> tuple[int, int | None] | None:
+    """NF-2026-02420: the newest ``provider_compacted`` event's valid ``pre_tokens`` and the window.
+
+    The window is the ``context_window`` its own turn's ``turn_end`` reported (``None`` when
+    unreported), the identity of the provider the compaction point belongs to.
+    """
+    events = list(events)
+    newest: tuple[int, Any] | None = None
+    for event in events:
+        payload = event.get("payload") if event.get("type") == "provider_compacted" else None
+        found = _valid_bound(payload.get("pre_tokens")) if isinstance(payload, Mapping) else None
+        if found is not None:
+            newest = (found, event.get("turn"))
+    if newest is None:
+        return None
+    bound, turn = newest
+    return bound, _measured_window(event for event in events if event.get("turn") == turn)
 
 
 def _empty_turn(events: Iterable[Mapping[str, Any]], reply: str) -> bool:
@@ -493,6 +532,29 @@ class SessionStore:
     def latest_closed(self) -> ManagerSession | None:
         closed = [item for item in self.sessions() if item.status == "closed"]
         return max(closed, key=lambda item: (item.closed_at or "", item.session_id), default=None)
+
+    def latest_compaction_pre_tokens(self, window: int | None) -> int | None:
+        """The newest valid ``provider_compacted`` ``pre_tokens`` observed under ``window``, or ``None``.
+
+        NF-2026-02420: a bound belongs to the ``context_window`` its compacting turn reported, so
+        one observed under another window (another provider) never answers; an unknown window
+        matches nothing. Sessions are read newest first and each log only to its bounded tail; a
+        session record that already carries a (bound, window) pair answers without reading its log.
+        """
+        window = _valid_bound(window)
+        if window is None:
+            return None
+        for session in reversed(self.sessions()):
+            bound = _valid_bound(session.provider_compact_tokens)
+            if bound is not None:
+                observed: tuple[int, int | None] | None = (
+                    bound, _valid_bound(session.provider_compact_window)
+                )
+            else:
+                observed = _compaction_observation(self.events(session.session_id))
+            if observed is not None and observed[1] == window:
+                return observed[0]
+        return None
 
     def save_handoff(self, session_id: str, text: str) -> None:
         _publish(self._path("handoffs", session_id), text)
@@ -847,6 +909,9 @@ class ManagerOrchestrator:
         self._stop_requested: bool = False
         self._stop_armed: bool = False
         self._log_lock = threading.Lock()
+        # NF-2026-02420: the session whose missing compaction bound was already looked up in
+        # the store, so a chain that never compacted scans the store once, not every turn.
+        self._bound_seeded: str | None = None
 
     @property
     def partial(self) -> dict[str, Any] | None:
@@ -1461,6 +1526,13 @@ class ManagerOrchestrator:
             brief = self.brief_builder.build(handoff)
             backend = self._backend_factory(backend_id, model)
             provider_ref = backend.start(brief)
+            # NF-2026-02420: the successor carries its predecessor's compaction point with the
+            # window it was observed under; a new chain seeds it on its first turn instead.
+            bound = _valid_bound(previous.provider_compact_tokens) if previous else None
+            bound_window = (
+                _valid_bound(previous.provider_compact_window)
+                if previous is not None and bound is not None else None
+            )
             session = ManagerSession(
                 session_id=self._new_id(),
                 repo_id=self.store.repo_id,
@@ -1470,6 +1542,8 @@ class ManagerOrchestrator:
                 created_at=self._clock(),
                 context_estimate_bytes=len(brief.encode("utf-8")),
                 previous_session_id=previous.session_id if previous else None,
+                provider_compact_tokens=bound,
+                provider_compact_window=bound_window,
             )
             self.store.save(session)
             self._record(session, 0, "session_start", {
@@ -1612,11 +1686,29 @@ class ManagerOrchestrator:
         baseline = session.context_baseline_tokens
         if isinstance(baseline, bool) or not isinstance(baseline, int):
             baseline = tokens
+        # NF-2026-02420: the provider's observed auto-compaction point bounds the usable context,
+        # paired with the context_window it was observed under. This turn's observation wins;
+        # else the carried pair; else, once per session, the newest bound the store already
+        # holds for this turn's window.
+        window = _measured_window(events)
+        observed = _compaction_observation(events)
+        if observed is not None:
+            bound, bound_window = observed
+        else:
+            bound = _valid_bound(session.provider_compact_tokens)
+            bound_window = _valid_bound(session.provider_compact_window) if bound is not None else None
+            # A turn that reports no window cannot key the seed, so it leaves it for the next turn.
+            if bound is None and window is not None and self._bound_seeded != session.session_id:
+                self._bound_seeded = session.session_id
+                bound = self.store.latest_compaction_pre_tokens(window)
+                bound_window = window if bound is not None else None
         session = dataclasses.replace(
             session,
             turn_count=turn,
             context_estimate_bytes=session.context_estimate_bytes + grown,
             context_baseline_tokens=baseline,
+            provider_compact_tokens=bound,
+            provider_compact_window=bound_window,
         )
         self.store.save(session)
         self._session = session
@@ -1640,6 +1732,15 @@ class ManagerOrchestrator:
         else:
             result["rotation_basis"] = "byte_estimate"
             full = session.context_estimate_bytes >= self.rotate_at_bytes
+        # NF-2026-02420: a provider that reports a window far larger than the point where it
+        # compacts on its own never reaches rotate_fraction of that window; the observed
+        # compaction point is then the effective window, so rotation precedes the lossy summary.
+        # The bound applies only under the window it was observed with: another provider's
+        # compaction point says nothing about this one, and a stale bound would never be replaced.
+        if not full and bound is not None and tokens is not None and window is not None:
+            if window == bound_window and tokens >= self.rotate_fraction * min(window, bound):
+                result["rotation_basis"] = "provider_compaction_bound"
+                full = True
         # NF-2026-01873: the ceiling measures growth over the first measured turn. A successor
         # starts at its brief plus handoff, often past the ceiling already; an absolute
         # ceiling rotated it after one or two turns, every rotation re-billing that start.
