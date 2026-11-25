@@ -27,7 +27,9 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import callback_store, core  # noqa: E402
 
-_WATCHER = "python -m aiworkhub.manager_callback_watch"
+# The docs keep the plain `python -m ...` form; the published contract and
+# remediation name the running interpreter (NF-2026-02438), so pin the module.
+_WATCHER = "-m aiworkhub.manager_callback_watch"
 _UNREGISTERED = {"dispatcher_running": False, "registered": False, "repo_id": "", "last_start_error": ""}
 _BOUND = callback_store.CALLBACK_BACKLOG_MAX_AGE_SECONDS
 
@@ -51,10 +53,8 @@ def _patch_claude_inbox(monkeypatch, *, backlog: int, oldest: str) -> None:
 
 
 def _claude_contract_line() -> str:
-    text = (_SRC / "aiworkhub" / "core.py").read_text(encoding="utf-8")
-    match = re.search(r'^\s*"claude": "(call aiworkhub_dispatcher_ensure_started[^\n]*)",$', text, re.M)
-    assert match is not None, "callback['claude'] contract string not found in core.py"
-    return match.group(1)
+    # The bootstrap dict's callback["claude"] is this one constant (NF-2026-02438).
+    return core.CLAUDE_CALLBACK_CONTRACT
 
 
 def test_claude_callback_contract_names_the_watcher_and_the_loop():

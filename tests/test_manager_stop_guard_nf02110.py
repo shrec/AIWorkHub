@@ -101,6 +101,11 @@ def test_blocks_on_processing_card_without_a_heartbeat(tmp_path: Path) -> None:
     assert reason is not None
     assert "NF-3" in reason
     assert "-m aiworkhub.manager_callback_watch" in reason
+    # NF-2026-02438: the running interpreter and a PYTHONPATH, never a bare python.
+    argv, env = hook.watcher_launcher(tmp_path)
+    assert argv[0] == Path(sys.executable).as_posix()
+    assert env["PYTHONPATH"] and f"PYTHONPATH={shlex.quote(env['PYTHONPATH'])}" in reason
+    assert " python -m " not in f" {reason}"
     repo = tmp_path.as_posix()
     assert f"--repo {repo}" in reason or f'--repo "{repo}"' in reason
     assert "--provider claude" in reason
@@ -255,13 +260,17 @@ def test_main_stop_fails_open_on_an_unexpected_error(
 def test_watcher_command_uses_forward_slash_paths_that_survive_git_bash(
     tmp_path: Path,
 ) -> None:
+    # NF-2026-02438: a target-repo .venv is no longer preferred; the command names
+    # the running server's interpreter behind a PYTHONPATH env prefix.
     python = tmp_path / ".venv" / "Scripts" / "python.exe"
     python.parent.mkdir(parents=True)
     python.write_bytes(b"")
     cmd = hook.manager_watch_command(tmp_path, SESSION)
     assert "\\" not in cmd
     parts = shlex.split(cmd)
-    assert parts[0] == python.as_posix()
+    assert parts[0].startswith("PYTHONPATH=")
+    assert parts[1] == Path(sys.executable).as_posix()
+    assert python.as_posix() not in cmd
     assert parts[parts.index("--repo") + 1] == tmp_path.as_posix()
 
 

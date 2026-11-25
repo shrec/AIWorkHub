@@ -2865,14 +2865,14 @@ MCP_MANAGER_CONTRACT_BANNER = (
 # dynamic part (29 turns), and task hygiene ran on the request path (p50
 # 2.77 s per bootstrap).
 #
-# The contract is now one module constant with one sha, delivered to a
-# verified session once (or whenever it asks with include_contract=true); the
-# identity block carries repository_current, task_health and the dispatcher
-# state so the start sequence is one call; hygiene runs off the request path
-# and its last result is readable here.
+# The contract is now one module constant with one sha, delivered to a verified session once
+# (or whenever it asks with include_contract=true); the identity block carries
+# repository_current, task_health and the dispatcher state so the start sequence is one call;
+# hygiene runs off the request path and its last result is readable here.
 # ---------------------------------------------------------------------------
 MANAGER_BOOTSTRAP_SCHEMA_ID = "aiworkhub.manager_bootstrap.v2"
 MANAGER_CONTRACT_VERSION = "aiworkhub.manager_operating_contract.v2"
+CLAUDE_CALLBACK_CONTRACT = callback_store.CLAUDE_CALLBACK_CONTRACT  # NF-2026-02438
 _CONTRACT_DELIVERY_LOCK = threading.Lock()
 _CONTRACT_DELIVERIES: dict[str, str] = {}
 _CONTRACT_DELIVERY_LIMIT = 256
@@ -3266,7 +3266,7 @@ def _manager_contract() -> dict[str, Any]:
                 "delivers to the repository's current verified Codex manager; "
                 "the originating thread remains immutable audit provenance"
             ),
-            "claude": "call aiworkhub_dispatcher_ensure_started; once per session after bootstrap, start in the background `python -m aiworkhub.manager_callback_watch --repo <repo> --provider <provider> --origin-thread-id <manager session id>`; when it exits, call aiworkhub_claude_callback_wait and immediately ack, then restart the watcher",
+            "claude": CLAUDE_CALLBACK_CONTRACT,
         },
         "rules": [
             "Managers use AIWorkHub manager AI tools before repository discovery, review, rebase, and planning.",

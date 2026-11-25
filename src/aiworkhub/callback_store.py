@@ -31,6 +31,7 @@ from typing import Any, NamedTuple
 from . import db_writer
 from . import task_fsm
 from . import task_store
+from . import tool_guard_hook
 from .route_identity import MANAGER_PROVIDERS
 
 SCHEMA_ID = "aiworkhub.callback_store.v1"
@@ -2280,12 +2281,19 @@ EXPIRED_BACKLOG_REASON = "expired_backlog"
 CALLBACK_BACKLOG_EXPIRED_EVENT = "callback_backlog_expired"
 # NF-2026-02415: the live wake a polling Claude manager is missing.  Surfaced
 # by dispatcher_health as `remediation` beside manager_inbox_no_live_delivery.
+_WATCH_COMMAND = tool_guard_hook.manager_watch_command(None, None, provider=None, timeout=None)
 MANAGER_INBOX_REMEDIATION = (
     "Start the background watcher once per session: "
-    "`python -m aiworkhub.manager_callback_watch --repo <repo> --provider <provider> "
-    "--origin-thread-id <manager session id>`. It exits when a callback is pending "
+    f"`{_WATCH_COMMAND}`. "
+    "It exits when a callback is pending "
     "without claiming it; then call aiworkhub_claude_callback_wait, immediately "
     "aiworkhub_claude_callback_ack, and restart the watcher (wake -> callback_wait -> ack loop)."
+)
+# NF-2026-02438: the bootstrap operating-contract line, from the same one helper.
+CLAUDE_CALLBACK_CONTRACT = (
+    "call aiworkhub_dispatcher_ensure_started; once per session after bootstrap, "
+    f"start in the background `{_WATCH_COMMAND}`; when it exits, call "
+    "aiworkhub_claude_callback_wait and immediately ack, then restart the watcher"
 )
 
 

@@ -2092,30 +2092,92 @@ def _listed(task_ids: list[str]) -> str:
     return shown + (f" (+{extra} more)" if extra > 0 else "")
 
 
-def manager_watch_command(root: str | Path, session_id: str) -> str:
-    """The exact watcher command the Stop guard asks the manager to start."""
+WATCHER_MODULE = "aiworkhub.manager_callback_watch"
 
-    project = Path(root)
-    python = "python"
-    for candidate in (
-        project / ".venv" / "Scripts" / "python.exe",
-        project / ".venv" / "bin" / "python",
-    ):
-        if candidate.is_file():
-            python = candidate.as_posix()
-            break
-    return " ".join(
+
+def _aiworkhub_package_parent(root: str | Path | None) -> str:
+    """The directory that must be on PYTHONPATH for ``import aiworkhub`` to work.
+
+    The running interpreter's own imported package wins (``dirname`` of the
+    package directory).  This module is also copied byte-for-byte into
+    ``.claude/hooks`` where ``aiworkhub`` may not import; there the target
+    repository's ``src`` is the parent when it holds the package, else ``""``.
+    """
+
+    package = sys.modules.get("aiworkhub")
+    paths = list(getattr(package, "__path__", None) or [])
+    if not paths:
+        try:
+            import importlib.util
+
+            spec = importlib.util.find_spec("aiworkhub")
+        except (ImportError, ValueError):
+            spec = None
+        paths = list(getattr(spec, "submodule_search_locations", None) or [])
+    if paths:
+        return Path(paths[0]).resolve().parent.as_posix()
+    if root is not None:
+        source = Path(root) / "src"
+        if (source / "aiworkhub" / "__init__.py").is_file():
+            return source.as_posix()
+    # The extension-launched hook process carries the bundled runtime on its own
+    # PYTHONPATH; a directory there that holds ``aiworkhub/`` is the parent.
+    for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if entry and (Path(entry) / "aiworkhub" / "__init__.py").is_file():
+            return Path(entry).resolve().as_posix()
+    return ""
+
+
+def watcher_launcher(root: str | Path | None = None) -> tuple[list[str], dict[str, str]]:
+    """``(argv_prefix, env)`` that start the callback watcher module.
+
+    Always the running server's interpreter plus a PYTHONPATH naming the
+    package parent: a bare ``python`` is not guaranteed to see ``aiworkhub``.
+    """
+
+    python = Path(sys.executable).as_posix() if sys.executable else "python"
+    parent = _aiworkhub_package_parent(root)
+    return [python, "-m", WATCHER_MODULE], ({"PYTHONPATH": parent} if parent else {})
+
+
+def manager_watch_command(
+    root: str | Path | None,
+    session_id: str | None,
+    *,
+    provider: str | None = "claude",
+    timeout: int | None = 86400,
+) -> str:
+    """The one rendering of every published watcher command.
+
+    ``root``/``session_id``/``provider`` of ``None`` render the unquoted
+    placeholders ``<repo>``, ``<manager session id>`` and ``<provider>``;
+    ``timeout=None`` omits ``--timeout``.  The environment is an ``NAME=value``
+    prefix, which POSIX shells and Git Bash (the Claude Bash tool) both accept.
+    """
+
+    argv, env = watcher_launcher(root)
+    if "PYTHONPATH" not in env:
+        # Never publish a command already known to fail with ModuleNotFoundError.
+        return (
+            f"{WATCHER_MODULE} cannot start: aiworkhub is not importable here; set "
+            "PYTHONPATH to the directory that contains the aiworkhub package "
+            "(the extension's bundled runtime) and start the watcher with that environment"
+        )
+    words = [f"{name}={_shell_arg(value)}" for name, value in env.items()]
+    words.extend(_shell_arg(part) for part in argv)
+    words.extend(
         (
-            _shell_arg(python),
-            "-m aiworkhub.manager_callback_watch",
             "--repo",
-            _shell_arg(project.as_posix()),
-            "--provider claude",
+            "<repo>" if root is None else _shell_arg(Path(root).as_posix()),
+            "--provider",
+            "<provider>" if provider is None else _shell_arg(provider),
             "--origin-thread-id",
-            _shell_arg(session_id),
-            "--timeout 86400",
+            "<manager session id>" if session_id is None else _shell_arg(session_id),
         )
     )
+    if timeout is not None:
+        words.extend(("--timeout", str(int(timeout))))
+    return " ".join(words)
 
 
 def stop_decision(payload: object, root: str | Path) -> str | None:
