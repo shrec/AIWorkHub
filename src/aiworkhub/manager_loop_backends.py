@@ -757,6 +757,8 @@ def _spawn_cli(
         bufsize=1,
         **grouping,
     )
+    if platform_io.is_windows():
+        _bind_turn_job(process)
     if stdin_text is not None:
 
         def _feed() -> None:
@@ -772,6 +774,29 @@ def _spawn_cli(
 
         threading.Thread(target=_feed, daemon=True).start()
     return process
+
+
+_TURN_JOB_ATTR = "_aiworkhub_turn_job"  # the Windows Job handle a turn's CLI carries
+
+
+def _bind_turn_job(process: Any) -> None:
+    """Windows: put the turn's CLI in its own Job that permits breakaway.
+
+    ``_end_process`` then ends the turn with TerminateJobObject, which spares a
+    worker supervisor the turn's MCP server started with
+    ``CREATE_BREAKAWAY_FROM_JOB`` (NF-2026-02423). Any job setup failure leaves
+    no job attached, so teardown keeps the ppid tree kill.
+    """
+    handle = getattr(process, "_handle", None)
+    if handle is None:
+        return
+    # ponytail: the CLI runs outside its job between Popen and
+    # AssignProcessToJobObject (microseconds, before it can start a child);
+    # spawn with CREATE_SUSPENDED and resume after the assign if a child
+    # ever outruns that window.
+    job = platform_io.attach_windows_breakaway_job(int(handle))
+    if job is not None:
+        setattr(process, _TURN_JOB_ATTR, job)
 
 def _decode(raw: str) -> Mapping[str, Any] | None:
     """One stdout line as a JSON object; anything else is skipped, never fatal."""
@@ -811,15 +836,30 @@ def _end_process(process: Any, *, grace_seconds: float | None = None) -> None:
     teardown -- silence window, exit grace, ``close()``, a consumer that
     stopped iterating -- goes through here. ``grace_seconds`` bounds the
     facade's graceful window; ``None`` keeps its default.
+
+    A Windows turn that carries its Job (see ``_bind_turn_job``) is ended by
+    TerminateJobObject instead of the ppid tree kill: a worker supervisor the
+    turn's MCP server started with ``CREATE_BREAKAWAY_FROM_JOB`` has left the
+    job but is still in the ppid tree, and must outlive the turn (NF-2026-02423).
     """
     if process is None:
         return
-    pid = getattr(process, "pid", None)
-    if isinstance(pid, int) and pid > 0:
-        options: dict[str, Any] = {} if grace_seconds is None else {"timeout": grace_seconds}
-        if process.poll() is not None and platform_io.is_windows():
-            options["run"] = _native_tree_kill_only
-        platform_io.terminate_process_tree(pid, **options)
+    job = getattr(process, _TURN_JOB_ATTR, None)
+    if job is not None:
+        # 0 marks the job ended: the handle is closed exactly once, and a later
+        # teardown never falls back to the ppid tree kill that reaches the supervisor.
+        setattr(process, _TURN_JOB_ATTR, 0)
+        if job:
+            if grace_seconds is not None and 0 < grace_seconds < float("inf"):
+                _reap(process, timeout=grace_seconds)  # let the root exit on its own first
+            platform_io.terminate_windows_job(job)
+    else:
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int) and pid > 0:
+            options: dict[str, Any] = {} if grace_seconds is None else {"timeout": grace_seconds}
+            if process.poll() is not None and platform_io.is_windows():
+                options["run"] = _native_tree_kill_only
+            platform_io.terminate_process_tree(pid, **options)
     if process.poll() is None:
         try:
             process.kill()

@@ -741,6 +741,7 @@ class MemoryLimitedRun(NamedTuple):
 
 _JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
 _POSIX_MEMORY_LIMIT_MARKERS = (b"MemoryError", b"Cannot allocate memory")
 
@@ -781,23 +782,7 @@ def _run_under_windows_job(
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         )
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
-    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
-    kernel32.SetInformationJobObject.argtypes = [
-        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
-    ]
-    kernel32.SetInformationJobObject.restype = ctypes.c_int
-    kernel32.QueryInformationJobObject.argtypes = [
-        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
-    ]
-    kernel32.QueryInformationJobObject.restype = ctypes.c_int
-    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
-    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    kernel32.TerminateJobObject.restype = ctypes.c_int
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32 = _windows_job_kernel32()
 
     job = kernel32.CreateJobObjectW(None, None)
     if not job:
@@ -864,6 +849,89 @@ def _run_under_windows_job(
             and int(usage.PeakJobMemoryUsed) > limit
         )
         return MemoryLimitedRun(int(child.returncode), stdout, stderr, limit_hit)
+    finally:
+        kernel32.CloseHandle(job)
+
+
+def _windows_job_kernel32() -> Any:
+    """kernel32 with every Job-object entry point's argtypes/restype declared.
+
+    The one loader the memory-limited run and the breakaway turn job share;
+    tests replace it with a fake to drive the Windows job branch anywhere.
+    """
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+    ]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+    ]
+    kernel32.QueryInformationJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    return kernel32
+
+
+def attach_windows_breakaway_job(process_handle: int) -> int | None:
+    """Put one started Windows process in a fresh Job its children may leave.
+
+    Only ``JOB_OBJECT_LIMIT_BREAKAWAY_OK`` is set: no ``KILL_ON_JOB_CLOSE``
+    (closing the handle never kills anything) and no ``SILENT_BREAKAWAY_OK``
+    (a child leaves the job only when it asks with
+    ``CREATE_BREAKAWAY_FROM_JOB``). Returns the job handle, or ``None`` after
+    any failure of CreateJobObjectW, SetInformationJobObject or
+    AssignProcessToJobObject with the handle already closed, so the caller
+    either owns a fully configured job or has none at all.
+    """
+
+    try:
+        from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    except ImportError:  # direct-file loading used by platform regression tests
+        from windows_job_structures import (  # type: ignore[no-redef]
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        )
+
+    try:
+        kernel32 = _windows_job_kernel32()
+    except (AttributeError, OSError):
+        return None
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    try:
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        if kernel32.SetInformationJobObject(
+            job,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ) and kernel32.AssignProcessToJobObject(job, int(process_handle)):
+            return int(job)
+    except (OSError, ValueError, TypeError, ctypes.ArgumentError):
+        pass
+    kernel32.CloseHandle(job)
+    return None
+
+
+def terminate_windows_job(job: int, *, exit_code: int = 1) -> bool:
+    """End every process still in ``job``, then close its handle exactly once.
+
+    A process that broke away with ``CREATE_BREAKAWAY_FROM_JOB`` is not in the
+    job and is left running. Returns whether TerminateJobObject succeeded.
+    """
+
+    kernel32 = _windows_job_kernel32()
+    try:
+        return bool(kernel32.TerminateJobObject(job, exit_code))
     finally:
         kernel32.CloseHandle(job)
 
