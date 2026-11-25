@@ -3945,7 +3945,7 @@ def _card_input_refusal_reason(
     repo_root: str | Path, card: Mapping[str, Any]
 ) -> str | None:
     """Return the first refusal task creation or launch would raise, or None."""
-    from . import task_scope_contract, worker_workspace
+    from . import quality_evidence, task_scope_contract, worker_workspace
 
     repo = Path(repo_root).resolve()
     try:
@@ -3959,6 +3959,18 @@ def _card_input_refusal_reason(
                 worker_workspace._parse_validation_command_detailed(command)
     except worker_workspace.WorkspaceError as exc:
         return str(exc)
+    # NF-2026-02403: refuse an invalid work_kind or validation_roles before auto-promotion, not at core task creation.
+    try:
+        quality_evidence.normalize_behavioral_contract(
+            card.get("work_kind"),
+            list(card.get("validation") or []),
+            card.get("validation_roles"),
+        )
+    except ValueError as exc:
+        return (
+            f"{exc}: allowed work_kind values {', '.join(quality_evidence.WORK_KINDS)}; "
+            f"allowed validation_roles {', '.join(quality_evidence.VALIDATION_ROLES)}"
+        )
     if str(card.get("topic") or "").strip() == "quality_review":
         return (
             "reserved_topic:quality_review: this topic belongs to reviewer cards "
