@@ -611,11 +611,51 @@ def _member_review_digest(entry: Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
+# NF-2026-02439: a review_ready member says which of the two review_ready wakes
+# it is. ``worker_done`` is the early seed/grace wake; ``review_complete`` is
+# the re-armed wake published after the review aggregate (NF-2026-01220).
+CALLBACK_REVIEW_PHASE_WORKER_DONE = "worker_done"
+CALLBACK_REVIEW_PHASE_COMPLETE = "review_complete"
+
+
+def _member_review_phase(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """``review_phase`` and ``manager_ready`` for one review_ready member.
+
+    ``manager_ready`` is true only when the card's ``manager_ready_receipt`` is
+    strictly bound to the card's current request/claim epoch
+    (``task_store.manager_ready_marker``) AND names this member's request.
+    Anything unreadable or unbound is not ready: never read as complete.
+    """
+    from . import completion_inbox, core, task_store  # lazy: core re-exports this module
+
+    ready = False
+    card, _read_error = completion_inbox._show_one_card(
+        core.show_task, str(entry.get("task_id") or "")
+    )
+    if isinstance(card, Mapping):
+        marker = task_store.manager_ready_marker(card)
+        aggregate = marker.get("manager_ready") if isinstance(marker, Mapping) else None
+        request_id = str(entry.get("request_id") or "")
+        ready = bool(
+            request_id
+            and isinstance(aggregate, Mapping)
+            and str(aggregate.get("target_request_id") or "") == request_id
+        )
+    return {
+        "review_phase": (
+            CALLBACK_REVIEW_PHASE_COMPLETE if ready else CALLBACK_REVIEW_PHASE_WORKER_DONE
+        ),
+        "manager_ready": ready,
+    }
+
+
 def _attach_review_digests(members: list[dict[str, Any]]) -> None:
     """Add ``review_digest`` to each review_ready member; other members untouched.
 
     A builder failure is that member's ``review_digest_error`` only -- it never
-    fails, delays or blocks the wait or the batch's ack/claim.
+    fails, delays or blocks the wait or the batch's ack/claim. The same members
+    get ``review_phase``/``manager_ready`` (NF-2026-02439); a failure there is
+    fail-closed (``worker_done``, not ready) and equally non-fatal.
     """
     for entry in members:
         if entry.get("state") != CALLBACK_REVIEW_DIGEST_STATE:
@@ -627,6 +667,11 @@ def _attach_review_digests(members: list[dict[str, Any]]) -> None:
                 "error_kind": type(exc).__name__,
                 "message": str(exc)[:CALLBACK_REVIEW_DIGEST_ERROR_CHARS],
             }
+        try:
+            entry.update(_member_review_phase(entry))
+        except Exception:  # noqa: BLE001 -- phase is evidence, never a failure
+            entry["review_phase"] = CALLBACK_REVIEW_PHASE_WORKER_DONE
+            entry["manager_ready"] = False
 
 
 def claude_callback_wait(

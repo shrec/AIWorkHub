@@ -2060,6 +2060,10 @@ def review_digest(
         )
         if finding_id and finding_id not in open_finding_ids:
             open_finding_ids.append(finding_id)
+    # NF-2026-02439: stored reviewer reports are evidence of open findings even
+    # when the accept preview was never run; an unevaluated preview with no
+    # stored finding is *unknown*, never zero.
+    open_findings_known = bool(preview_section.get("evaluated")) or bool(open_finding_ids)
     gates = packet.get("gates") or {}
     status = packet.get("status") or {}
     digest: dict[str, Any] = {
@@ -2070,8 +2074,8 @@ def review_digest(
         "blocker_count": len(blockers),
         "quality_gate_passed": gates.get("quality_gate_passed"),
         "validation": _review_digest_validation(gates.get("validation")),
-        "open_finding_ids": open_finding_ids,
-        "open_finding_count": len(open_finding_ids),
+        "open_finding_ids": open_finding_ids if open_findings_known else None,
+        "open_finding_count": len(open_finding_ids) if open_findings_known else None,
         "changed_file_count": int((packet.get("diff") or {}).get("changed_path_count") or 0),
         "risk_tier": _packet_text(decision.get("effective_tier"), 20),
         "hint": REVIEW_DIGEST_HINT,
