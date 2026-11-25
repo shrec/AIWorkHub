@@ -76,8 +76,8 @@ def test_a_node_that_passes_on_the_serial_rerun_is_recorded_not_refused(raised: 
     runner = _Runner(first, [_GREEN])
     evidence = _run(runner)
     assert runner.commands == [
-        "python -m pytest -n 2 tests/test_b.py tests/test_a.py -q",
-        f"python -m pytest -n 0 {_FLAKY} -q",
+        "python -m pytest -n 2 -rfE tests/test_b.py tests/test_a.py -q",
+        f"python -m pytest -n 0 -rfE {_FLAKY} -q",
     ]
     rerun = evidence["neighbour_flaky_rerun"]
     assert rerun["nodes"] == [_FLAKY]
@@ -90,7 +90,7 @@ def test_a_node_red_on_both_runs_refuses_naming_it() -> None:
     other = "tests/test_b.py::test_other"
     runner = _Runner([_red(_FLAKY, other)], [_red(_FLAKY)])
     detail = _refusal(runner)
-    assert runner.commands[1] == f"python -m pytest -n 0 {_FLAKY} {other} -q"
+    assert runner.commands[1] == f"python -m pytest -n 0 -rfE {_FLAKY} {other} -q"
     assert detail["failed"] == [_FLAKY]
     assert detail["tests"] == ["tests/test_b.py", "tests/test_a.py"]
 
@@ -169,8 +169,8 @@ def test_a_node_outside_the_selection_or_needing_quotes_is_not_rerun(node: str) 
 
 def test_the_serial_command_shares_the_neighbour_command_shape() -> None:
     assert neighbours.neighbour_command(["tests/test_a.py"]) == (
-        "python -m pytest -n 1 tests/test_a.py -q"
+        "python -m pytest -n 1 -rfE tests/test_a.py -q"
     )
     assert neighbours.neighbour_command([_FLAKY], serial=True) == (
-        f"python -m pytest -n 0 {_FLAKY} -q"
+        f"python -m pytest -n 0 -rfE {_FLAKY} -q"
     )

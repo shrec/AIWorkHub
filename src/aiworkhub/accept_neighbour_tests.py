@@ -1135,26 +1135,31 @@ def _with_nodes(
 
 
 def neighbour_width(tests: Sequence[str]) -> int:
-    """xdist workers for one neighbour run (NF-2026-02069).
+    """xdist workers for one neighbour run (NF-2026-02069, NF-2026-02434).
 
     ``max(1, min(distinct test files, cores - headroom))`` with
     ``headroom = max(2, cores // 4)`` and ``cores`` sampled now, so the run never
-    takes every core and never starts more workers than it has files.
+    takes every core and never starts more workers than it has files. The result
+    never exceeds ``validation_runner.bounded_xdist_workers()`` for the same host
+    facts, so the memory bound of the worker lane applies here too.
     """
+    from .validation_runner import bounded_xdist_workers
+
     files = {str(test).split("::", 1)[0] for test in tests}
     cores = os.cpu_count() or 1
     headroom = max(2, cores // 4)
-    return max(1, min(len(files), cores - headroom))
+    return max(1, min(len(files), cores - headroom, bounded_xdist_workers()))
 
 
 def neighbour_command(tests: Sequence[str], *, serial: bool = False) -> str:
     """One ``python -m pytest`` over ``tests`` with an explicit ``-n`` width.
 
     The width is always stated, so the repository's ``-n auto`` addopts never
-    decides it; ``serial`` is ``-n 0``.
+    decides it; ``serial`` is ``-n 0``. ``-rfE`` keeps the FAILED/ERROR summary
+    lines even when a consumer ``addopts`` sets a narrower ``-r`` (NF-2026-02435).
     """
     width = 0 if serial else neighbour_width(tests)
-    return f"python -m pytest -n {width} " + " ".join(tests) + " -q"
+    return f"python -m pytest -n {width} -rfE " + " ".join(tests) + " -q"
 
 
 def neighbour_authority(card: Mapping[str, Any], command: str) -> dict[str, Any]:
@@ -1168,12 +1173,60 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE.sub("", text)
 
 
+def _digest_entries(row: Mapping[str, Any]) -> tuple[list[tuple[str, str]], int]:
+    """``(test, short-summary line)`` pairs and the omitted count of a row's digest.
+
+    The line mirrors the pytest short-summary format the tail regex captures:
+    ``FAILED|ERROR <node>[ - <message>]``, from the digest item's own kind/message.
+    """
+    digest = row.get("pytest_failure_digest")
+    if not isinstance(digest, Mapping):
+        return [], 0
+    failures = digest.get("failures")
+    if not isinstance(failures, (list, tuple)):
+        return [], 0
+    omitted = digest.get("omitted")
+    omitted_count = omitted if isinstance(omitted, int) and omitted > 0 else 0
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in failures:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("test")
+        if not isinstance(name, str) or not name.strip() or name in seen:
+            continue
+        seen.add(name)
+        kind = "ERROR" if str(item.get("kind") or "").lower() == "error" else "FAILED"
+        message = item.get("message")
+        line = f"{kind} {name}"
+        if isinstance(message, str) and message.strip():
+            line = f"{line} - {message.strip()}"
+        entries.append((name, line))
+    return entries, omitted_count
+
+
 def _failed_tests(
     rows: Iterable[Mapping[str, Any]], limit: int = MAX_REPORTED_FAILURES
 ) -> tuple[list[str], str]:
+    """Failed test names: the digest first, the tail regex as fallback and top-up.
+
+    The 4 KB output tails can miss the summary lines of a large run, while every
+    row carries a digest parsed from the full stdout. A row whose digest names no
+    test, or whose digest dropped some (``omitted > 0``), is also scanned with
+    ``_PYTEST_FAILURE``; new names are merged deduped. At most ``limit`` names
+    are returned.
+    """
     failed: list[str] = []
     first_line = ""
     for row in rows:
+        entries, omitted = _digest_entries(row)
+        for node, line in entries:
+            if not first_line:
+                first_line = line
+            if node not in failed and len(failed) < limit:
+                failed.append(node)
+        if entries and not omitted:
+            continue
         for key in ("stdout_tail", "stderr_tail"):
             raw = row.get(key)
             if not isinstance(raw, str):
@@ -1183,7 +1236,7 @@ def _failed_tests(
                 node = match.group(1)
                 if not first_line:
                     first_line = text[match.start() :].split("\n", 1)[0]
-                if node not in failed:
+                if node not in failed and len(failed) < limit:
                     failed.append(node)
     return failed[:limit], first_line[:_FIRST_FAILURE_CHARS]
 

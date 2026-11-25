@@ -17,9 +17,9 @@ def _host(monkeypatch, cores: int, memory: int | None) -> None:
     monkeypatch.setattr(platform_io, "available_memory_bytes", lambda *a, **k: memory)
 
 
-def test_headroom_matches_host_stage_and_budget_is_one_gib():
+def test_headroom_matches_host_stage_and_budget_is_one_and_a_half_gib():
     assert vr.XDIST_HEADROOM_FRACTION == host_validation_stage.HEADROOM_FRACTION
-    assert vr.XDIST_WORKER_MEMORY_BUDGET_BYTES == GIB
+    assert vr.XDIST_WORKER_MEMORY_BUDGET_BYTES == GIB * 3 // 2
 
 
 @pytest.mark.parametrize(
@@ -73,8 +73,8 @@ def test_console_script_spelling_is_also_capped(monkeypatch):
 
 
 def test_low_memory_host_caps_to_memory_bound(monkeypatch):
-    # The field host: 16 cores but only ~2.5 GiB free -> 2 workers.
-    _host(monkeypatch, 16, int(2.5 * GIB))
+    # 16 cores but only 4 GiB free: 25% reserve leaves 3 GiB = 2 workers of 1.5 GiB.
+    _host(monkeypatch, 16, 4 * GIB)
     assert ww._normalize_pytest_validation_argv(PY + ["-n", "12"]) == PY + ["-n", "2"]
     assert vr.bounded_xdist_workers() == 2
     # 370 MB free: still at least one worker, never zero.
@@ -94,7 +94,7 @@ def test_unmeasured_memory_falls_back_to_core_bound(monkeypatch):
 def test_bound_is_sampled_at_call_time(monkeypatch):
     _host(monkeypatch, 16, 64 * GIB)
     assert vr.bounded_xdist_workers() == 12
-    _host(monkeypatch, 16, 3 * GIB)
+    _host(monkeypatch, 16, 6 * GIB)
     assert vr.bounded_xdist_workers() == 3
 
 
@@ -127,7 +127,7 @@ def test_bundled_zero_and_unrelated_bundles_untouched(monkeypatch):
 def test_xdist_env_equals_bound(monkeypatch):
     _host(monkeypatch, 16, 64 * GIB)
     assert vr.xdist_env() == {"PYTEST_XDIST_AUTO_NUM_WORKERS": "12"}
-    _host(monkeypatch, 16, int(2.5 * GIB))
+    _host(monkeypatch, 16, 4 * GIB)
     assert vr.xdist_env() == {
         "PYTEST_XDIST_AUTO_NUM_WORKERS": str(vr.bounded_xdist_workers())
     }

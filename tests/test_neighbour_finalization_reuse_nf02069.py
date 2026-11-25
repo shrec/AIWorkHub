@@ -27,7 +27,13 @@ _RED = {"returncode": 1, "timed_out": False, "stdout_tail": "boom"}
 
 
 def _cores(monkeypatch: pytest.MonkeyPatch, count: int | None) -> None:
+    from aiworkhub import parallelism, platform_io
+
     monkeypatch.setattr(neighbours.os, "cpu_count", lambda: count)
+    # NF-2026-02434: the width is also bounded by the host's cores and memory;
+    # pin both so the result does not depend on the machine running the test.
+    monkeypatch.setattr(parallelism, "get_cpu_capacity", lambda: count or 1)
+    monkeypatch.setattr(platform_io, "available_memory_bytes", lambda *a, **k: 1 << 40)
 
 
 # --- the explicit width ---------------------------------------------------------------
@@ -52,7 +58,7 @@ def test_width_is_cores_minus_headroom_capped_by_files(
     tests = _files(files)
     assert neighbours.neighbour_width(tests) == width
     command = neighbours.neighbour_command(tests)
-    assert command == f"python -m pytest -n {width} " + " ".join(tests) + " -q"
+    assert command == f"python -m pytest -n {width} -rfE " + " ".join(tests) + " -q"
     assert command.count(" -n ") == 1
 
 
@@ -73,7 +79,7 @@ def test_cores_are_sampled_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None
 def test_serial_keeps_n_zero_and_no_second_width(monkeypatch: pytest.MonkeyPatch) -> None:
     _cores(monkeypatch, 16)
     command = neighbours.neighbour_command(list(_TESTS), serial=True)
-    assert command == "python -m pytest -n 0 tests/test_b.py tests/test_a.py -q"
+    assert command == "python -m pytest -n 0 -rfE tests/test_b.py tests/test_a.py -q"
     assert command.count("-n ") == 1
 
 
@@ -150,7 +156,7 @@ def test_green_finalization_records_neighbour_evidence_in_the_snapshot(
     evidence = record["neighbour_tests"]
     assert evidence["passed"] is True
     assert evidence["selected"] == list(_TESTS)
-    assert evidence["command"] == "python -m pytest -n 2 tests/test_b.py tests/test_a.py -q"
+    assert evidence["command"] == "python -m pytest -n 2 -rfE tests/test_b.py tests/test_a.py -q"
     assert isinstance(evidence["duration_seconds"], float)
     assert "neighbour_flaky_rerun" not in evidence
     # Selected against the canonical repo, run once in the same snapshot, same runner.

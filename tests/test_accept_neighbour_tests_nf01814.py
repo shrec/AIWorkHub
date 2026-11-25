@@ -324,12 +324,17 @@ _SELECTION = neighbours.NeighbourSelection(
     production_paths=(ENGINE,), related_count=2,
 )
 # NF-2026-02069: the width is explicit; 16 cores leave 12, so two files run -n 2.
-_COMMAND = "python -m pytest -n 2 tests/test_b.py tests/test_a.py -q"
+_COMMAND = "python -m pytest -n 2 -rfE tests/test_b.py tests/test_a.py -q"
 
 
 @pytest.fixture(autouse=True)
 def _sixteen_cores(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aiworkhub import parallelism, platform_io
+
     monkeypatch.setattr(neighbours.os, "cpu_count", lambda: 16)
+    # NF-2026-02434: pin the host facts the memory bound reads.
+    monkeypatch.setattr(parallelism, "get_cpu_capacity", lambda: 16)
+    monkeypatch.setattr(platform_io, "available_memory_bytes", lambda *a, **k: 1 << 40)
 
 
 class _Runner:

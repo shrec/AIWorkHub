@@ -1133,9 +1133,14 @@ def _pytest_spawns_subprocess(args: list[str]) -> bool:
 
 # NF-2026-02369: field 0.13.9 GeoAI Linux -- ``pytest -n 12`` through
 # worker_validation_run spawned 14 xdist processes at ~1 GB RSS each and drove
-# the host into swap (370 MB free at 04:25 UTC). One xdist worker is budgeted at
-# that measured ~1 GiB so the memory bound keeps the run out of swap.
-XDIST_WORKER_MEMORY_BUDGET_BYTES = 1 << 30
+# the host into swap (370 MB free at 04:25 UTC). NF-2026-02434: a 0.13.14 Linux
+# host measured ~1.4 GB per worker (12 x 1.4 GB = 17 GB), so one xdist worker is
+# budgeted at 1.5 GiB and a reserve of the available memory is never handed out.
+XDIST_WORKER_MEMORY_BUDGET_BYTES = 3 << 29
+# Overrides the per-worker budget; a positive integer, anything else is ignored.
+XDIST_WORKER_MEMORY_ENV = "AIWORKHUB_XDIST_WORKER_MEMORY_BYTES"
+# Fraction of the available memory kept out of the worker budget.
+XDIST_MEMORY_RESERVE_FRACTION = 0.25
 # Same value and semantics as ``host_validation_stage.HEADROOM_FRACTION`` (that
 # module cannot be imported here or from worker_workspace without a cycle);
 # ``tests/test_validation_xdist_cap_nf02369.py`` asserts the two stay equal.
@@ -1143,13 +1148,29 @@ XDIST_HEADROOM_FRACTION = 0.25
 _XDIST_AUTO_VALUES = frozenset({"auto", "logical"})
 
 
+def xdist_worker_memory_budget_bytes() -> int:
+    """Per-worker memory budget: the env override when a positive int, else the default."""
+
+    raw = os.environ.get(XDIST_WORKER_MEMORY_ENV)
+    if raw is not None:
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            return XDIST_WORKER_MEMORY_BUDGET_BYTES
+        if value > 0:
+            return value
+    return XDIST_WORKER_MEMORY_BUDGET_BYTES
+
+
 def bounded_xdist_workers(requested: int | None = None) -> int:
     """Return the xdist worker ceiling for this host, sampled at call time.
 
-    ``bound = max(1, min(cores - headroom, available_memory // budget))`` where
+    ``bound = max(1, min(cores - headroom, usable_memory // budget))`` where
     cores come from ``parallelism.get_cpu_capacity()``, headroom is
-    ``ceil(cores * XDIST_HEADROOM_FRACTION)`` and memory from
-    ``platform_io.available_memory_bytes()``. Unmeasured memory (``None``) falls
+    ``ceil(cores * XDIST_HEADROOM_FRACTION)``, ``usable_memory`` is
+    ``platform_io.available_memory_bytes()`` minus an
+    ``XDIST_MEMORY_RESERVE_FRACTION`` reserve and ``budget`` is
+    ``xdist_worker_memory_budget_bytes()``. Unmeasured memory (``None``) falls
     back to the core bound alone. A positive ``requested`` is never raised.
     """
 
@@ -1161,7 +1182,8 @@ def bounded_xdist_workers(requested: int | None = None) -> int:
     bound = cores - math.ceil(cores * XDIST_HEADROOM_FRACTION)
     available = platform_io.available_memory_bytes()
     if available is not None:
-        bound = min(bound, int(available) // XDIST_WORKER_MEMORY_BUDGET_BYTES)
+        usable = int(int(available) * (1.0 - XDIST_MEMORY_RESERVE_FRACTION))
+        bound = min(bound, usable // xdist_worker_memory_budget_bytes())
     bound = max(1, bound)
     if requested is not None and requested > 0:
         return min(requested, bound)
