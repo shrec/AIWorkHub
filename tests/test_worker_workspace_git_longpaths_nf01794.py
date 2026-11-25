@@ -35,6 +35,9 @@ def test_git_environment_still_scrubs_inherited_git_variables(
     monkeypatch.setenv("GIT_CONFIG_KEY_2", "core.hooksPath")
     monkeypatch.setenv("GIT_CONFIG_VALUE_2", "/tmp/hooks")
     monkeypatch.setenv("AIWORKHUB_NF01794_KEEP", "kept")
+    # NF-2026-02428: the ceiling is the one inherited GIT_* variable kept, so
+    # the test pins it instead of depending on the runner's environment.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", "/ceiling")
 
     env = worker_workspace._git_environment()
 
@@ -43,7 +46,9 @@ def test_git_environment_still_scrubs_inherited_git_variables(
     assert "GIT_CONFIG_KEY_2" not in env
     assert "GIT_CONFIG_VALUE_2" not in env
     assert env["AIWORKHUB_NF01794_KEEP"] == "kept"
+    assert env["GIT_CEILING_DIRECTORIES"] == "/ceiling"
     assert sorted(key for key in env if key.upper().startswith("GIT_")) == [
+        "GIT_CEILING_DIRECTORIES",
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_KEY_0",
         "GIT_CONFIG_VALUE_0",

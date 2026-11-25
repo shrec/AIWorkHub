@@ -418,7 +418,7 @@ def test_memory_denial_precedes_launch_side_effects(monkeypatch, tmp_path: Path)
     )
     deferred: list[tuple[str, str, str]] = []
 
-    def _defer(repo, task_id, runner, reason):
+    def _defer(repo, task_id, runner, reason, request_id=None):
         deferred.append((task_id, runner, reason))
         return True, "pending"
 
