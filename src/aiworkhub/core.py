@@ -5014,9 +5014,9 @@ def create_task(
         if _valid_origin_thread_id(candidate_origin_thread_id)
         else ""
     )
-    chat_origin = _manager_chat_session_origin()
-    # Keep the Codex/Claude thread when one was observed. Manager Chat is a
-    # second destination, not a replacement, until that mux is removed.
+    chat_origin = "" if uuid_origin else _manager_chat_session_origin()
+    # A Codex/Claude thread owns its card's callbacks; the seated Manager Chat
+    # session is stamped only when no such thread was observed.
     origin_thread_id = uuid_origin or chat_origin
     provider = str(identity["provider"])
     route_state = str(identity.get("route_state") or "")

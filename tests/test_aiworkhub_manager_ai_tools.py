@@ -1971,7 +1971,7 @@ def test_task_create_uses_active_manager_chat_session_as_callback_origin(tmp_pat
 
 
 @pytest.mark.live_manager_chat_seat
-def test_task_create_keeps_codex_thread_and_manager_chat_session(tmp_path, monkeypatch):
+def test_task_create_keeps_codex_thread_and_stamps_no_manager_chat_session(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     assert task_store.initialize_repository(root)["ok"]
@@ -1993,11 +1993,11 @@ def test_task_create_keeps_codex_thread_and_manager_chat_session(tmp_path, monke
 
     result = core.create_task(
         task_id="TASK_BOTH_CALLBACK_ROUTES",
-        title="Both callback seats",
+        title="Codex thread owns callbacks",
         runner="manager_chat_canary",
         topic="task_mcp",
-        objective="Keep the Codex thread and also stamp the manager chat session.",
-        acceptance=["Card stores both destinations."],
+        objective="Keep the Codex thread and do not stamp the seated manager chat session.",
+        acceptance=["Card stores only the Codex thread destination."],
         allowed_writes=[],
         read_only=True,
         callback_required=True,
@@ -2006,7 +2006,8 @@ def test_task_create_keeps_codex_thread_and_manager_chat_session(tmp_path, monke
     assert result["ok"] is True
     card = json.loads(result["stdout"])
     assert card["origin_thread_id"] == thread_id
-    assert card["manager_chat_session_id"] == session_id
+    # The creating Codex thread owns the callback; the seated chat is not stamped.
+    assert card["manager_chat_session_id"] == ""
     assert card["callback_supported"] is True
     assert card["callback_supported"] is True
 

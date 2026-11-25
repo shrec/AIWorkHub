@@ -716,20 +716,34 @@ def _active_manager_chat_session_from_conn(conn: sqlite3.Connection) -> str:
     return session_id
 
 
+def _is_uuid_origin(value: str) -> bool:
+    """Whether ``value`` is a Codex/Claude thread UUID rather than an ``mls-`` session."""
+
+    try:
+        uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return True
+
+
 def _card_manager_chat_owner(card: Any, row_origin: Any = "") -> str:
     """The Manager Chat session that launched one card, else ''.
 
-    Its stamped ``manager_chat_session_id`` wins; otherwise an ``mls-`` origin
-    (the card's own, then the task row's). Window ids and episode ids are not
+    A card whose origin (its own, then the task row's) is a Codex/Claude UUID
+    belongs to that creating session: no stamp moves it to Manager Chat.
+    Otherwise its stamped ``manager_chat_session_id`` wins over an ``mls-`` or
+    empty origin; else an ``mls-`` origin. Window ids and episode ids are not
     sessions.
     """
 
     if not isinstance(card, dict):
         card = {}
+    origin = str(card.get("origin_thread_id") or row_origin or "").strip()
+    if origin and _is_uuid_origin(origin):
+        return ""
     stamped = str(card.get("manager_chat_session_id") or "").strip()
     if _MANAGER_CHAT_SESSION_RE.fullmatch(stamped):
         return stamped
-    origin = str(card.get("origin_thread_id") or row_origin or "").strip()
     if _MANAGER_CHAT_SESSION_RE.fullmatch(origin):
         return origin
     return ""

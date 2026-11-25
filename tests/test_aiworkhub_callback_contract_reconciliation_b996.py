@@ -127,7 +127,7 @@ def test_reconciliation_unknown_review_substatus_falls_back_without_weakening_di
         conn.close()
 
 
-def test_a_chat_launched_card_is_filed_only_on_its_launching_session(tmp_path: Path) -> None:
+def test_a_codex_created_card_stays_on_its_creator_despite_a_chat_stamp(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     db_path = root / ".aiworkhub" / "tasking" / "task_queue.sqlite"
     session_id = "mls-" + "ab" * 16
@@ -170,7 +170,7 @@ def test_a_chat_launched_card_is_filed_only_on_its_launching_session(tmp_path: P
             ("TASK_DUAL_CALLBACK",),
         ).fetchall()
         assert [(row["provider"], row["origin_thread_id"], row["state"]) for row in rows] == [
-            ("manager_chat", session_id, "pending"),
+            ("codex", card["origin_thread_id"], "pending"),
         ]
 
         chat_only = "mls-" + "ef" * 16
@@ -182,17 +182,12 @@ def test_a_chat_launched_card_is_filed_only_on_its_launching_session(tmp_path: P
             provider="codex",
             episode_id="2",
         ) is True
-        retagged = conn.execute(
+        explicit = conn.execute(
             "SELECT provider, origin_thread_id FROM callback_outbox "
             "WHERE task_id=? AND episode_id='2'",
             ("TASK_DUAL_CALLBACK",),
         ).fetchone()
-        assert retagged["provider"] == "manager_chat"
-        assert retagged["origin_thread_id"] == session_id
-        no_codex = conn.execute(
-            "SELECT state FROM callback_outbox WHERE provider='codex' AND task_id=?",
-            ("TASK_DUAL_CALLBACK",),
-        ).fetchone()
-        assert no_codex is None
+        # An explicit mls- origin still files on that chat; the stamp no longer pulls it over.
+        assert (explicit["provider"], explicit["origin_thread_id"]) == ("manager_chat", chat_only)
     finally:
         conn.close()
