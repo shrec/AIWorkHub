@@ -358,6 +358,14 @@ def test_request_ids_bounds_are_refused_by_name(monkeypatch):
     )
 
 
+def test_review_packet_empty_request_ids_beside_key_is_absent(monkeypatch):
+    _patch(monkeypatch)
+    bare = server.aiworkhub_review_packet("R-A")
+    assert server.aiworkhub_review_packet("R-A", request_ids=[]) == bare
+    by_task = server.aiworkhub_review_packet(task_id="T-A")
+    assert server.aiworkhub_review_packet(task_id="T-A", request_ids=[]) == by_task
+
+
 def test_request_ids_is_documented_in_the_tool_args_block():
     doc = inspect.getdoc(server.aiworkhub_review_packet) or ""
     args_block = doc.split("Args:", 1)[1]

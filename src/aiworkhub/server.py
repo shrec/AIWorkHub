@@ -3646,7 +3646,14 @@ def aiworkhub_manager_loop_rotate(reason: str) -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_manager_loop_status() -> dict[str, Any]:
-    """MANAGER READ: the active session, whether a turn is running, queued owner sends, and the last turn's outcome."""
+    """MANAGER READ: the active session, whether a turn is running, queued owner sends, and the last turn's outcome.
+
+    ``session`` is the Manager Chat session that this MCP server process's own
+    orchestrator holds. It is null when the active session runs in another
+    process, such as the VS Code panel's.
+    ``sessions`` is the repository-wide session catalog across processes. Read
+    it, or aiworkhub_manager_loop_events, to see a panel session.
+    """
 
     root, refusal = _manager_loop_repo_root()
     if refusal is not None:
@@ -7547,6 +7554,9 @@ def aiworkhub_review_packet(
         request_ids: Up to 8 review_ready request ids to read in one call instead of request_id; returns {packets, per_packet_max_bytes}, each packet built exactly like a single call with the split budget, and a member that fails carries its own error without failing the batch.
     """
 
+    # NF-2026-02426: MCP clients send [] for an omitted optional array; treat it as absent.
+    if request_ids == [] and (request_id or task_id):
+        request_ids = None
     if request_ids is not None:
         if request_id or task_id:
             return {
