@@ -24,6 +24,7 @@ from . import (
     core,
     evidence_levels,
     feature_settings,
+    rework_delta_artifact,
     sqlite_readonly,
     task_store,
 )
@@ -213,6 +214,69 @@ def _canonical_acceptance_reference(card: dict[str, Any], request_id: str) -> st
     if not record.reference:
         raise LearningCommitStoreError("learning_commit_acceptance_reference_missing")
     return cast(str, record.reference)
+
+
+def _canonical_rejection_reference(
+    repo: str | Path, card: dict[str, Any], request_id: str
+) -> str:
+    """The canonical ``file:`` id of the evidence a rejection retained.
+
+    Mirrors :func:`_canonical_acceptance_reference` for ``decision=rejected``
+    (NF-2026-02442). ``core.reject_review`` pins, in the same transition that
+    produced the rejection, the sealed rework-delta artifact of the candidate
+    it judged under ``rework_predecessor.delta_artifact`` (path + sha256). That
+    artifact is the reject decision's retained evidence for this request, and
+    it is never model-authored. The reference is derived only when the pin is
+    bound to this exact request and
+    :func:`rework_delta_artifact.has_verified_rework_delta` (the single owner of
+    the path, digest, request, task and claim-epoch checks) accepts it, and the
+    artifact lies inside the repository; every other state raises a named
+    ``learning_commit_rejection_evidence_*`` reason and nothing is guessed, so
+    the evidence requirement stays mandatory.
+    """
+    predecessor = card.get("rework_predecessor")
+    if (
+        not isinstance(predecessor, dict)
+        or str(predecessor.get("request_id") or "") != request_id
+    ):
+        raise LearningCommitStoreError(
+            "learning_commit_rejection_evidence_missing:no retained evidence is "
+            "pinned for this request; supply an explicit file:/http(s): evidence id"
+        )
+    artifact = predecessor.get("delta_artifact")
+    if not isinstance(artifact, dict):
+        raise LearningCommitStoreError(
+            "learning_commit_rejection_evidence_missing:the rejection retained no "
+            "sealed delta artifact; supply an explicit file:/http(s): evidence id"
+        )
+    raw_path = str(artifact.get("path") or "").strip()
+    if not raw_path:
+        raise LearningCommitStoreError("learning_commit_rejection_evidence_invalid")
+    repo_resolved = Path(repo).resolve(strict=False)
+    # A repo-relative path is anchored at the repository, never the process cwd.
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = repo_resolved / candidate
+    artifact_resolved = candidate.resolve(strict=False)
+    try:
+        relative = artifact_resolved.relative_to(repo_resolved)
+    except ValueError as exc:
+        raise LearningCommitStoreError(
+            "learning_commit_rejection_evidence_outside_repository"
+        ) from exc
+    if not artifact_resolved.is_file():
+        raise LearningCommitStoreError(
+            "learning_commit_rejection_evidence_missing:the retained artifact "
+            "no longer exists; supply an explicit file:/http(s): evidence id"
+        )
+    if not rework_delta_artifact.has_verified_rework_delta(
+        predecessor, authority_repo=repo_resolved
+    ):
+        raise LearningCommitStoreError(
+            "learning_commit_rejection_evidence_tampered:the retained artifact "
+            "failed sealed rework-delta verification"
+        )
+    return f"file:{relative.as_posix()}"
 
 
 def _landed_manager_rejection(card: dict[str, Any], request_id: str) -> bool:
@@ -1469,11 +1533,22 @@ def resolve_short_form(
     if not decision:
         raise LearningCommitStoreError("learning_commit_request_identity_mismatch")
     evidence_reference = ""
+    evidence_refusal = ""
     if decision == "accepted":
         # Raises with the exact reason when the acceptance seal is missing or
         # not FIXED_AND_VERIFIED, which is the same refusal commit_learning
         # would produce -- surfaced before the manager writes a lesson.
         evidence_reference = _canonical_acceptance_reference(card, request)
+    elif decision == "rejected":
+        # NF-2026-02442: a rejection retains its own evidence (the sealed
+        # rework-delta artifact reject_review pinned for this request), so the
+        # lesson derives a canonical file: id from it instead of needing a
+        # hand-supplied one. Absent or unusable evidence is NOT an error here
+        # (a caller-supplied id may still satisfy the gate); it is named.
+        try:
+            evidence_reference = _canonical_rejection_reference(repo_path, card, request)
+        except LearningCommitStoreError as exc:
+            evidence_refusal = str(exc)
     changed_paths, paths_source = _decision_changed_paths(card, decision)
     owed = commit_owed(
         task_id=task,
@@ -1482,6 +1557,15 @@ def resolve_short_form(
         changed_paths=changed_paths,
         evidence_reference=evidence_reference,
     )
+    if (
+        decision != "accepted"
+        and evidence_reference
+        and not owed["evidence_ids"]
+        and not evidence_refusal
+    ):
+        # commit_owed drops an id the store would refuse; name that instead of
+        # handing back an empty list with no cause.
+        evidence_refusal = "learning_commit_rejection_evidence_invalid"
     if repo_area is not None:
         # A supplied area is honored after normalization, never silently
         # re-derived from the decision's evidence tiers.
@@ -1493,13 +1577,18 @@ def resolve_short_form(
             f"the {decision} card records no changed paths and declares no write "
             "scope; supply repo_area explicitly"
         )
-    return {
+    resolved: dict[str, Any] = {
         **owed,
         "resolved_from": "task_card_decision_event",
         "repo_area_source": paths_source,
         "repository_id": readiness.repo_id,
         "allowed_evidence_id_schemes": list(ALLOWED_EVIDENCE_ID_SCHEMES),
     }
+    if evidence_refusal:
+        # Today's refusal, now with its cause named: the evidence requirement
+        # stays mandatory, so the commit will not promote without a supplied id.
+        resolved["evidence_reference_refusal"] = evidence_refusal
+    return resolved
 
 
 __all__ = [
