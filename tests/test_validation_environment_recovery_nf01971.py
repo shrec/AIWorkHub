@@ -158,10 +158,12 @@ def test_the_lane_entry_is_named_and_never_reached_by_the_candidate_text_scan():
     assert entry.name == _LANE
     assert entry.candidate_forgeable is False
     assert entry.evidence_source == validation_runner.LANE_INFRASTRUCTURE_EVIDENCE_SOURCE
+    # NF-2026-02096's runner-measured timeout entry is the only other one.
+    measured = {entry.name, validation_runner.VALIDATION_TIMEOUT_SIGNATURE}
     assert all(
         signature.candidate_forgeable
         for signature in validation_runner.VALIDATION_ENVIRONMENT_SIGNATURES
-        if signature is not entry
+        if signature.name not in measured
     )
     # Candidate output that merely prints the class names nothing: only the
     # lane-set ``failure_class`` field counts.

@@ -13203,9 +13203,15 @@ def run_validations(
         )
         if batch_short_tmp is not None:
             tmp_env_value = str(batch_short_tmp)
-        from . import toolchain_authority as _ta
+        from . import toolchain_authority as _ta, validation_runner
         version_probes = _ta.ExecutableProbeCache()  # one --version probe per path per run
-        for command in rows:
+        for index, command in enumerate(rows):
+            if results and results[-1].get("timed_out") is True:  # NF-2026-02096: never
+                last = results[-1]  # run a later step on the half-built tree it left
+                results.extend(validation_runner.skipped_after_timeout_rows(
+                    rows[index:], timed_out_command=str(last.get("command")), carried=last
+                ))
+                break
             if command.startswith("lane:"):
                 from .build_lane import run_lane_validation
                 results.append(run_lane_validation(workspace, command))
@@ -13604,16 +13610,8 @@ def run_validations(
                         pass_fds=(broker_write_fd,) if broker_write_fd is not None else (),
                     )
             except subprocess.TimeoutExpired as exc:
-                stdout = (
-                    exc.stdout.decode("utf-8", errors="replace")
-                    if isinstance(exc.stdout, bytes)
-                    else str(exc.stdout or "")
-                )
-                stderr = (
-                    exc.stderr.decode("utf-8", errors="replace")
-                    if isinstance(exc.stderr, bytes)
-                    else str(exc.stderr or "")
-                )
+                stdout = validation_runner.decode_timeout_stream(exc.stdout)
+                stderr = validation_runner.decode_timeout_stream(exc.stderr)
                 timeout_record = {
                         **base_record,
                         "returncode": None,

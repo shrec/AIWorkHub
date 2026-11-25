@@ -203,9 +203,10 @@ def test_a_winerror_1314_row_is_classified_validation_environment_with_the_plan(
 def test_the_signature_table_is_closed_versioned_and_the_match_is_frozen():
     signatures = validation_runner.VALIDATION_ENVIRONMENT_SIGNATURES
     assert isinstance(signatures, tuple)
-    # NF-2026-01971 adds the one lane-measured, not candidate-forgeable entry.
+    # NF-2026-01971 adds the one lane-measured, not candidate-forgeable entry;
+    # NF-2026-02096 the runner-measured validation-timeout entry.
     assert [signature.name for signature in signatures] == [
-        _SYMLINK, _SEMLOCK, "lane_infrastructure"
+        _SYMLINK, _SEMLOCK, "lane_infrastructure", "validation_command_timed_out"
     ]
     assert validation_runner.VALIDATION_ENVIRONMENT_SIGNATURES_VERSION == (
         "aiworkhub.validation_environment_signatures.v1"
@@ -394,10 +395,17 @@ def test_an_uncut_summary_that_lists_fewer_failures_than_it_counts_fails_closed(
     assert _disposition([row]) is None
 
 
-def test_every_failing_row_must_match_and_a_timed_out_row_never_does():
+def test_every_failing_row_must_match_and_a_timed_out_row_never_carries_a_text_signature():
     assert _disposition([_winerror_row(), _typeerror_row()]) is None
     timed_out = {**_winerror_row(), "returncode": None, "timed_out": True}
-    assert _disposition([timed_out]) is None
+    # NF-2026-02096: a timed-out row carries only the runner-measured timeout
+    # signature, never the candidate-text one its output happens to contain.
+    disposition = _disposition([timed_out])
+    assert disposition is not None
+    assert disposition["validation_environment_recovery"]["signature"] == (
+        validation_runner.VALIDATION_TIMEOUT_SIGNATURE
+    )
+    assert _disposition([timed_out, _typeerror_row()]) is None
     assert _disposition([{**_winerror_row(), "returncode": 0}]) is None
 
 

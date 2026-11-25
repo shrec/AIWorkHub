@@ -1647,6 +1647,11 @@ VALIDATION_ENVIRONMENT_EVIDENCE_SOURCE = "candidate_validation_output"
 # row's ``failure_class`` (``build_lane._row``).
 LANE_INFRASTRUCTURE_SIGNATURE = "lane_infrastructure"
 LANE_INFRASTRUCTURE_EVIDENCE_SOURCE = "validation_lane_measurement"
+# NF-2026-02096: the runner itself killed a declared command at its deadline
+# (``timed_out``) and reported every later declared step ``skipped_after_timeout``
+# instead of running it on a half-built tree. Runner-measured, never candidate text.
+VALIDATION_TIMEOUT_SIGNATURE = "validation_command_timed_out"
+SKIPPED_AFTER_TIMEOUT_REASON_PREFIX = "previous_command_timed_out:"
 
 
 @dataclass(frozen=True)
@@ -1717,6 +1722,19 @@ VALIDATION_ENVIRONMENT_SIGNATURES: tuple[ValidationEnvironmentSignature, ...] = 
         literals=(),
         backends=(),
         lane_change_reason="validation_lane_infrastructure_failure_measured",
+        evidence_source=LANE_INFRASTRUCTURE_EVIDENCE_SOURCE,
+        candidate_forgeable=False,
+    ),
+    # NF-2026-02096: a row the runner killed at its per-command deadline, or a
+    # later declared step it therefore never launched. Like the lane entry it has
+    # no literal and no backend: only the runner-set ``timed_out`` /
+    # ``skipped_after_timeout`` fields yield it, in
+    # ``match_validation_environment_signature``.
+    ValidationEnvironmentSignature(
+        name=VALIDATION_TIMEOUT_SIGNATURE,
+        literals=(),
+        backends=(),
+        lane_change_reason="validation_command_deadline_exceeded_measured",
         evidence_source=LANE_INFRASTRUCTURE_EVIDENCE_SOURCE,
         candidate_forgeable=False,
     ),
@@ -2052,6 +2070,62 @@ def _required_outputs_recorded(required_outputs: Any, records: Any) -> bool:
     )
 
 
+def decode_timeout_stream(stream: Any) -> str:
+    """A ``subprocess.TimeoutExpired`` partial stream (bytes, str or None) as text."""
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", errors="replace")
+    return str(stream or "")
+
+
+# Per-run keys a ``run_validations`` row carries that a skipped row inherits from
+# the timed-out row, so every consumer reading them of every row still finds them.
+_SKIPPED_ROW_CARRIED_KEYS = ("sandbox_backend", "execution_boundary", "python_candidate_authority")
+
+
+def skipped_after_timeout_rows(
+    commands: Iterable[str],
+    *,
+    timed_out_command: str,
+    carried: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """One never-launched, failing row per declared command after a timeout.
+
+    NF-2026-02096: once a declared command is killed at its deadline the tree it
+    leaves is half-built, so the later steps are reported here rather than run.
+    ``returncode`` is ``None`` (never a pass) and ``timed_out`` stays ``False``:
+    only :data:`VALIDATION_TIMEOUT_SIGNATURE` reads ``skipped_after_timeout``.
+    """
+    source = carried if isinstance(carried, Mapping) else {}
+    return [
+        {
+            "command": command,
+            "argv": [],
+            "declared_command": command,
+            "declared_argv": [],
+            "executed_argv": [],
+            "argv_rewritten": False,
+            "cwd": None,
+            "env_override": None,
+            **{key: source.get(key) for key in _SKIPPED_ROW_CARRIED_KEYS},
+            "interpreter_authority": None,
+            "toolchain_authority_receipt": None,
+            "returncode": None,
+            "timed_out": False,
+            "skipped_after_timeout": True,
+            "skipped_reason": f"{SKIPPED_AFTER_TIMEOUT_REASON_PREFIX}{timed_out_command}",
+            "timeout_seconds": 0,
+            "duration_seconds": 0.0,
+            "stdout_head": "",
+            "stdout_tail": "",
+            "stdout_truncated": False,
+            "stderr_head": "",
+            "stderr_tail": "",
+            "stderr_truncated": False,
+        }
+        for command in commands
+    ]
+
+
 def match_validation_environment_signature(
     results: Iterable[Mapping[str, Any]],
     *,
@@ -2080,6 +2154,9 @@ def match_validation_environment_signature(
     names = {
         LANE_INFRASTRUCTURE_SIGNATURE
         if row.get("failure_class") == VALIDATION_ENVIRONMENT_CLASS
+        # NF-2026-02096: runner-set deadline fields, never candidate text.
+        else VALIDATION_TIMEOUT_SIGNATURE
+        if row.get("timed_out") is True or row.get("skipped_after_timeout") is True
         else validation_environment_signature(row)
         for row in failing
     }
@@ -2109,6 +2186,7 @@ __all__ = [
     "SEMLOCK_PRIMITIVE",
     "SEMLOCK_PROBE_SCHEMA",
     "SEMLOCK_TRUSTED_PROBE_SOURCE",
+    "SKIPPED_AFTER_TIMEOUT_REASON_PREFIX",
     "SemlockPreflight",
     "TerminalState",
     "VALIDATION_CHILD_UTF8_ENV",
@@ -2118,6 +2196,7 @@ __all__ = [
     "VALIDATION_ENVIRONMENT_SIGNATURES_VERSION",
     "VALIDATION_FAILED",
     "VALIDATION_PASSED",
+    "VALIDATION_TIMEOUT_SIGNATURE",
     "VALIDATION_UNSUPPORTED_IN_SANDBOX",
     "ValidationEnvironmentSignature",
     "ValidationEnvironmentSignatureMatch",
@@ -2128,6 +2207,7 @@ __all__ = [
     "construct_multiprocessing_semlock",
     "ctest_no_tests_found",
     "dash_m_validator_modules",
+    "decode_timeout_stream",
     "decode_trusted_semlock_exit",
     "exec_scratch_denied_restriction",
     "landlock_semlock_dev_shm_root",
@@ -2141,6 +2221,7 @@ __all__ = [
     "row_restriction",
     "sandbox_can_grant_semlock",
     "sandbox_unrunnable_reason",
+    "skipped_after_timeout_rows",
     "temp_root_blocks_nested_lsp_helper",
     "trusted_semlock_probe_argv",
     "validation_child_env",

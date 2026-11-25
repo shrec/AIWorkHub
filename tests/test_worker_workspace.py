@@ -1104,7 +1104,11 @@ def test_validation_records_carry_bounded_python_candidate_authority_reference(
         assert [row["command"] for row in rows] == commands
         assert rows[0]["returncode"] == 0
         assert rows[1]["timed_out"] is True
-        assert rows[2]["launch_error"] == "OSError"
+        # NF-2026-02096: the step after a timeout is reported, never launched.
+        assert rows[2]["skipped_after_timeout"] is True
+        assert rows[2]["skipped_reason"] == f"previous_command_timed_out:{commands[1]}"
+        assert rows[2]["returncode"] is None and "launch_error" not in rows[2]
+        assert isinstance(next(outcomes), OSError)
         expected_ref = {
             "schema_id": "aiworkhub.python_candidate_authority_ref.v1",
             "digest": authority["digest"],
