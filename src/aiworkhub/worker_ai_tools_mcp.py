@@ -4582,8 +4582,15 @@ def _merge_rework_overlay_payload(
                 })
             continue
         if mode == "bodygrep":
-            if target is not None and target != relative:
-                continue
+            # NF-2026-02441: canonical bodygrep scopes a target to the exact path or
+            # its directory prefix (``file_path = t OR file_path LIKE t/%``); reuse the
+            # owner's component-wise twin rather than an equality test.
+            from . import source_graph as _source_graph_mod
+
+            if target is not None:
+                scope = str(target).strip().replace("\\", "/").strip("/")
+                if not _source_graph_mod._row_under_include_roots(relative, (scope,)):
+                    continue
             for line_number, line in enumerate(lines, 1):
                 if query_lower in line.casefold():
                     overlay_matches.append({
