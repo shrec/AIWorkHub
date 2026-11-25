@@ -88,7 +88,13 @@ tests never run npm, WSL or git push. The version, changelog and README rules
 belong to scripts/release_metadata.py and the receipt to
 scripts/release_receipt.py; this script orders them and adds no second copy.
 On this host it writes nothing outside the repository: the archive, the host
-suite's basetemp and the step logs live under .scratch/release/VERSION. Inside
+suite's basetemps (b, and br for its serial rerun) and the step logs live under
+.scratch/release/VERSION. A cut keeps its own basetemps, which the diagnosis of
+its failure reads; when it starts (bump), a daemon thread removes every other
+version's b and br there while the host suite runs, never a log, baseline or
+archive beside them, and the report waits for it at most
+BASETEMP_PRUNE_JOIN_SECONDS: the JSON summary's pruned_basetemps names what it
+removed and what it could not, which never fails the cut. Inside
 WSL, the extracted tree is /tmp/aiworkhub-release-VERSION-tree and pytest's
 basetemp its sibling /tmp/aiworkhub-release-VERSION, both on the Linux
 filesystem, which the POSIX suite needs for sockets and file modes and where
@@ -113,6 +119,7 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -223,6 +230,20 @@ PIPE_DRAIN_SECONDS = 10.0
 PIPE_READ_BYTES = 65_536
 # The pytest option every suite run passes, by which run_subprocess tells one apart.
 BASETEMP_OPTION = "--basetemp="
+# Every cut's scratch directory, .scratch/release/VERSION, sits in this one.
+RELEASE_SCRATCH_PARTS: tuple[str, ...] = (".scratch", "release")
+# NF-2026-02429: the host suite's basetemps in a cut's scratch directory (_host_test_argv),
+# the whole run's and its serial rerun's. Nothing deleted them, as deleting the whole
+# run's measured 203 s, so every release leaked one: 0.13.10/b held 5.0 GB, and removing
+# 0.13.*/b and br freed 46.87 GB (2026-11-25). A cut keeps its own and removes every
+# other version's in the background (BasetempPrune).
+HOST_BASETEMP = "b"
+HOST_RERUN_BASETEMP = "br"
+HOST_BASETEMP_DIRS: tuple[str, ...] = (HOST_BASETEMP, HOST_RERUN_BASETEMP)
+# How long a cut's report waits for that prune: a cut that fails in its first minute
+# reports at most this much later, and what a prune still running then leaves, the
+# next cut removes.
+BASETEMP_PRUNE_JOIN_SECONDS = 60.0
 MAX_BASELINE_BYTES = 1024 * 1024
 MAX_BASELINE_IDS = 10_000
 MAX_LINE_CHARS = 600
@@ -729,6 +750,9 @@ class Host:
     # Asked (root, base) when a test injects one; else test_impact_select.select_tests,
     # which also takes the pathspec _impact_targets scopes the diff with.
     impact_selector: Callable[[Path, str], Any] | None = None
+    # What removes an earlier version's basetemp (BasetempPrune): shutil.rmtree, which a
+    # test replaces with one that fails.
+    rmtree: Callable[..., Any] = shutil.rmtree
 
     @classmethod
     def current(cls) -> Host:
@@ -962,6 +986,183 @@ def _listing(items: Sequence[str]) -> str:
     return f"{shown} (+{more} more)" if more > 0 else shown
 
 
+def _why(exc: BaseException) -> str:
+    """``exc`` as one short cause: its type and strerror, else its text; never its path."""
+
+    detail = getattr(exc, "strerror", None) or str(exc)
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+def _is_real_directory(path: Path) -> bool:
+    """``path`` is a directory itself, not a symlink or a junction to one."""
+
+    return path.is_dir() and not path.is_symlink() and not path.is_junction()
+
+
+def _clear_read_only(name: str, top: str) -> None:
+    """Make ``name`` removable: clear its read-only bit (Windows) and its directory's (POSIX).
+
+    Never through a link, so never outside the tree under ``top``: rmtree descends only
+    into real directories, so ``name``'s directory is one; ``name`` itself is left alone
+    when it is a link, and the directory above ``top`` is one the prune keeps.
+    """
+
+    writable = [] if name == top else [os.path.dirname(name)]
+    with contextlib.suppress(OSError):
+        if not stat.S_ISLNK(os.lstat(name).st_mode) and not os.path.isjunction(name):
+            writable.append(name)
+    for path in writable:
+        with contextlib.suppress(OSError):
+            os.chmod(path, stat.S_IRWXU)
+
+
+def _remove_tree(path: Path, rmtree: Callable[..., Any]) -> str | None:
+    """``rmtree`` of ``path`` recording, not raising, what it refuses: None once ``path`` is gone.
+
+    An entry refused with PermissionError, as Windows refuses a read-only file (git makes
+    its objects so), is removed once more with its read-only bits cleared; an entry still
+    refused is counted, and the first one named. Else the answer says why ``path`` stays.
+    """
+
+    top = os.fspath(path)
+    failures = 0
+    first = ""
+
+    def retry(function: Callable[..., Any], name: str, exc: BaseException) -> None:
+        nonlocal failures, first
+        if isinstance(exc, PermissionError) and function in (os.unlink, os.rmdir):
+            _clear_read_only(name, top)
+            try:
+                function(name)
+                return
+            except OSError as again:
+                exc = again
+        if isinstance(exc, FileNotFoundError):
+            return  # gone already, which is all its removal wanted
+        failures += 1
+        if not first:
+            where = "" if name == top else f"{Path(os.path.relpath(name, top)).as_posix()}: "
+            first = f"{where}{_why(exc)}"
+
+    rmtree(top, onexc=retry)
+    if not os.path.lexists(top):
+        return None
+    if not failures:
+        return "still present after rmtree"
+    return f"{failures} entr{'y' if failures == 1 else 'ies'} not removed (first: {first})"
+
+
+class BasetempPrune:
+    """Removes the host basetemps of earlier versions on a daemon thread while a cut runs.
+
+    NF-2026-02429: each cut leaves its host suite's basetemps (HOST_BASETEMP_DIRS) in its
+    scratch directory, ~5 GB a release, and deleting the whole run's measured 203 s, so
+    the cut that wrote them never deletes them. Each directory under .scratch/release
+    (RELEASE_SCRATCH_PARTS) is one version's; of every one but ``keep_version``'s, the
+    version being cut, whose basetemps a failure's diagnosis reads, only those real
+    directories go: every log, baseline and archive beside them stays, and nothing behind
+    a link is touched. A removal that fails is recorded with its cause and never raised,
+    so a prune cannot change a cut's result. ``run`` prunes in the calling thread;
+    ``start`` runs it on a daemon thread, and ``join`` returns the summary once it ended or
+    its timeout passed, whose state is RUNNING for a prune that has not ended.
+    """
+
+    NOT_RUN = "not_run"
+    RUNNING = "running"
+    DONE = "done"
+
+    def __init__(
+        self, root: Path, keep_version: str, *, rmtree: Callable[..., Any] = shutil.rmtree
+    ) -> None:
+        self.root = root
+        self.keep_version = keep_version
+        self.thread: threading.Thread | None = None
+        self._rmtree = rmtree
+        self._lock = threading.Lock()
+        self._state = self.NOT_RUN
+        self._removed: list[str] = []
+        self._errors: list[str] = []
+
+    def start(self) -> BasetempPrune:
+        """Run the prune on a daemon thread, which the process's exit does not wait for."""
+
+        thread = threading.Thread(target=self.run, name="release-basetemp-prune", daemon=True)
+        try:
+            thread.start()
+        except RuntimeError as exc:  # no thread to be had: the cut goes on unpruned
+            self._record(error=f"the prune thread did not start: {_why(exc)}")
+        else:
+            self.thread = thread
+        return self
+
+    def join(self, timeout: float) -> dict[str, Any]:
+        """The summary once the prune ended or ``timeout`` seconds passed, whichever is first."""
+
+        if self.thread is not None:
+            self.thread.join(timeout)
+        return self.summary()
+
+    def summary(self) -> dict[str, Any]:
+        """The state, the basetemps removed so far, their count and every recorded failure."""
+
+        with self._lock:
+            state, removed, errors = self._state, list(self._removed), list(self._errors)
+        return {"state": state, "removed": removed, "count": len(removed), "errors": errors}
+
+    def run(self) -> dict[str, Any]:
+        """Prune in the calling thread and return the summary; it never raises."""
+
+        with self._lock:
+            self._state = self.RUNNING
+        try:
+            for target in self._targets():
+                self._remove(target)
+        except Exception as exc:  # the listing failed: what it did not reach stays
+            self._record(error=f"{'/'.join(RELEASE_SCRATCH_PARTS)}: {_why(exc)}")
+        finally:
+            with self._lock:
+                self._state = self.DONE
+        return self.summary()
+
+    def _targets(self) -> list[Path]:
+        """HOST_BASETEMP_DIRS of every version directory but ``keep_version``'s, by name."""
+
+        scratch = self.root / RELEASE_SCRATCH_PARTS[0]
+        release = scratch.joinpath(*RELEASE_SCRATCH_PARTS[1:])
+        # Both real: a link at either would lead the prune out of the repository.
+        if not (_is_real_directory(scratch) and _is_real_directory(release)):
+            return []
+        with os.scandir(release) as entries:
+            versions = sorted(
+                entry.name
+                for entry in entries
+                if entry.name != self.keep_version
+                and entry.is_dir(follow_symlinks=False)
+                and not entry.is_junction()
+            )
+        return [release / version / name for version in versions for name in HOST_BASETEMP_DIRS]
+
+    def _remove(self, target: Path) -> None:
+        relative = target.relative_to(self.root).as_posix()
+        try:
+            if not _is_real_directory(target):
+                return
+            why = _remove_tree(target, self._rmtree)
+        except Exception as exc:  # a failing removal is recorded; it never fails the cut
+            why = _why(exc)
+        if why is None:
+            self._record(removed=relative)
+        else:
+            self._record(error=f"{relative}: {why}")
+
+    def _record(self, *, removed: str | None = None, error: str | None = None) -> None:
+        with self._lock:
+            if removed is not None:
+                self._removed.append(removed)
+            if error is not None:
+                self._errors.append(_one_line(error))
+
+
 class ReleaseCut:
     """One ordered release cut; ``run`` returns the process exit code."""
 
@@ -990,6 +1191,10 @@ class ReleaseCut:
             "selected_count": None,
             "fallback_reason": "host_tests_not_run",
         }
+        # NF-2026-02429: earlier versions' host basetemps, removed on a daemon thread the
+        # cut starts with its first cut step (_run_steps) and joins before it reports.
+        self.basetemp_prune = BasetempPrune(self.root, self.version, rmtree=host.rmtree)
+        self.pruned_basetemps: dict[str, Any] = self.basetemp_prune.summary()
         self._steps: dict[str, Callable[[], str]] = {
             "version": self._step_version,
             "changelog": self._step_changelog,
@@ -1013,7 +1218,7 @@ class ReleaseCut:
     def scratch(self) -> Path:
         """.scratch/release/VERSION, used only once the version step accepted VERSION."""
 
-        return self.root.joinpath(".scratch", "release", self.version)
+        return self.root.joinpath(*RELEASE_SCRATCH_PARTS, self.version)
 
     @property
     def wsl_basetemp(self) -> PurePosixPath:
@@ -1043,6 +1248,8 @@ class ReleaseCut:
                 failed if name == failed.name else StepResult(name, "not_run", not_run)
                 for name in STEPS
             ]
+        # Before the recovery line, which stays the one just above the summary.
+        self.pruned_basetemps = self._join_basetemp_prune()
         recovery = self._recovery(failed)
         if recovery is not None:
             self.host.out(f"recovery: {recovery}")
@@ -1071,6 +1278,9 @@ class ReleaseCut:
             elif dry_run and name in CUT_STEPS:
                 self.results.append(StepResult(name, "planned", self._plan(name)))
             else:
+                if name == CUT_STEPS[0]:
+                    # The cut starts: earlier versions' basetemps go while its suite runs.
+                    self.basetemp_prune.start()
                 if name in CUT_STEPS:
                     self._emit("run", name, self._plan(name))
                 result = self._run_step(name)
@@ -1082,6 +1292,31 @@ class ReleaseCut:
                     for planned in STEPS:
                         self._emit("plan", planned, self._plan(planned))
         return failed
+
+    def _join_basetemp_prune(self) -> dict[str, Any]:
+        """The prune's summary once it ended or BASETEMP_PRUNE_JOIN_SECONDS passed.
+
+        A prune that removed, failed or still runs prints one line naming that, above the
+        recovery line; what it did is never the cut's result, which only the steps decide.
+        """
+
+        pruned = self.basetemp_prune.join(BASETEMP_PRUNE_JOIN_SECONDS)
+        removed, errors = pruned["removed"], pruned["errors"]
+        running = pruned["state"] == BasetempPrune.RUNNING
+        if not (removed or errors or running):
+            return pruned  # nothing to name; the summary's pruned_basetemps still says so
+        detail = f"{len(removed)} earlier basetemp(s) removed"
+        if removed:
+            detail += f": {_listing(removed)}"
+        if running:
+            detail += (
+                f"; still running after {BASETEMP_PRUNE_JOIN_SECONDS:g} s, so the next cut "
+                "removes what it leaves"
+            )
+        if errors:
+            detail += f"; {len(errors)} not removed: {_listing(errors)}"
+        self._emit("pruned", "basetemps", _one_line(detail))
+        return pruned
 
     def _run_step(self, name: str) -> StepResult:
         try:
@@ -1117,6 +1352,7 @@ class ReleaseCut:
             "skip_wsl": self.options.skip_wsl,
             "host_test_workers": self.workers,
             "test_selection": dict(self.test_selection),
+            "pruned_basetemps": self.pruned_basetemps,
             "failed_step": failed.name if failed is not None else None,
             "reason": failed.detail if failed is not None else None,
             "completed_steps": [result.name for result in self.results if result.status == "ok"],
@@ -1212,7 +1448,8 @@ class ReleaseCut:
 
     def _host_test_argv(self, nodes: Sequence[str] = ()) -> list[str]:
         # With nodes: the serial rerun of exactly those ids, in a basetemp of its own
-        # because deleting the full run's basetemp measured 203 s. Both pass the
+        # because deleting the full run's basetemp measured 203 s; a later cut's
+        # BasetempPrune removes both while its own suite runs. Both runs pass the
         # per-test --timeout, so a stuck test fails with its stack instead of hanging.
         # Only the whole-suite run loads TEST_IMPACT_RECORDER_PLUGIN: the recorder would
         # refuse a narrowed run or a rerun the map anyway, so neither carries it.
@@ -1227,7 +1464,7 @@ class ReleaseCut:
             *(("-p", TEST_IMPACT_RECORDER_PLUGIN) if records else ()),
             "-n",
             "0" if nodes else _xdist_flag(self.workers),
-            f"{BASETEMP_OPTION}{self.scratch / ('br' if nodes else 'b')}",
+            f"{BASETEMP_OPTION}{self.scratch / (HOST_RERUN_BASETEMP if nodes else HOST_BASETEMP)}",
             *(nodes or self.test_targets),
         ]
 

@@ -16,6 +16,7 @@ import os
 import shlex
 import shutil
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -265,6 +266,7 @@ def _cut(
     cpu_count: int | None = 16,
     windows: bool = True,
     selector: Any = None,
+    rmtree: Any = shutil.rmtree,
 ) -> tuple[int, dict[str, Any], list[str], FakeRunner]:
     runner = runner if runner is not None else FakeRunner(root)
     lines: list[str] = []
@@ -277,6 +279,7 @@ def _cut(
         is_windows=windows,
         out=lines.append,
         impact_selector=selector,
+        rmtree=rmtree,
     )
     code = release_cut.main([version, *args], host=host)
     return code, json.loads(lines[-1]), lines, runner
@@ -1358,6 +1361,111 @@ def test_the_host_suite_carries_the_derived_worker_count_and_an_in_repo_basetemp
     (basetemp,) = [token for token in argv if token.startswith("--basetemp=")]
     assert Path(basetemp.split("=", 1)[1]).is_relative_to(root / ".scratch" / "release")
     assert (root / ".scratch" / "release" / VERSION / "host_tests.log").is_file()
+
+
+# -- earlier versions' basetemps (NF-2026-02429) ----------------------------------------
+
+
+def _earlier_cut_scratch(root: Path) -> Path:
+    """What the cut of CURRENT left in its scratch directory: both basetemps and a log."""
+
+    earlier = root / ".scratch" / "release" / CURRENT
+    _write(earlier / "b" / "popen-gw0" / "test_x0" / "out.txt", "earlier run")
+    _write(earlier / "br" / "test_x0" / "out.txt", "earlier rerun")
+    _write(earlier / "host_tests.log", "earlier log")
+    return earlier
+
+
+def test_a_cut_prunes_earlier_versions_basetemps_while_its_host_suite_runs(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path)
+    earlier = _earlier_cut_scratch(root)
+    own = root / ".scratch" / "release" / VERSION / "b" / "kept.txt"
+    _write(own, "this cut's own basetemp")
+    pruning, suite_ran = threading.Event(), threading.Event()
+
+    def host_suite(_call: Call) -> None:
+        # The prune started with the cut, so it is under way before this suite ends ...
+        assert pruning.wait(30), "no prune ran beside the host suite"
+        suite_ran.set()
+        return None  # the passing default
+
+    def rmtree(path: str, *, onexc: Any) -> None:
+        # ... and it removes only once the suite runs, so the cut never waits for it first.
+        pruning.set()
+        if not suite_ran.wait(30):
+            raise TimeoutError("the host suite never ran beside the prune")
+        shutil.rmtree(path, onexc=onexc)
+
+    runner = FakeRunner(root, {"pytest": host_suite})
+    code, summary, lines, _ = _cut(root, "--push", runner=runner, rmtree=rmtree)
+
+    assert code == 0, summary["reason"]
+    assert summary["pruned_basetemps"] == {
+        "state": "done",
+        "removed": [f".scratch/release/{CURRENT}/b", f".scratch/release/{CURRENT}/br"],
+        "count": 2,
+        "errors": [],
+    }
+    assert not (earlier / "b").exists() and not (earlier / "br").exists()
+    assert (earlier / "host_tests.log").read_text(encoding="utf-8") == "earlier log"
+    assert own.read_text(encoding="utf-8") == "this cut's own basetemp"
+    # One line names them, just above the summary, as nothing failed.
+    assert lines[-2] == (
+        f"pruned  basetemps: 2 earlier basetemp(s) removed: .scratch/release/{CURRENT}/b, "
+        f".scratch/release/{CURRENT}/br"
+    )
+
+
+def test_a_failing_prune_is_reported_and_never_changes_the_cuts_result(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    earlier = _earlier_cut_scratch(root)
+
+    def refusing(path: str, *, onexc: Any) -> None:
+        raise PermissionError(13, "Access is denied", path)  # EACCES
+
+    code, summary, lines, runner = _cut(root, "--push", rmtree=refusing)
+
+    assert code == 0, summary["reason"]
+    assert summary["ok"] is True and summary["failed_step"] is None
+    assert set(_statuses(summary).values()) == {"ok"} and runner.labels == FULL_CUT
+    assert summary["pruned_basetemps"] == {
+        "state": "done",
+        "removed": [],
+        "count": 0,
+        "errors": [
+            f".scratch/release/{CURRENT}/b: PermissionError: Access is denied",
+            f".scratch/release/{CURRENT}/br: PermissionError: Access is denied",
+        ],
+    }
+    assert (earlier / "b").is_dir() and (earlier / "br").is_dir()
+    assert lines[-2].startswith(
+        "pruned  basetemps: 0 earlier basetemp(s) removed; 2 not removed: "
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "responses"),
+    [(("--dry-run",), {}), ((), {"git symbolic-ref": Completed(0, "topic\n")})],
+    ids=["dry_run", "failed_preflight"],
+)
+def test_no_prune_runs_unless_the_cut_starts(
+    tmp_path: Path, args: tuple[str, ...], responses: dict[str, Any]
+) -> None:
+    root = _repo(tmp_path)
+    earlier = _earlier_cut_scratch(root)
+
+    _, summary, lines, _ = _cut(root, *args, runner=FakeRunner(root, responses))
+
+    assert summary["pruned_basetemps"] == {
+        "state": "not_run",
+        "removed": [],
+        "count": 0,
+        "errors": [],
+    }
+    assert (earlier / "b").is_dir() and (earlier / "br").is_dir()
+    assert not any(line.startswith("pruned ") for line in lines)
 
 
 # -- worktree and release commit ------------------------------------------------------
