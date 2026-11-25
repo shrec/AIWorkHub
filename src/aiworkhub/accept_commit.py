@@ -154,7 +154,9 @@ def commit_promoted(
             outcome = _decided(STATE_SKIPPED, SKIP_DIRTY_BEFORE_ACCEPT)
             return {**_reply(outcome, listed, subject), "dirty_paths": dirty_before}
         root = snapshot.root
-        if not set(paths) & _dirty_paths(root):
+        dirty_now = _dirty_paths(root)
+        changed = sorted(set(paths) & dirty_now)
+        if not changed:
             return _reply(_decided(STATE_SKIPPED, SKIP_PROMOTED_PATHS_UNCHANGED), listed, subject)
         declared = _declared_records(card, needfix_id)
         named = _named_not_declared(card, needfix_id)
@@ -163,10 +165,11 @@ def commit_promoted(
             declared=declared,
         )
         message = head + "\n\n" + "\n".join(trailers) + "\n"
-        _run_step(root, FAIL_ADD, "--literal-pathspecs", "add", "-A", "--", *paths, timeout=None)
+        # NF-2026-02401: stage and commit only the paths git reports changed; an absent path matches no pathspec.
+        _run_step(root, FAIL_ADD, "--literal-pathspecs", "add", "-A", "--", *changed, timeout=None)
         _run_step(
             root, FAIL_COMMIT,
-            "--literal-pathspecs", "commit", "--only", "-m", message, "--", *paths,
+            "--literal-pathspecs", "commit", "--only", "-m", message, "--", *changed,
             timeout=None,
         )
         sha = _git(root, "rev-parse", "--verify", "HEAD")
@@ -176,6 +179,9 @@ def commit_promoted(
         reply = _reply(committed, listed, subject)
         if named:
             reply["needfix_named_not_declared"] = named
+        unchanged = sorted(set(paths) - dirty_now)
+        if unchanged:
+            reply["unchanged_paths"] = unchanged
         return reply
     except _GitStepFailed as failed:
         return _reply(failed.outcome, listed, subject)

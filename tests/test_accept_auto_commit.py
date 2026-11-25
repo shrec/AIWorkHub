@@ -358,6 +358,23 @@ def test_an_unsafe_promoted_path_is_never_handed_to_git(repo):
     assert _head(repo) == before
 
 
+def test_a_promoted_path_absent_from_disk_and_index_does_not_fail_the_commit(repo):
+    # NF-2026-02401: a promoted path that is neither on disk nor in the index matches no pathspec.
+    snapshot = accept_commit.snapshot_before_accept(repo, auto_commit=True)
+    _write(repo, "notes.txt", "notes edited by the accept\n")
+    receipt = {"ok": True, "promoted_paths": ["notes.txt", "gone/never_existed.py"]}
+    before = _head(repo)
+
+    commit = accept_commit.commit_promoted(
+        snapshot, receipt, CARD, task_id=TASK_ID, request_id=REQUEST_ID,
+    )
+
+    assert commit["state"] == "committed", commit
+    assert commit["unchanged_paths"] == ["gone/never_existed.py"]
+    assert _head(repo) != before
+    assert _committed_paths(repo) == ["notes.txt"]
+
+
 def test_the_module_never_pushes_amends_skips_hooks_or_uses_a_shell():
     tree = ast.parse(Path(accept_commit.__file__).read_text(encoding="utf-8"))
     literals = {
