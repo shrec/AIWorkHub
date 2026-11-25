@@ -616,6 +616,29 @@ def flush(backend_id: str, context: TurnContext) -> list[dict[str, Any]]:
     return [_turn_end(usage, context)]
 
 
+_PROVISIONAL_USAGE_COUNTS = (
+    "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+)
+
+
+def _provisional_claude_result(backend_id: str, event: Mapping[str, Any]) -> bool:
+    """NF-2026-02424: a claude ``result`` that does not end the turn.
+
+    The CLI reports an all-zero usage with ``iterations: []`` (e.g. for an
+    injected task-notification) and then continues the same turn with more
+    assistant text and a real ``result``. Only that exact shape is provisional:
+    ``usage: {}`` (no ``iterations`` key) or any non-zero count is a real end.
+    """
+    if backend_id != "claude_cli" or str(event.get("type") or "") != "result":
+        return False
+    usage = event.get("usage")
+    if not isinstance(usage, Mapping) or "iterations" not in usage or usage["iterations"] != []:
+        return False
+    return all(
+        type(usage.get(key)) is int and usage.get(key) == 0 for key in _PROVISIONAL_USAGE_COUNTS
+    )
+
+
 def _failed_result_subtype(event: Mapping[str, Any]) -> bool:
     """A Claude ``result`` whose subtype is not ``success`` (``error_during_execution``,
     ``error_max_turns``, ...) is a failure even when it carries ``is_error: false``."""
@@ -1132,6 +1155,8 @@ class CliManagerBackend:
         context = TurnContext()
         ended = False
         held: dict[str, Any] | None = None
+        # NF-2026-02424: a claude result that does not end the turn, held until one does.
+        provisional: dict[str, Any] | None = None
         streamed = False
         # Why reading stopped: eof, expired (silence), lingered (past the exit grace
         # after the terminal event), cancelled (close()), or dropped (the consumer left).
@@ -1160,13 +1185,20 @@ class CliManagerBackend:
                     continue
                 self._conversation_id = self._conversation_id or conversation_id_of(event)
                 _maybe_record_claude_resolution(self.backend_id, self.model, self.repo, event)
+                is_provisional = _provisional_claude_result(self.backend_id, event)
                 for translated in translate(self.backend_id, event, context):
                     if translated["type"] in TURN_TERMINAL_TYPES:
                         # NF-2026-01232: one turn is one terminal event; the provider's
                         # first report (Codex: error, then turn.failed) wins.
                         if ended:
                             continue
+                        if is_provisional and translated["type"] == "turn_end":
+                            # NF-2026-02424: the turn goes on; no exit grace, the silence
+                            # window still applies, and a later terminal replaces it.
+                            provisional = translated
+                            continue
                         ended = True
+                        provisional = None
                         streamed = True
                         deadline = time.monotonic() + TERMINAL_EXIT_GRACE_SECONDS
                         if translated["type"] == "turn_end":
@@ -1199,6 +1231,12 @@ class CliManagerBackend:
                 _end_process(process, grace_seconds=grace)
                 code = _reap(process)
             stderr = tail.text()
+        if provisional is not None and not ended and ending in ("eof", "expired"):
+            # NF-2026-02424: the turn closed holding only its provisional result, so
+            # that result is its one terminal (a non-zero exit still replaces it).
+            held = provisional
+            if ending == "expired":
+                ending = "lingered"
         if ended and held is None:
             return
         if ending == "cancelled" and held is None:
