@@ -110,6 +110,8 @@ def _snapshot(directory: Path, state: str, record: dict) -> dict:
     status_path = directory / "supervisor.json"
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(record), encoding="utf-8")
+    # read_supervisor_status fails closed on group/other bits (POSIX only).
+    status_path.chmod(0o600)
     row = {
         "request_id": REQUEST_ID,
         "task_id": TASK_ID,
