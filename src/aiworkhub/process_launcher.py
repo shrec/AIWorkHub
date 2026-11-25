@@ -501,6 +501,9 @@ SUPERVISOR_GRACE_SECONDS = 90
 TERMINAL_AUTHORITY_SCHEMA_ID = terminal_authority.SCHEMA_ID
 TERMINAL_AUTHORITY_KEY_FILENAME = terminal_authority.KEY_FILENAME
 ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
+# NF-2026-01966: the named subset of ACTIVE_PROCESS_STATES a takeover finalizer
+# leaves as the latest row while it validates an already exited supervisor.
+TAKEOVER_FINALIZATION_ROW_STATES = frozenset({"starting", "running"}) & ACTIVE_PROCESS_STATES
 # A reviewer attempt reservation outlives the synchronous MCP handler: it is
 # established before expensive preparation and must cover preparation plus
 # provider spawn under one background owner. It remains a bounded pid-null
@@ -1293,9 +1296,18 @@ def finalizer_liveness(
     *,
     now_epoch: float | None = None,
 ) -> dict[str, Any]:
-    """``finalizing`` overlay when the exact finalizer of a pending request is alive, else ``{}``."""
+    """``finalizing`` overlay when the exact finalizer of a pending request is alive, else ``{}``.
+
+    NF-2026-01966: a takeover finalizer (``lock_blocking=False``) never appends
+    the ``finalizing`` row, so a ``starting``/``running`` row whose supervisor
+    has already exited is also pending finalization.
+    """
     section = supervisor_status.get(FINALIZER_STATUS_SECTION)
-    if latest.get("state") not in FINALIZATION_PENDING_STATES or not isinstance(section, dict):
+    state = latest.get("state")
+    pending = state in FINALIZATION_PENDING_STATES or (
+        state in TAKEOVER_FINALIZATION_ROW_STATES and supervisor_status.get("state") == "exited"
+    )
+    if not pending or not isinstance(section, dict):
         return {}
     now = time.time() if now_epoch is None else now_epoch
     pid, ticks, beat = (section.get(key) for key in ("pid", "pid_start_ticks", "heartbeat_at_epoch"))

@@ -266,9 +266,15 @@ def test_every_finalization_pending_state_reports_finalizing(tmp_path, state):
     assert liveness["liveness_state"] == "finalizing"
 
 
-@pytest.mark.parametrize("state", ["starting", "running", "review_ready", "blocked"])
-def test_finalizer_section_is_ignored_outside_finalization_pending_states(tmp_path, state):
-    liveness = _snapshot(tmp_path, _supervisor_record(), _finalizer_section(), state=state)
+@pytest.mark.parametrize(
+    ("state", "supervisor"),
+    [("starting", {"state": "running"}), ("running", {"state": "running"}),
+     ("review_ready", {}), ("blocked", {})],
+)
+def test_finalizer_section_is_ignored_outside_finalization_pending_states(tmp_path, state, supervisor):
+    # NF-2026-01966: starting/running with an exited supervisor is a takeover
+    # finalization (tests/test_finalizer_liveness_takeover_nf01966.py).
+    liveness = _snapshot(tmp_path, _supervisor_record(**supervisor), _finalizer_section(), state=state)
 
     assert liveness.get("liveness_state") != "finalizing"
     assert "finalization_progress" not in liveness
@@ -1232,7 +1238,14 @@ def test_a_live_finalizer_with_no_active_validation_progress_gets_no_phase(tmp_p
     assert not set(_PHASE_FIELDS) & set(liveness)
 
 
-def test_the_phase_is_ignored_outside_finalization_pending_states(tmp_path):
-    liveness = _snapshot(tmp_path, _supervisor_record(), _finalizer_section(), state="running")
+@pytest.mark.parametrize(
+    ("state", "supervisor"),
+    [("running", {"state": "running"}), ("starting", {"state": "running"}),
+     ("review_ready", {}), ("blocked", {})],
+)
+def test_the_phase_is_ignored_outside_finalization_pending_states(tmp_path, state, supervisor):
+    # NF-2026-01966: a running row with an exited supervisor IS pending, so the
+    # "outside" cases are a live worker and the terminal states.
+    liveness = _snapshot(tmp_path, _supervisor_record(**supervisor), _finalizer_section(), state=state)
 
     assert not set(_PHASE_FIELDS) & set(liveness)
