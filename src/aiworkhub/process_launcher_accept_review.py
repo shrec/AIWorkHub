@@ -2167,6 +2167,47 @@ def create_supplemental_inspection_rounds(
     return rows
 
 
+# review_lifecycle's outbox states that mean "queued, not yet executed":
+# ``pending`` is waiting for a worker, ``reserved`` is leased to one.
+_QUEUED_OUTBOX_STATES = ("pending", "reserved")
+
+
+def queued_reviewer_actions(self: Any, request_id: str) -> dict[str, str]:
+    """Lens -> outbox state for reviewer actions queued for ``request_id``.
+
+    NF-2026-02440: the auto-review chain writes its actions to
+    ``review_action_outbox`` before any reviewer card exists, so for that window
+    neither a bound reviewer nor a ledger event says a review is on its way.
+    This reads the same outbox rows ``ReviewOrchestrator._outbox_lens_states``
+    reads, keyed by the parent request instead of a chain id. It only ever ADDS
+    a fact to a blocker, so an unreadable store yields ``{}`` -- the unchanged
+    blocker -- never a refusal or an acceptance. The earliest queued action of
+    a lens names its state.
+    """
+    from . import review_orchestrator
+
+    try:
+        review_db = review_orchestrator.canonical_review_db(self)
+        if review_db is None or not str(request_id or ""):
+            return {}
+        with contextlib.closing(
+            review_orchestrator._side_table_connection(review_db, readonly=True)
+        ) as conn:
+            rows = conn.execute(
+                "SELECT lens,state FROM review_action_outbox "
+                "WHERE target_request_id=? AND lens<>'' "
+                f"AND state IN ({','.join('?' * len(_QUEUED_OUTBOX_STATES))}) "
+                "ORDER BY chain_id,action_index",
+                (str(request_id), *_QUEUED_OUTBOX_STATES),
+            ).fetchall()
+    except Exception:  # noqa: BLE001 -- an unreadable outbox adds nothing
+        return {}
+    queued: dict[str, str] = {}
+    for row in rows:
+        queued.setdefault(str(row[0]), str(row[1]))
+    return queued
+
+
 def fold_accept_blockers(
     *,
     reviewers: list[dict[str, Any]],
@@ -2181,6 +2222,7 @@ def fold_accept_blockers(
     confirm_destructive_change: bool = False,
     finding_dispositions: list[Mapping[str, Any]] | None = None,
     manager_correction: Mapping[str, Any] | None = None,
+    queued_reviewer_actions: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Every acceptance blocker decidable from persisted evidence alone.
 
@@ -2272,6 +2314,11 @@ def fold_accept_blockers(
                 )
                 continue
             live = running_rows.get(lens)
+            # NF-2026-02440: an auto-review action still pending/leased in the
+            # outbox is neither a missing reviewer to launch nor a running one
+            # to wait on; say it is queued. ``reviewer_running`` stays the
+            # launcher's liveness verdict, untouched by the queue.
+            queued_state = (queued_reviewer_actions or {}).get(lens)
             blockers.append(
                 _blocker(
                     "required_reviewer_missing", lens,
@@ -2285,6 +2332,10 @@ def fold_accept_blockers(
                             live.get("running_request_id") or live["request_id"]
                         ),
                     } if live is not None else {}),
+                    **({
+                        "reviewer_queued": True,
+                        "queued_action_state": str(queued_state),
+                    } if queued_state else {}),
                 )
             )
     evidence_rows = [row for row in chosen if row["usable"]]
@@ -2991,6 +3042,7 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
         pending_context_write_intents=intents,
         confirm_high_risk=bool(overrides.get("confirm_high_risk")),
         repository_requires_explicit_human_approval=owner_approval_required,
+        queued_reviewer_actions=queued_reviewer_actions(self, request_id),
         **(
             {"finding_dispositions": preview_dispositions}
             if preview_dispositions
