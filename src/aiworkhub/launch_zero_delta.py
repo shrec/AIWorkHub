@@ -13,9 +13,17 @@ from .worker_workspace import WorkerWorkspace
 
 ZERO_DELTA_NOTICE = "zero_required_output_delta_warning"
 RUNTIME_NOTICE_EVENT_KIND = "runtime_notice"
+# Stateless review-orchestrator observation copies (no top-level ``state``):
+# the task event is the durable record, and readers take them from raw events
+# filtered by ``event_type``, never from the latest-per-request projection.
+# NF-2026-02412 added the auto-accept and lens-blocked rows, which otherwise
+# REPLACED a ``review_ready`` + ``workspace_retained`` row and hid it from GC.
 ORCHESTRATOR_ADVISORY_EVENT_TYPES = frozenset({
     "review_orchestrator_wait",
     "review_orchestrator_mechanical_rework",
+    "auto_accepted",
+    "auto_accept_declined",
+    "review_orchestrator_lens_blocked",
 })
 ZERO_DELTA_ELAPSED_SHARE_ENV = "AIWORKHUB_ZERO_DELTA_ELAPSED_SHARE"
 ZERO_DELTA_DEFAULT_ELAPSED_SHARE = 0.5
@@ -54,9 +62,10 @@ def split_lifecycle_tail(
 
 
 def _tail_row_kind(event: dict[str, Any]) -> str:
-    """``skip`` (orchestrator advisory), ``advisory`` (runtime notice) or ``lifecycle``."""
+    """``skip`` (stateless observation), ``advisory`` (runtime notice) or ``lifecycle``."""
 
-    if str(event.get("event_type") or "") in ORCHESTRATOR_ADVISORY_EVENT_TYPES:
+    event_type = str(event.get("event_type") or "")
+    if event_type in ORCHESTRATOR_ADVISORY_EVENT_TYPES:
         return "skip"
     if str(event.get("event_kind") or "") == RUNTIME_NOTICE_EVENT_KIND:
         return "advisory"
