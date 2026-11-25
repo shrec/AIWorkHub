@@ -13,6 +13,7 @@ this function no longer calls -- silently, with the tests still green.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import errno
 import fnmatch
 import hashlib
@@ -3202,6 +3203,46 @@ def _stored_hash_mismatch_refusal(
     )
 
 
+# NF-2026-02425: wall-clock seconds per accept sub-phase. A medium accept took
+# ~190-234 s and only its ~42 s of neighbour tests could be attributed, because
+# nothing timed the rest. Measurement only: the MCP accept tool binds one
+# recorder around the whole accept and replies with it under
+# ``ACCEPT_PHASE_SECONDS_KEY``. With no recorder bound every phase runs untimed,
+# so ``accept_review``'s own reply, refusals and receipts never change.
+ACCEPT_PHASE_SECONDS_KEY = "accept_phase_seconds"
+_ACCEPT_PHASE_RECORDER: contextvars.ContextVar[dict[str, float] | None] = (
+    contextvars.ContextVar("aiworkhub_accept_phase_seconds", default=None)
+)
+
+
+@contextlib.contextmanager
+def accept_phases_recorded() -> Iterator[dict[str, float]]:
+    """Bind a fresh ``{phase: seconds}`` recorder for the accept run inside the block."""
+    phases: dict[str, float] = {}
+    token = _ACCEPT_PHASE_RECORDER.set(phases)
+    try:
+        yield phases
+    finally:
+        _ACCEPT_PHASE_RECORDER.reset(token)
+
+
+@contextlib.contextmanager
+def accept_phase(name: str) -> Iterator[None]:
+    """Add the block's ``time.monotonic`` seconds to the bound recorder's ``name``.
+
+    Seconds accumulate, so a phase re-run under the promotion lock reports its
+    total, and a block that raises still counts what it spent -- which is how a
+    refused accept reports exactly the phases it reached. No recorder: a no-op.
+    """
+    phases = _ACCEPT_PHASE_RECORDER.get()
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        if phases is not None:
+            phases[name] = phases.get(name, 0.0) + max(0.0, time.monotonic() - started)
+
+
 # The seams are runtime names only.  ``Any`` and ``_WorkerWorkspaceT`` appear
 # solely in annotations -- which ``from __future__ import annotations`` leaves
 # as strings -- so they are resolved from this module's own imports and are
@@ -3259,6 +3300,7 @@ ACCEPT_REVIEW_LOCAL_NAMES: tuple[str, ...] = (
     "carried_reviewer_evidence",
     "retained_sealed_binding",
     "_stored_hash_mismatch_refusal",
+    "accept_phase",
 )
 
 ACCEPT_REVIEW_SEAM_NAMES: tuple[str, ...] = (
@@ -4612,35 +4654,38 @@ def accept_review(
                 nonlocal combined_tree, combined_tree_checks
                 nonlocal neighbour_tests, union_validation_reuse
                 in_flight.advance("combined_tree_gate")
-                union_workspace, combined_tree = create_combined_validation_workspace(
-                    workspace,
-                    card,
-                    changed,
-                )
+                with accept_phase("combined_tree_preparation"):
+                    union_workspace, combined_tree = create_combined_validation_workspace(
+                        workspace,
+                        card,
+                        changed,
+                    )
                 try:
-                    union_validations, union_validation_reuse = (
-                        _union_validations_once(
-                            workspace,
-                            card,
-                            latest,
-                            changed,
-                            combined_tree=combined_tree,
-                            snapshot_base_oid=union_workspace.base_oid,
-                            run_declared=lambda: _run_declared_validations(
-                                union_workspace, card, latest
-                            ),
-                            reuse=validation_reuse,
+                    with accept_phase("declared_validation"):
+                        union_validations, union_validation_reuse = (
+                            _union_validations_once(
+                                workspace,
+                                card,
+                                latest,
+                                changed,
+                                combined_tree=combined_tree,
+                                snapshot_base_oid=union_workspace.base_oid,
+                                run_declared=lambda: _run_declared_validations(
+                                    union_workspace, card, latest
+                                ),
+                                reuse=validation_reuse,
+                            )
                         )
-                    )
-                    union_quality = quality_evidence.run_completion_quality_gate(
-                        union_workspace.path,
-                        changed_paths=changed,
-                        requested_risk_tier=effective_requested_tier,
-                        risk_signals=effective_risk_signals,
-                        combined_tree_scope=True,
-                        policy_root=self.repo if inherited_policy else None,
-                        baseline_root=self.repo,
-                    )
+                    with accept_phase("quality_gates"):
+                        union_quality = quality_evidence.run_completion_quality_gate(
+                            union_workspace.path,
+                            changed_paths=changed,
+                            requested_risk_tier=effective_requested_tier,
+                            risk_signals=effective_risk_signals,
+                            combined_tree_scope=True,
+                            policy_root=self.repo if inherited_policy else None,
+                            baseline_root=self.repo,
+                        )
                     if not union_quality.get("passed"):
                         union_blockers = union_quality.get("blocking_checks") or []
                         failed_checks = [row for row in union_quality.get("checks") or []
@@ -4679,15 +4724,16 @@ def accept_review(
                     # ``neighbour_tests_failed:`` and the card stays in review.
                     # NF-2026-02069: green finalization evidence on this same
                     # reused tree and selection is reused instead.
-                    neighbour_tests = accept_neighbour_tests.reused_finalization_neighbours(
-                        validation_reuse, union_validation_reuse, neighbour_selection
-                    ) or accept_neighbour_tests.run_neighbour_tests(
-                        neighbour_selection,
-                        card,
-                        run=_run_declared_validations,
-                        workspace=union_workspace,
-                        route_metadata=latest,
-                    )
+                    with accept_phase("neighbour_tests"):
+                        neighbour_tests = accept_neighbour_tests.reused_finalization_neighbours(
+                            validation_reuse, union_validation_reuse, neighbour_selection
+                        ) or accept_neighbour_tests.run_neighbour_tests(
+                            neighbour_selection,
+                            card,
+                            run=_run_declared_validations,
+                            workspace=union_workspace,
+                            route_metadata=latest,
+                        )
                     combined_tree["validation"] = union_validations
                     combined_tree["quality_gate"] = union_quality
                     combined_tree["neighbour_tests"] = neighbour_tests
@@ -4951,51 +4997,52 @@ def accept_review(
                 if correction_record is not None
                 else []
             )
-            quality_gate = quality_evidence.run_completion_quality_gate(
-                workspace.path,
-                baseline_root=self.repo,
-                changed_paths=changed,
-                requested_risk_tier=effective_requested_tier,
-                risk_signals=effective_risk_signals,
-                reviewer_reports=verified_reviewer_reports,
-                combined_tree_checks=combined_tree_checks,
-                worker_provider=str(latest.get("adapter_id") or runner),
-                human_approval=high_risk_approval,
-                reachability_inputs=self._candidate_reachability_inputs(
-                    workspace, changed
-                ),
-                # The two inputs the supplemental decision needs, and nothing
-                # the gate can use to PASS anything: the packet each lens was
-                # sealed against, and how many re-reads that lens already had.
-                review_packets=sealed_review_packets,
-                supplemental_rounds=supplemental_rounds_completed(reviewers),
-                **(
-                    {"finding_dispositions": accepted_finding_dispositions}
-                    if accepted_finding_dispositions
-                    else {}
-                ),
-                # Only a VALIDATED correction reaches the authoritative gate,
-                # so the lift it performs can never rest on a caller's claim
-                # nothing checked (NF-2026-01469).
-                # ``validation:<i>`` ids name a failed declared row, never a
-                # reviewer finding, so they never reach the reviewer gate.
-                **(
-                    {"corrected_finding_ids": reviewer_corrected_ids}
-                    if reviewer_corrected_ids
-                    else {}
-                ),
-                # NF-2026-02308: reviewers the hub MEASURED as never having
-                # read the candidate are blind whatever they filed.
-                **(
-                    {
-                        "overlay_unreachable_reviewers": frozenset(
-                            overlay_unreachable_ids
-                        )
-                    }
-                    if overlay_unreachable_ids
-                    else {}
-                ),
-            )
+            with accept_phase("quality_gates"):
+                quality_gate = quality_evidence.run_completion_quality_gate(
+                    workspace.path,
+                    baseline_root=self.repo,
+                    changed_paths=changed,
+                    requested_risk_tier=effective_requested_tier,
+                    risk_signals=effective_risk_signals,
+                    reviewer_reports=verified_reviewer_reports,
+                    combined_tree_checks=combined_tree_checks,
+                    worker_provider=str(latest.get("adapter_id") or runner),
+                    human_approval=high_risk_approval,
+                    reachability_inputs=self._candidate_reachability_inputs(
+                        workspace, changed
+                    ),
+                    # The two inputs the supplemental decision needs, and nothing
+                    # the gate can use to PASS anything: the packet each lens was
+                    # sealed against, and how many re-reads that lens already had.
+                    review_packets=sealed_review_packets,
+                    supplemental_rounds=supplemental_rounds_completed(reviewers),
+                    **(
+                        {"finding_dispositions": accepted_finding_dispositions}
+                        if accepted_finding_dispositions
+                        else {}
+                    ),
+                    # Only a VALIDATED correction reaches the authoritative gate,
+                    # so the lift it performs can never rest on a caller's claim
+                    # nothing checked (NF-2026-01469).
+                    # ``validation:<i>`` ids name a failed declared row, never a
+                    # reviewer finding, so they never reach the reviewer gate.
+                    **(
+                        {"corrected_finding_ids": reviewer_corrected_ids}
+                        if reviewer_corrected_ids
+                        else {}
+                    ),
+                    # NF-2026-02308: reviewers the hub MEASURED as never having
+                    # read the candidate are blind whatever they filed.
+                    **(
+                        {
+                            "overlay_unreachable_reviewers": frozenset(
+                                overlay_unreachable_ids
+                            )
+                        }
+                        if overlay_unreachable_ids
+                        else {}
+                    ),
+                )
             quality_gate["combined_tree"] = combined_tree
             quality_gate["neighbour_tests"] = neighbour_tests
             quality_gate["quality_policy_authority"] = policy_authority
@@ -5127,12 +5174,13 @@ def accept_review(
             # digest without any worker edit. Hashing the changed paths right
             # before it lets the refusal below name the drift validation caused.
             pre_validation_hashes = _changed_path_hashes(workspace, changed)
-            validations, full_validation_snapshot = (
-                _run_full_snapshot_validations(
-                    workspace, card, latest, changed,
-                    **({"reuse": validation_reuse} if validation_reuse else {}),
+            with accept_phase("declared_validation"):
+                validations, full_validation_snapshot = (
+                    _run_full_snapshot_validations(
+                        workspace, card, latest, changed,
+                        **({"reuse": validation_reuse} if validation_reuse else {}),
+                    )
                 )
-            )
             quality_gate["full_validation_snapshot"] = full_validation_snapshot
             _enforce_behavioral_gate(card, validations, quality_gate)
             # ``accepted_path_hashes`` IS ``stored_hashes`` unless a manager
@@ -5168,7 +5216,8 @@ def accept_review(
             # - the path-hash compare above reads this request's retained worktree,
             #   which the request lock protects and no other accept writes.
             in_flight.advance("awaiting_promotion_lock")
-            promotion_busy_reply = _enter_promotion_lock()
+            with accept_phase("promotion_lock_wait"):
+                promotion_busy_reply = _enter_promotion_lock()
             if promotion_busy_reply is not None:
                 return _reply_with_correction_restored(
                     workspace, correction_originals, promotion_busy_reply
@@ -5229,12 +5278,13 @@ def accept_review(
                 if _combined_tree_required():
                     _validate_combined_tree()
                 in_flight.advance("revalidating")
-                validations, full_validation_snapshot = (
-                    _run_full_snapshot_validations(
-                        workspace, card, latest, changed,
-                        **({"reuse": union_validation_reuse} if union_validation_reuse else {}),
+                with accept_phase("declared_validation"):
+                    validations, full_validation_snapshot = (
+                        _run_full_snapshot_validations(
+                            workspace, card, latest, changed,
+                            **({"reuse": union_validation_reuse} if union_validation_reuse else {}),
+                        )
                     )
-                )
                 quality_gate["combined_tree"] = combined_tree
                 quality_gate["neighbour_tests"] = neighbour_tests
                 quality_gate["full_validation_snapshot"] = full_validation_snapshot
@@ -5284,9 +5334,10 @@ def accept_review(
             # NF-2026-01469: promotion can raise before writing any byte (a
             # backwards-version refusal) or mid-write; either way CORRECTED
             # bytes must not be left behind in the retained worktree.
-            promoted = self._promote_accepted_candidate(
-                workspace, changed, merged_hashes=combined_tree.get("merged_paths")
-            )
+            with accept_phase("promotion"):
+                promoted = self._promote_accepted_candidate(
+                    workspace, changed, merged_hashes=combined_tree.get("merged_paths")
+                )
         except WorkspaceError as exc:
             if correction_originals:
                 _restore_correction_originals(workspace, correction_originals)

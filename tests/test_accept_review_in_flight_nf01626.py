@@ -541,6 +541,11 @@ def _tool_reply(result: Any) -> dict[str, Any]:
     return json.loads(result.content[0].text)
 
 
+def _untimed(reply: dict[str, Any]) -> dict[str, Any]:
+    """The reply without its wall-clock phase timings, which differ between two calls."""
+    return {key: value for key, value in reply.items() if key != "accept_phase_seconds"}
+
+
 @_needs_sdk
 def test_mcp_accept_reports_progress_while_a_slow_accept_runs(slow_accept):
     reported, notes, result = asyncio.run(_accept_over_mcp(with_progress=True))
@@ -548,7 +553,7 @@ def test_mcp_accept_reports_progress_while_a_slow_accept_runs(slow_accept):
     assert notes, "no notifications/progress reached the client during the accept"
     assert reported and reported == sorted(set(reported)), reported
     direct = server.aiworkhub_agent_accept_review(request_id=REQUEST_ID, task_id=TASK_ID)
-    assert _tool_reply(result) == json.loads(json.dumps(direct))
+    assert _untimed(_tool_reply(result)) == _untimed(json.loads(json.dumps(direct)))
     assert slow_accept.calls == 2
 
 
@@ -558,7 +563,7 @@ def test_mcp_accept_without_a_progress_token_sends_none(slow_accept):
 
     assert reported == [] and notes == []
     direct = server.aiworkhub_agent_accept_review(request_id=REQUEST_ID, task_id=TASK_ID)
-    assert _tool_reply(result) == json.loads(json.dumps(direct))
+    assert _untimed(_tool_reply(result)) == _untimed(json.loads(json.dumps(direct)))
 
 
 def test_the_accept_tool_function_stays_synchronous_with_its_parameters():
@@ -634,7 +639,7 @@ def test_the_stdio_fallback_still_lists_and_calls_the_accept_tool():
     assert "aiworkhub_agent_accept_review" in payload["listed"]
     assert "isError" not in payload["called"]
     assert list(payload["called"]) == ["content"]
-    assert json.loads(payload["called"]["content"][0]["text"]) == {
+    assert _untimed(json.loads(payload["called"]["content"][0]["text"])) == {
         "ok": False,
         "error": "accept_refused_for_test",
         "request_id": "R-1",

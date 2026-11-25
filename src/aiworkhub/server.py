@@ -8250,22 +8250,32 @@ def aiworkhub_agent_accept_review(
     # itself, so a manager whose marker cannot be read here still reaches it.
     in_flight = _accept_in_flight_refusal(manager, request_id, task_id)
     if in_flight is not None:
-        return in_flight
-    with _TASK_LIFECYCLE_WRITE_LOCK:
-        pre_accept = accept_commit.snapshot_before_accept(core.repo_root(), auto_commit=auto_commit)
-        result = manager.accept_review(
-            request_id,
-            task_id,
-            confirm_destructive_change=confirm_destructive_change,
-            requested_risk_tier=requested_risk_tier,
-            risk_signals=risk_signals,
-            reviewer_reports=reviewer_reports,
-            reviewer_request_ids=reviewer_request_ids,
-            confirm_high_risk=confirm_high_risk,
-            manager_correction=manager_correction,
-        )
+        # NF-2026-02425: refused before any phase ran, so no phase was reached.
+        return {**in_flight, process_launcher_accept_review.ACCEPT_PHASE_SECONDS_KEY: {}}
+    # NF-2026-02425: per-phase wall-clock seconds, refusals included. ``accept_review``
+    # spans the sub-phases it reports itself, so its remainder is the unattributed part.
+    phase_key = process_launcher_accept_review.ACCEPT_PHASE_SECONDS_KEY
+    accept_phase = process_launcher_accept_review.accept_phase
+    recorded_phases = process_launcher_accept_review.accept_phases_recorded()
+    with _TASK_LIFECYCLE_WRITE_LOCK, recorded_phases as phases:
+        with accept_phase("snapshot_before_accept"):
+            pre_accept = accept_commit.snapshot_before_accept(
+                core.repo_root(), auto_commit=auto_commit
+            )
+        with accept_phase("accept_review"):
+            result = manager.accept_review(
+                request_id,
+                task_id,
+                confirm_destructive_change=confirm_destructive_change,
+                requested_risk_tier=requested_risk_tier,
+                risk_signals=risk_signals,
+                reviewer_reports=reviewer_reports,
+                reviewer_request_ids=reviewer_request_ids,
+                confirm_high_risk=confirm_high_risk,
+                manager_correction=manager_correction,
+            )
         if not isinstance(result, dict) or not result.get("ok"):
-            return result
+            return {**result, phase_key: dict(phases)} if isinstance(result, dict) else result
         receipt: dict[str, Any] = {"schema_id": "aiworkhub.accept_review_receipt.v1", **result}
         # The accept reply never carried the card; its identity is one bounded
         # read, best-effort so a read failure cannot fail an accept that landed.
@@ -8281,10 +8291,12 @@ def aiworkhub_agent_accept_review(
             if view is not None:
                 receipt["card"] = view
         receipt["include_card"] = include_card
-        receipt["commit"] = accept_commit.commit_promoted(
-            pre_accept, receipt, card if isinstance(card, dict) else None,
-            task_id=task_id, request_id=request_id, commit_message=commit_message,
-        )
+        with accept_phase("commit_promoted"):
+            receipt["commit"] = accept_commit.commit_promoted(
+                pre_accept, receipt, card if isinstance(card, dict) else None,
+                task_id=task_id, request_id=request_id, commit_message=commit_message,
+            )
+        receipt[phase_key] = dict(phases)
         return _with_learning_closeout(
             receipt,
             task_id=task_id,

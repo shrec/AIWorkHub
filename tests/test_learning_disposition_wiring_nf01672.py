@@ -550,6 +550,7 @@ def test_a_plain_accept_reply_is_exactly_what_it_was(decisions):
         **server._card_identity(card),
         "include_card": "none",
         "commit": commit,
+        "accept_phase_seconds": receipt["accept_phase_seconds"],
     }
     assert json.dumps(receipt, sort_keys=True) == json.dumps(expected, sort_keys=True)
     assert receipt["status"] == "finished"
@@ -804,6 +805,7 @@ def test_a_refused_accept_attempts_no_closeout(decisions):
         request_id=REQUEST_ID, task_id=TASK_ID, lesson_candidate=LESSON
     )
 
+    assert set(reply.pop("accept_phase_seconds")) == {"snapshot_before_accept", "accept_review"}
     assert reply == {"ok": False, "error": "accept_refused"}
     _assert_nothing_recorded(decisions.root)
 
