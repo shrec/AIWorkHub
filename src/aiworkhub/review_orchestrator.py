@@ -336,6 +336,12 @@ def reviewer_route_adapter_refusal(route: Mapping[str, Any]) -> str:
     return ""
 
 
+# NF-2026-02404: the soft refusal of a route whose auth/quota circuit is
+# half_open. It is a demotion, not a hard filter: select_reviewer_route keeps
+# such a route as the last resort only.
+CREDENTIAL_UNRECOVERED_REASON = "credential_unrecovered"
+
+
 def _review_route_refusal(
     repo: Path,
     route: Mapping[str, str],
@@ -362,15 +368,24 @@ def _review_route_refusal(
     # unreadable circuit skips nothing: any exception reads as
     # "not open", exactly like ``_derivation_route_circuit``.
     try:
-        if (
-            workforce_catalog.route_circuit_for(
-                repo, route["adapter_id"], route["model"]
-            ).get("state")
-            == "open"
-        ):
-            return "circuit_open"
+        circuit = workforce_catalog.route_circuit_for(
+            repo, route["adapter_id"], route["model"]
+        )
+        state = circuit.get("state")
+        failure_kind = str(circuit.get("failure_kind") or "")
     except Exception:
+        # An unreadable circuit skips nothing, exactly as before.
         return ""
+    if state == "open":
+        return "circuit_open"
+    # NF-2026-02404: a tripped auth/quota route whose cooldown has passed and
+    # that has not succeeded since is DEMOTED, not refused: selection keeps it
+    # as the last resort when no other route is launchable.
+    if (
+        state == "half_open"
+        and failure_kind in workforce_catalog.QUOTA_REROUTE_FAILURE_KINDS
+    ):
+        return CREDENTIAL_UNRECOVERED_REASON
     return ""
 
 
@@ -458,6 +473,15 @@ def select_reviewer_route(
     # NF-2026-02356: with a recorded start on this host, a ranked route that
     # has started beats a ranked one that never has; with none, the first
     # launchable ranked route wins exactly as before.
+    # NF-2026-02404: the first DEMOTED route (credential_unrecovered), kept as
+    # the last resort only; every other refusal is recorded exactly as before.
+    demoted: list[dict[str, str]] = []
+
+    def _refuse(route: Mapping[str, str], why: str) -> None:
+        _record_skip(route, why)
+        if why == CREDENTIAL_UNRECOVERED_REASON and not demoted:
+            demoted.append(dict(route))
+
     started = frozenset(started_routes)
     first_launchable: dict[str, str] | None = None
     for candidate in primary:
@@ -466,7 +490,7 @@ def select_reviewer_route(
             continue
         route, refusal = examined
         if refusal:
-            _record_skip(route, refusal)
+            _refuse(route, refusal)
             continue
         if not started or _review_route_identity(route) in started:
             return route
@@ -492,7 +516,7 @@ def select_reviewer_route(
             _record_skip(route, "ranker_excluded:" + ",".join(ranker_hard[identity]))
             continue
         if refusal:
-            _record_skip(route, refusal)
+            _refuse(route, refusal)
             continue
         return {**route, "route_fallback": {"reason": "started_route_fallback"}}
     # Fallback pass: the ranker preferred nothing, so a launchable route it
@@ -506,7 +530,7 @@ def select_reviewer_route(
             _record_skip(route, "ranker_excluded:" + ",".join(reasons))
             continue
         if refusal:
-            _record_skip(route, refusal)
+            _refuse(route, refusal)
             continue
         return {
             **route,
@@ -514,6 +538,11 @@ def select_reviewer_route(
                 "reason": "ranked_routes_exhausted",
                 "ranker_exclusion": list(reasons),
             },
+        }
+    if demoted:
+        return {
+            **demoted[0],
+            "route_fallback": {"reason": "credential_unrecovered_last_resort"},
         }
     raise ReviewRouteUnavailable(lens, skipped)
 
@@ -5862,6 +5891,12 @@ class ReviewOrchestrator:
                 and not self._is_archived(accepted_reviewer_task)
             ):
                 self._require_ok(result, "reviewer_archive_failed")
+            # NF-2026-02404: the dead earlier route attempts of this lens are
+            # superseded by the accepted reviewer; best-effort per card.
+            self._archive_superseded_attempts(
+                action.chain_id, action.lens, accepted_reviewer_task,
+                str(accepted["reviewer_request_id"]),
+            )
             return self._receipt(
                 action, reviewer_task_id=accepted_reviewer_task,
                 reviewer_request_id=str(accepted["reviewer_request_id"]), result=result,
@@ -6742,6 +6777,33 @@ class ReviewOrchestrator:
             return ""
         canonical = task_store.canonical_status(card)
         return "" if canonical in REVIEWABLE_TARGET_STATUSES else str(canonical)
+
+    def _archive_superseded_attempts(
+        self, chain_id: int, lens: str, accepted_reviewer_task: str,
+        accepted_request: str,
+    ) -> None:
+        """NF-2026-02404: archive each earlier route attempt of this chain+lens.
+
+        Every attempt whose reviewer task is not the accepted one and is not
+        already archived is superseded by the accepted reviewer. Best-effort per
+        card: a failure reading the history or archiving one attempt never fails
+        the archive action or the accepted reviewer's own archive.
+        """
+        try:
+            attempts = self._route_attempts(int(chain_id), str(lens))
+        except Exception:  # noqa: BLE001 - history unreadable: nothing superseded here
+            return
+        for attempt in attempts:
+            task = str(attempt.get("reviewer_task_id") or "")
+            if not task or task == accepted_reviewer_task or self._is_archived(task):
+                continue
+            try:
+                task_engine.archive_task(
+                    self.manager.repo, task, actor="system",
+                    reason=f"superseded reviewer attempt:verified_by:{accepted_request}",
+                )
+            except Exception:  # noqa: BLE001 - one attempt's failure is not the action's
+                continue
 
     def _is_archived(self, task_id: str) -> bool:
         try:

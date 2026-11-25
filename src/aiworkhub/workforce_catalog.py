@@ -787,8 +787,16 @@ def _route_failure_kind(process: Mapping[str, Any]) -> str:
         and str(process.get("adapter_id") or "").strip() == "vscode_lm"
     ):
         # Lazy: terminal_failure_classification is a heavy module.
-        from .terminal_failure_classification import _VSCODE_LM_BEHAVIOUR_CODES
+        from .terminal_failure_classification import (
+            _VSCODE_LM_BEHAVIOUR_CODES,
+            reviewer_route_credential_code,
+        )
 
+        # NF-2026-02404: a rejected editor credential is an auth fact, so it
+        # trips the single-failure circuit.  The classifier's whole token
+        # decides; the ``:diagnostics=`` tail never counts (the owner's rule).
+        if reviewer_route_credential_code(process.get("error")):
+            return "auth"
         tokens = set(re.split(r"[^a-z0-9_]+", error))
         if tokens & set(_VSCODE_LM_BEHAVIOUR_CODES):
             return "harness_behaviour"
