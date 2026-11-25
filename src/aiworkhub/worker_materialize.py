@@ -380,6 +380,29 @@ def checkout_policy(
         raise error(str(exc)) from exc
 
 
+def assert_git_toplevel(
+    repo: Path,
+    run: Callable[..., Any],
+    *,
+    error: Callable[[str], BaseException],
+) -> None:
+    """Refuse ``repo`` unless git itself reports it as its own toplevel.
+
+    NF-2026-02428: a directory without a valid ``.git`` (none at all, or an
+    empty/invalid ``.git`` directory git skips) makes discovery climb into an
+    enclosing repository, so a worktree would be registered there.  A linked
+    worktree or submodule (``.git`` file) is its own toplevel and passes.
+    ``run`` is the caller's git runner, so its scrubbed environment (keeping
+    ``GIT_CEILING_DIRECTORIES``) applies; ``repo`` must already be resolved.
+    """
+    result = run(["git", "rev-parse", "--show-toplevel"], cwd=repo)
+    top = str(result.stdout or "").strip()
+    if result.returncode != 0 or not top:
+        raise error("repo_not_git_toplevel")
+    if os.path.normcase(str(Path(top).resolve())) != os.path.normcase(str(repo)):
+        raise error("repo_not_git_toplevel")
+
+
 def expand_full_tree(
     path: Path,
     card: Mapping[str, Any],

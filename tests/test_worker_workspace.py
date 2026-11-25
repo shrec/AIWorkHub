@@ -27,6 +27,21 @@ from aiworkhub import worker_workspace  # noqa: E402
 from aiworkhub import platform_io  # noqa: E402
 from aiworkhub import promotion_merge  # noqa: E402
 
+# NF-2026-02428: create_workspace's pre-create toplevel guard runs this probe.
+_TOPLEVEL_PROBE = ["git", "rev-parse", "--show-toplevel"]
+
+
+def _allow_toplevel_probe(fake: Callable[..., object]) -> Callable[..., object]:
+    """Route only the pre-create toplevel probe to the real runner; fake the rest."""
+    real_run = worker_workspace._run
+
+    def run(argv, *args, **kwargs):
+        if list(argv) == _TOPLEVEL_PROBE:
+            return real_run(argv, *args, **kwargs)
+        return fake(argv, *args, **kwargs)
+
+    return run
+
 
 def _fchmod_permitted() -> bool:
     """Whether this environment can actually execute an ``fchmod``.
@@ -240,7 +255,7 @@ def test_create_workspace_timeout_uses_process_free_cleanup(
             tree_terminated=True,
         )
 
-    monkeypatch.setattr(worker_workspace, "_run", fail_worktree_add)
+    monkeypatch.setattr(worker_workspace, "_run", _allow_toplevel_probe(fail_worktree_add))
     monkeypatch.setattr(
         worker_workspace,
         "cleanup_workspace",
@@ -433,7 +448,7 @@ def test_workspace_rejects_missing_exact_card_input_before_git_launch(
     def git_launch_forbidden(*_args, **_kwargs):
         raise AssertionError("missing input must fail before worktree launch")
 
-    monkeypatch.setattr(worker_workspace, "_run", git_launch_forbidden)
+    monkeypatch.setattr(worker_workspace, "_run", _allow_toplevel_probe(git_launch_forbidden))
     with pytest.raises(
         worker_workspace.WorkspaceError,
         match=rf"workspace_required_input_missing:field={field}:index=0:path=missing/input.py",
@@ -521,7 +536,7 @@ def test_workspace_rejects_missing_validation_script_before_git_launch(
     def git_launch_forbidden(*_args, **_kwargs):
         raise AssertionError("missing validation script must fail before worktree launch")
 
-    monkeypatch.setattr(worker_workspace, "_run", git_launch_forbidden)
+    monkeypatch.setattr(worker_workspace, "_run", _allow_toplevel_probe(git_launch_forbidden))
     with pytest.raises(
         worker_workspace.WorkspaceError,
         match="workspace_required_input_missing:field=validation:index=0:path=scripts/missing.py",
@@ -871,7 +886,7 @@ def test_missing_declared_quality_config_fails_before_worktree_launch(
     def git_launch_forbidden(*_args, **_kwargs):
         raise AssertionError("missing quality support must fail before Git launch")
 
-    monkeypatch.setattr(worker_workspace, "_run", git_launch_forbidden)
+    monkeypatch.setattr(worker_workspace, "_run", _allow_toplevel_probe(git_launch_forbidden))
     with pytest.raises(
         worker_workspace.WorkspaceError,
         match=(
@@ -2274,6 +2289,8 @@ def test_workspace_creation_uses_bounded_metadata_not_post_create_git_probes(
 
     def guarded_run(argv, **kwargs):
         calls.append(tuple(argv))
+        if len(calls) == 1 and list(argv) == _TOPLEVEL_PROBE:
+            return real_run(argv, **kwargs)  # pre-create guard (NF-2026-02428)
         if len(argv) > 1 and argv[1] in {"symbolic-ref", "rev-parse"}:
             raise AssertionError(f"post-create Git probe forbidden: {argv}")
         return real_run(argv, **kwargs)
@@ -2288,6 +2305,7 @@ def test_workspace_creation_uses_bounded_metadata_not_post_create_git_probes(
     try:
         assert len(workspace.base_oid or "") in {40, 64}
         assert [call[1] for call in calls if len(call) > 1] == [
+            "rev-parse",
             "worktree",
             "sparse-checkout",
             "sparse-checkout",
@@ -2299,7 +2317,7 @@ def test_workspace_creation_uses_bounded_metadata_not_post_create_git_probes(
             # argv chunk is the intended contract, not a post-create probe.
             "--no-optional-locks",
         ]
-        assert "--no-checkout" in calls[0]
+        assert "--no-checkout" in calls[1]
         assert not (workspace.path / "parent-secret.txt").exists()
         assert (workspace.path / "out" / "result.txt").is_file()
     finally:

@@ -706,7 +706,7 @@ def _git_environment() -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.upper().startswith("GIT_")
+        if not key.upper().startswith("GIT_") or key.upper() == "GIT_CEILING_DIRECTORIES"
     }
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -5113,6 +5113,7 @@ def create_workspace(
     if any(PurePosixPath(pattern).parts[0] == ".git" for pattern in allowed):
         raise WorkspaceError("git_metadata_write_forbidden")
     from . import worker_materialize  # card materialize/checkout rule (NF-2026-02237)
+    worker_materialize.assert_git_toplevel(repo, _run, error=WorkspaceError)
     policy = worker_materialize.checkout_policy(card, repo, error=WorkspaceError)
     root = configured_worktree_root(repo)
     canonical_repo_root = (repo / ".aiworkhub" / "runtime" / "worktrees").resolve(
