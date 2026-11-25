@@ -263,8 +263,12 @@ transport/lease/batching contract):
   Codex models included. Readiness check: bootstrap inside the seat reports
   `provider=manager_chat`, `route_state=ready` and `callback_supported=true`.
 - **Claude Code chat**: automatic through `aiworkhub_claude_callback_wait` /
-  `aiworkhub_claude_callback_ack` plus a background
-  `python -m aiworkhub.manager_callback_watch --provider claude ...`.
+  `aiworkhub_claude_callback_ack` plus a background watcher. Once per session,
+  after bootstrap, start
+  `python -m aiworkhub.manager_callback_watch --repo <repo> --provider claude --origin-thread-id <manager session id>`
+  in the background; when it exits, call `aiworkhub_claude_callback_wait`,
+  immediately `aiworkhub_claude_callback_ack`, then restart the watcher
+  (wake -> wait -> ack).
 - **Codex VS Code sidebar chat**: inbox only since the Codex mux was retired in
   0.12.85. A `route_pending` route with `codex_thread_id_not_observed` is the
   expected state when Codex does not pass its thread id to the MCP server. The

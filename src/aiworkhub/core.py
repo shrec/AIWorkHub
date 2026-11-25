@@ -3266,7 +3266,7 @@ def _manager_contract() -> dict[str, Any]:
                 "delivers to the repository's current verified Codex manager; "
                 "the originating thread remains immutable audit provenance"
             ),
-            "claude": "call aiworkhub_dispatcher_ensure_started, then aiworkhub_claude_callback_wait and immediately ack",
+            "claude": "call aiworkhub_dispatcher_ensure_started; once per session after bootstrap, start in the background `python -m aiworkhub.manager_callback_watch --repo <repo> --provider <provider> --origin-thread-id <manager session id>`; when it exits, call aiworkhub_claude_callback_wait and immediately ack, then restart the watcher",
         },
         "rules": [
             "Managers use AIWorkHub manager AI tools before repository discovery, review, rebase, and planning.",
@@ -12584,6 +12584,9 @@ def dispatcher_health() -> dict[str, Any]:
         "problems": problems,
         "manager_context": _passive_codex_manager_context(root, target),
         **backlog,
+        # The remediation names Claude tools, so only a Claude-selected manager inbox gets it.
+        **({"remediation": callback_store.MANAGER_INBOX_REMEDIATION}
+           if "manager_inbox_no_live_delivery" in problems and target.get("selected_provider") == "claude" else {}),
     }
 
 

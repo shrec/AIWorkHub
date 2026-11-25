@@ -30,9 +30,14 @@ Which manager chat is woken automatically depends on the client:
   it to run Codex models with automatic callbacks, including on Windows.
 - **Claude Code chat:** the chat waits on `aiworkhub_claude_callback_wait` and
   acknowledges with `aiworkhub_claude_callback_ack` (a two-phase MCP
-  long-poll). A background
-  `python -m aiworkhub.manager_callback_watch --provider claude ...` exits when
-  a callback is pending, which re-invokes the model.
+  long-poll). Once per session, after bootstrap, start the watcher in the
+  background:
+  `python -m aiworkhub.manager_callback_watch --repo <repo> --provider claude --origin-thread-id <manager session id>`.
+  It exits when a callback is pending (without claiming it), which re-invokes
+  the model. The loop is wake -> `aiworkhub_claude_callback_wait` -> immediate
+  `aiworkhub_claude_callback_ack` -> restart the watcher. Without the watcher
+  the chat only polls and `aiworkhub_dispatcher_health` reports
+  `manager_inbox_no_live_delivery` with a `remediation` naming it.
 - **Codex VS Code sidebar chat:** manager inbox only. The App Server mux that
   used to push-wake a Codex thread was retired in 0.12.85 and Codex has no
   callback-wait tool, so the sidebar chat receives no push. It can still manage

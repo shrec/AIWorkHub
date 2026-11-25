@@ -2264,6 +2264,15 @@ def prune_stale_pending_callbacks(
 CALLBACK_BACKLOG_MAX_AGE_SECONDS = 7 * 24 * 3600
 EXPIRED_BACKLOG_REASON = "expired_backlog"
 CALLBACK_BACKLOG_EXPIRED_EVENT = "callback_backlog_expired"
+# NF-2026-02415: the live wake a polling Claude manager is missing.  Surfaced
+# by dispatcher_health as `remediation` beside manager_inbox_no_live_delivery.
+MANAGER_INBOX_REMEDIATION = (
+    "Start the background watcher once per session: "
+    "`python -m aiworkhub.manager_callback_watch --repo <repo> --provider <provider> "
+    "--origin-thread-id <manager session id>`. It exits when a callback is pending "
+    "without claiming it; then call aiworkhub_claude_callback_wait, immediately "
+    "aiworkhub_claude_callback_ack, and restart the watcher (wake -> callback_wait -> ack loop)."
+)
 
 
 # Public name for the store's one ISO-8601 parser (health reads backlog age).
