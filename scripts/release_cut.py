@@ -165,6 +165,9 @@ def _impact_modules() -> tuple[ModuleType, ModuleType]:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# The tracked list of known WSL failures; a release input lives in the repository,
+# never in .scratch, which may be cleared at any time.
+WSL_BASELINE = REPO_ROOT / "scripts" / "wsl_known_failures.txt"
 SCHEMA_ID = "aiworkhub.release_cut.v1"
 MAIN_BRANCH = "main"
 REMOTE = "origin"
@@ -2078,8 +2081,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wsl-baseline",
         type=Path,
+        default=WSL_BASELINE if WSL_BASELINE.is_file() else None,
         metavar="PATH",
-        help="known WSL failures, one pytest node id per line",
+        help=f"known WSL failures, one pytest node id per line (default: {WSL_BASELINE.name}, tracked)",
     )
     parser.add_argument(
         "--wsl-python",
