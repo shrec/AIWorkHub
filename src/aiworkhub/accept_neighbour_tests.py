@@ -1540,6 +1540,39 @@ def _base_red(
 # combined tree the declared validations ran in; accept reuses a green record
 # only when its own validation reuse matched that tree.
 FINALIZATION_REUSE_SOURCE = "finalization"
+# NF-2026-02436: a red finalization record stops the card before review_ready,
+# on the route a failing declared validation of the same kind takes. The kind
+# is measured from the candidate snapshot's own last attempt, never guessed.
+FINALIZATION_FAILURE_PREFIX = "finalization_" + NEIGHBOUR_FAILURE_PREFIX
+FINALIZATION_UNRUNNABLE_PREFIX = "finalization_neighbour_tests_unrunnable:"
+FAILURE_KIND_TEST = "test_failure"  # a test verdict -> ValidationRunError (validation_failed)
+FAILURE_KIND_ENVIRONMENT = "environment_blocked"  # -> ValidationEnvironmentBlocked
+FAILURE_KIND_UNRUNNABLE = "unrunnable"  # no verdict at all -> WorkspaceError (finalize_failed)
+
+
+def _refusal_detail(error: str) -> dict[str, Any]:
+    """The JSON detail of a ``neighbour_tests_failed:`` text, ``{}`` when unparseable."""
+    if not error.startswith(NEIGHBOUR_FAILURE_PREFIX):
+        return {}
+    try:
+        detail = json.loads(error[len(NEIGHBOUR_FAILURE_PREFIX):])
+    except ValueError:
+        return {}
+    return detail if isinstance(detail, dict) else {}
+
+
+def _failure_kind(cause: BaseException | None, failed_names: Sequence[str]) -> str:
+    """Name what a red neighbour run proved (NF-2026-02436).
+
+    Only a run whose refusal (or candidate rows) names failed tests is a test
+    verdict; a refusal with no named failure is ``unrunnable``, never a test
+    failure, so it is not routed to ``validation_failed`` without evidence.
+    """
+    if isinstance(cause, _workspace.ValidationEnvironmentBlocked):
+        return FAILURE_KIND_ENVIRONMENT
+    if failed_names:
+        return FAILURE_KIND_TEST
+    return FAILURE_KIND_UNRUNNABLE
 
 
 def run_finalization_neighbours(
@@ -1557,43 +1590,142 @@ def run_finalization_neighbours(
     """Select and run the neighbours once in the finalization snapshot.
 
     ``None`` when nothing is selected. Never raises: a red, erroring or
-    evidence-free run is recorded with ``passed: False`` (and its refusal text
-    under ``error``), so finalization stands and the accept runs it again.
+    evidence-free run is recorded with ``passed: False``, its refusal text under
+    ``error``, the failed node ids under ``failed``, the last candidate attempt's
+    rows under ``validation`` and its ``failure_kind``; the caller routes it with
+    :func:`finalization_neighbour_refusal` (NF-2026-02436).
     """
     selection = select_neighbour_tests(
         repo_root, candidate_changed_paths, declared_commands, candidate_root=candidate_root
     )
     if not selection.tests:
         return None
+    last: dict[str, Any] = {}
+
+    def candidate_run(ws: Any, authority: Mapping[str, Any], meta: Mapping[str, Any]) -> Any:
+        # Only the candidate snapshot's attempts decide the failure kind; a
+        # base_red run on canonical HEAD is judged inside run_neighbour_tests.
+        if ws is not workspace:
+            return run(ws, authority, meta)
+        last.clear()
+        try:
+            rows = run(ws, authority, meta)
+        except BaseException as exc:
+            last.update(rows=[dict(row) for row in getattr(exc, "results", None) or []], exc=exc)
+            raise
+        last.update(rows=[dict(row) for row in rows], exc=None)
+        return rows
+
     started = clock()
     try:
         evidence = run_neighbour_tests(
-            selection, card, run=run, workspace=workspace,
+            selection, card, run=candidate_run, workspace=workspace,
             route_metadata=route_metadata, clock=clock,
         )
-    except Exception as exc:  # recorded, never raised: finalization must not fail on it
+    except Exception as exc:  # recorded, never raised here: the caller routes it
         failed = selection.evidence()
         failed["command"] = neighbour_command(selection.tests)
         failed["duration_seconds"] = round(max(0.0, clock() - started), 3)
         failed["passed"] = False
         failed["error"] = (str(exc) or type(exc).__name__)[:NEIGHBOUR_FAILURE_DETAIL_CHARS]
+        rows = list(last.get("rows") or [])
+        cause = last["exc"] if last else exc
+        detail = _refusal_detail(str(exc))
+        names = detail.get("failed")
+        failed["failed"] = (
+            [str(name) for name in names][:MAX_REPORTED_FAILURES]
+            if isinstance(names, list) else _failed_tests(rows)[0]
+        )
+        failed["first_failure"] = str(
+            detail.get("first_failure") or failed["error"]
+        )[:_FIRST_FAILURE_CHARS]
+        failed["failure_kind"] = _failure_kind(cause, failed["failed"])
+        if failed["failure_kind"] == FAILURE_KIND_ENVIRONMENT:
+            failed["restriction"] = str(getattr(cause, "restriction", "") or "")
+        if rows:
+            failed["validation"] = rows
         return failed
     evidence["passed"] = True
     return evidence
 
 
-def reused_finalization_neighbours(
+def red_neighbour_view(recorded: Any) -> dict[str, Any] | None:
+    """NF-2026-02436: the named view of a red neighbour record, else ``None``.
+
+    Only ``passed is False`` is red; a green, absent or malformed record is not.
+    A record written before ``failed`` was stored falls back to its refusal text.
+    """
+    if not isinstance(recorded, Mapping) or recorded.get("passed") is not False:
+        return None
+    error = str(recorded.get("error") or "")
+    detail = _refusal_detail(error)
+    names = recorded.get("failed")
+    if not isinstance(names, list):
+        names = detail.get("failed")
+    selected = recorded.get("selected")
+    return {
+        "selected": [str(test) for test in selected] if isinstance(selected, list) else [],
+        "failed": (
+            [str(name) for name in names][:MAX_REPORTED_FAILURES]
+            if isinstance(names, list) else []
+        ),
+        "failure_kind": str(recorded.get("failure_kind") or ""),
+        "first_failure": str(
+            recorded.get("first_failure") or detail.get("first_failure") or error
+        )[:_FIRST_FAILURE_CHARS],
+    }
+
+
+def _view_detail(view: Mapping[str, Any], **extra: Any) -> str:
+    return _fit_detail({
+        "tests": list(view["selected"]), "failed": list(view["failed"]),
+        "first_failure": str(view["first_failure"]), **extra,
+    })
+
+
+def finalization_neighbour_refusal(
+    recorded: Any, validations: Sequence[Mapping[str, Any]]
+) -> WorkspaceError | None:
+    """The error a red finalization record finalizes with, ``None`` when it is not red.
+
+    A test verdict is a ``ValidationRunError`` (``validation_failed``, the
+    declared-validation failure route), an environment block a
+    ``ValidationEnvironmentBlocked`` (as a declared one), and a run with no
+    verdict a plain ``WorkspaceError`` (``finalize_failed``). The rows are the
+    declared ``validations`` then the neighbour run's own, stamped
+    ``finalization_neighbour``, whose digests name the failed tests.
+    """
+    view = red_neighbour_view(recorded)
+    if view is None:
+        return None
+    rows = [dict(row) for row in validations] + [
+        {**dict(row), "finalization_neighbour": True}
+        for row in recorded.get("validation") or ()
+        if isinstance(row, Mapping)
+    ]
+    text = _view_detail(view, failure_kind=view["failure_kind"])
+    if view["failure_kind"] == FAILURE_KIND_TEST:
+        return ValidationRunError("validation_failed:" + FINALIZATION_FAILURE_PREFIX + text, rows)
+    if view["failure_kind"] == FAILURE_KIND_ENVIRONMENT:
+        return _workspace.ValidationEnvironmentBlocked(
+            "validation_environment_blocked:" + FINALIZATION_FAILURE_PREFIX + text, rows,
+            restriction=str(recorded.get("restriction") or "") or "finalization_neighbour_tests",
+        )
+    return WorkspaceError(FINALIZATION_UNRUNNABLE_PREFIX + text)
+
+
+def _matched_finalization_record(
     finalizer_reuse: Mapping[str, Any] | None,
     union_reuse: Mapping[str, Any] | None,
     selection: NeighbourSelection,
-) -> dict[str, Any] | None:
-    """The finalizer's green neighbour evidence when accept may reuse it, else ``None``.
+) -> Mapping[str, Any] | None:
+    """The finalizer's neighbour record for this exact tree and selection, else ``None``.
 
-    Reuse needs all of: a non-empty accept-time selection; the accept's union
+    Needs all of: a non-empty accept-time selection; the accept's union
     validation having reused this exact finalizer record (same snapshot, no
     accept-union run of its own -- which a manager correction already rules
-    out, since it yields no finalizer record); recorded ``passed is True``; and
-    a recorded selection equal to ``selection.tests``.
+    out, since it yields no finalizer record); and a recorded selection equal
+    to ``selection.tests``. Green or red is the caller's question.
     """
     if not selection.tests:
         return None
@@ -1609,7 +1741,6 @@ def reused_finalization_neighbours(
     recorded = snapshot.get("neighbour_tests")
     if (
         not isinstance(recorded, Mapping)
-        or recorded.get("passed") is not True
         or recorded.get("selected") != list(selection.tests)
     ):
         return None
@@ -1624,4 +1755,46 @@ def reused_finalization_neighbours(
         and recorded.get("closure_covers_selected") is not True
     ):
         return None
+    return recorded
+
+
+def reused_finalization_neighbours(
+    finalizer_reuse: Mapping[str, Any] | None,
+    union_reuse: Mapping[str, Any] | None,
+    selection: NeighbourSelection,
+) -> dict[str, Any] | None:
+    """The finalizer's green neighbour evidence when accept may reuse it, else ``None``.
+
+    Reuse needs :func:`_matched_finalization_record` and recorded ``passed is True``.
+    """
+    recorded = _matched_finalization_record(finalizer_reuse, union_reuse, selection)
+    if recorded is None or recorded.get("passed") is not True:
+        return None
     return {**dict(recorded), "reused_from": FINALIZATION_REUSE_SOURCE}
+
+
+def refuse_recorded_red_neighbours(
+    finalizer_reuse: Mapping[str, Any] | None,
+    union_reuse: Mapping[str, Any] | None,
+    selection: NeighbourSelection,
+) -> None:
+    """NF-2026-02436: refuse from a red finalization record on this exact tree.
+
+    The same gate as reuse (:func:`_matched_finalization_record`), so the known
+    failure is not re-run in full; a different tree identity, selection or a
+    moved HEAD the closure does not cover runs the neighbours again. Only a
+    recorded test verdict refuses: an unrunnable or environment-blocked record
+    (or a legacy record naming no failed test) proved nothing about the tree,
+    so accept re-runs the neighbours as before.
+    """
+    view = red_neighbour_view(
+        _matched_finalization_record(finalizer_reuse, union_reuse, selection)
+    )
+    if view is None:
+        return
+    kind = view["failure_kind"]
+    if kind != FAILURE_KIND_TEST and (kind or not view["failed"]):
+        return
+    raise WorkspaceError(
+        NEIGHBOUR_FAILURE_PREFIX + _view_detail(view, reused_from=FINALIZATION_REUSE_SOURCE)
+    )

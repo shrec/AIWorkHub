@@ -79,3 +79,19 @@ def launch_sandbox_visibility(
     if not isinstance(receipt, Mapping):
         return None
     return summarize_sandbox_visibility(receipt)
+
+
+def red_finalization_neighbours(evidence: Any) -> dict[str, Any] | None:
+    """NF-2026-02436: the recorded red finalization neighbour run, named, else ``None``.
+
+    ``evidence`` is a terminal review's evidence; the run sits at
+    ``quality_gate.full_validation_snapshot.neighbour_tests``. The view names the
+    failed tests, so a manager never re-runs the suite to learn them.
+    """
+    from .accept_neighbour_tests import red_neighbour_view
+
+    gate = evidence.get("quality_gate") if isinstance(evidence, Mapping) else None
+    snapshot = gate.get("full_validation_snapshot") if isinstance(gate, Mapping) else None
+    return red_neighbour_view(
+        snapshot.get("neighbour_tests") if isinstance(snapshot, Mapping) else None
+    )

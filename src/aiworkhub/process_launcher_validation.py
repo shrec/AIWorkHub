@@ -1223,7 +1223,7 @@ def run_full_snapshot_validations(
             **_identity_record_fields(identity),
             "validations_all_passed": all_passed,
         }
-        if all_passed:  # NF-2026-02069: neighbours on this sealed tree; red never raises
+        if all_passed:  # NF-2026-02069: neighbours on this sealed tree
             from . import accept_neighbour_tests
 
             neighbours = accept_neighbour_tests.run_finalization_neighbours(
@@ -1244,6 +1244,13 @@ def run_full_snapshot_validations(
                     str(test) in closure for test in neighbours.get("selected") or ()
                 )
                 record["neighbour_tests"] = neighbours
+                # NF-2026-02436: a red run stops the card here, on the route a failing
+                # declared validation of the same kind takes -- never at review_ready.
+                refusal = accept_neighbour_tests.finalization_neighbour_refusal(
+                    neighbours, validations
+                )
+                if refusal is not None:
+                    raise refusal
         return validations, record
     finally:
         cleanup_workspace(snapshot.repo, snapshot.path, snapshot.home)

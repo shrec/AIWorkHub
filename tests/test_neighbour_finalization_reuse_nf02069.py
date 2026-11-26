@@ -187,22 +187,44 @@ def test_empty_selection_runs_no_neighbours(
     assert len(select.calls) == 1 and len(fake.runs) == 1
 
 
+_NAMED_RED = {
+    "returncode": 1,
+    "timed_out": False,
+    "stdout_tail": "FAILED tests/test_a.py::test_x - AssertionError: boom",
+    "pytest_failure_digest": {
+        "failures": [{"test": "tests/test_a.py::test_x", "kind": "failed", "message": "boom"}],
+        "omitted": 0,
+    },
+}
+
+
 @pytest.mark.parametrize(
-    "neighbour",
-    [_RED, WorkspaceError("validation_environment_blocked:x"), RuntimeError("runner crashed")],
-    ids=["red_rows", "workspace_error", "unexpected_error"],
+    ("neighbour", "kind"),
+    [
+        (_NAMED_RED, neighbours.FAILURE_KIND_TEST),
+        # A red run naming no failed test is no test verdict (NF-2026-02436 rework).
+        (_RED, neighbours.FAILURE_KIND_UNRUNNABLE),
+        (WorkspaceError("validation_environment_blocked:x"), neighbours.FAILURE_KIND_UNRUNNABLE),
+        (RuntimeError("runner crashed"), neighbours.FAILURE_KIND_UNRUNNABLE),
+    ],
+    ids=["red_rows_named", "red_rows_unnamed", "workspace_error", "unexpected_error"],
 )
-def test_red_or_erroring_neighbours_are_recorded_not_raised(
-    tmp_path: Path, select: _Select, neighbour: Any
+def test_red_or_erroring_neighbours_are_recorded_then_routed(
+    tmp_path: Path, select: _Select, neighbour: Any, kind: str
 ) -> None:
+    # NF-2026-02436: recorded by run_finalization_neighbours, then raised by the
+    # finalization so the card never reaches review_ready on a red run.
     fake = _Snapshot(tmp_path, declared=_GREEN, neighbour=neighbour)
-    rows, record = fake.call()
-    assert record["validations_all_passed"] is True
-    evidence = record["neighbour_tests"]
-    assert evidence["passed"] is False
-    assert evidence["selected"] == list(_TESTS)
-    assert evidence["error"]
-    assert evidence["command"].startswith("python -m pytest -n 2 ")
+    with pytest.raises(WorkspaceError) as caught:
+        fake.call()
+    is_test_verdict = isinstance(caught.value, validation.ValidationRunError)
+    assert is_test_verdict is (kind == neighbours.FAILURE_KIND_TEST)
+    prefix = (
+        "validation_failed:" + neighbours.FINALIZATION_FAILURE_PREFIX
+        if is_test_verdict else neighbours.FINALIZATION_UNRUNNABLE_PREFIX
+    )
+    assert str(caught.value).startswith(prefix)
+    assert f'"failure_kind": "{kind}"' in str(caught.value)
     assert fake.cleaned == 1
 
 

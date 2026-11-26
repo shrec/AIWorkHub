@@ -133,6 +133,9 @@ ACCEPT_BLOCKER_KINDS = (
     "gate_receipt_pending",
     "gate_receipt_stale",
     "gate_receipt_red",
+    # A finalization neighbour run recorded red, named by its failed tests
+    # (NF-2026-02436); accept refuses it with the same ``neighbour_tests_failed:``.
+    "neighbour_tests_failed",
 )
 
 
@@ -3064,6 +3067,16 @@ def accept_preview(self, request_id: str, task_id: str, **overrides: Any) -> dic
             self.repo, task_id=task_id, request_id=request_id, card=card
         )
     )
+    # NF-2026-02436: a recorded red finalization neighbour run blocks, by test name.
+    from . import review_packet
+
+    red_neighbours = review_packet.red_finalization_neighbours(evidence)
+    if red_neighbours is not None:
+        preview_blockers.append(_blocker(
+            "neighbour_tests_failed",
+            ",".join(red_neighbours["failed"]) or red_neighbours["first_failure"],
+            finalization_neighbour_tests=red_neighbours,
+        ))
     return {
         **result,
         "evaluated": True,
@@ -4728,6 +4741,11 @@ def accept_review(
                                 reuse=validation_reuse,
                             )
                         )
+                    # NF-2026-02436: a red finalization record on this exact tree and
+                    # selection refuses now instead of re-running the known failure.
+                    accept_neighbour_tests.refuse_recorded_red_neighbours(
+                        validation_reuse, union_validation_reuse, neighbour_selection
+                    )
                     with accept_phase("quality_gates"):
                         union_quality = quality_evidence.run_completion_quality_gate(
                             union_workspace.path,
