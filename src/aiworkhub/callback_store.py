@@ -2289,12 +2289,6 @@ MANAGER_INBOX_REMEDIATION = (
     "without claiming it; then call aiworkhub_claude_callback_wait, immediately "
     "aiworkhub_claude_callback_ack, and restart the watcher (wake -> callback_wait -> ack loop)."
 )
-# NF-2026-02438: the bootstrap operating-contract line, from the same one helper.
-CLAUDE_CALLBACK_CONTRACT = (
-    "call aiworkhub_dispatcher_ensure_started; once per session after bootstrap, "
-    f"start in the background `{_WATCH_COMMAND}`; when it exits, call "
-    "aiworkhub_claude_callback_wait and immediately ack, then restart the watcher"
-)
 
 
 # Public name for the store's one ISO-8601 parser (health reads backlog age).

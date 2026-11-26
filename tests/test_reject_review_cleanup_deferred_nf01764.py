@@ -176,8 +176,8 @@ class _Harness:
         """The cancel's terminal row lands, then its filesystem step meets a held handle."""
         real_append = process_event_ledger.append_event
 
-        def append_then_held(ledger: Path, event: dict[str, Any]) -> dict[str, Any]:
-            written = real_append(ledger, event)
+        def append_then_held(ledger: Path, event: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+            written = real_append(ledger, event, **kwargs)
             if event.get("request_id") == REVIEWER_REQUEST and event.get("state") == "cancelled":
                 raise make_error(path)
             return written

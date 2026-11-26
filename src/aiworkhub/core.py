@@ -43,6 +43,7 @@ from . import task_store
 from . import task_create_warnings as _task_create_warnings
 from . import task_retention
 from . import callback_store
+from . import tool_guard_hook
 from . import task_plan
 from . import dependency_autolaunch
 from . import learning_commit
@@ -2872,7 +2873,17 @@ MCP_MANAGER_CONTRACT_BANNER = (
 # ---------------------------------------------------------------------------
 MANAGER_BOOTSTRAP_SCHEMA_ID = "aiworkhub.manager_bootstrap.v2"
 MANAGER_CONTRACT_VERSION = "aiworkhub.manager_operating_contract.v2"
-CLAUDE_CALLBACK_CONTRACT = callback_store.CLAUDE_CALLBACK_CONTRACT  # NF-2026-02438
+# NF-2026-02438: the bootstrap callback line names the exact watcher command from
+# the one helper.  Built here, not in callback_store: MANAGER_CONTRACT is computed
+# at import, and reading callback_store would execute it on the first tools/list
+# (NF-2026-02053 module budget); tool_guard_hook is already loaded by then.
+CLAUDE_CALLBACK_CONTRACT = (
+    "call aiworkhub_dispatcher_ensure_started; once per session after bootstrap, "
+    "start in the background "
+    f"`{tool_guard_hook.manager_watch_command(None, None, provider=None, timeout=None)}`; "
+    "when it exits, call aiworkhub_claude_callback_wait and immediately ack, then "
+    "restart the watcher"
+)
 _CONTRACT_DELIVERY_LOCK = threading.Lock()
 _CONTRACT_DELIVERIES: dict[str, str] = {}
 _CONTRACT_DELIVERY_LIMIT = 256
