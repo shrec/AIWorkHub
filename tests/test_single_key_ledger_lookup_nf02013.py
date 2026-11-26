@@ -288,7 +288,13 @@ def test_routed_callers_return_what_they_returned_before(
         {}, task_id="T2", request_id=ABSENT, runner="claude", reason="boom"
     ) is None
 
-    assert task_retention._latest_process_row(tmp_path, OTHER) == dropped[OTHER]
-    assert task_retention._latest_process_row(tmp_path, KEY) == dropped[KEY]
+    # NF-2026-00966: retention asks only for the fields its fence reads; each
+    # holds exactly the value the packet-dropped fold holds.
+    for key in (OTHER, KEY):
+        assert task_retention._latest_process_row(tmp_path, key) == {
+            field: value
+            for field, value in dropped[key].items()
+            if field in task_retention._PROCESS_ROW_FIELDS
+        }
     assert task_retention._latest_process_row(tmp_path, ABSENT) is None
     assert ledger.latest_event_cache_stats()["entries"] == 0

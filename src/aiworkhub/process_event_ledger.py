@@ -16,6 +16,7 @@ import stat
 import threading
 import time
 import uuid
+from array import array
 from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
@@ -2044,9 +2045,6 @@ def _decode_checkpoint(
 
     coverage = _archive_coverage(archives)
     latest: dict[str, dict[str, Any]] = {}
-    digest = hashlib.sha256()
-    payload_bytes = 0
-    pending: bytes | None = None
     try:
         with target.open("rb") as handle:
             header_line = handle.readline(_CHECKPOINT_HEADER_MAX_BYTES + 1)
@@ -2065,34 +2063,119 @@ def _decode_checkpoint(
                 or checkpoint_mtime_ns < max(item[2] for item in coverage[:covered])
             ):
                 return None
-            for line in handle:
-                if pending is not None:
-                    if not _fold_checkpoint_line(latest, pending):
-                        return None
-                    digest.update(pending)
-                    payload_bytes += len(pending)
-                pending = line
+            if not _verified_payload(
+                handle, lambda line: _fold_checkpoint_line(latest, line)
+            ):
+                return None
     # RecursionError: json's answer to a deeply nested line is not a ValueError.
     except (OSError, ValueError, RecursionError):
-        return None
-    if pending is None or not pending.endswith(b"\n"):
-        return None
-    try:
-        trailer = json.loads(pending)
-    except (ValueError, RecursionError):
-        return None
-    if (
-        not isinstance(trailer, dict)
-        or trailer.get("rows") != len(latest)
-        or trailer.get("payload_bytes") != payload_bytes
-        or trailer.get("payload_sha256") != digest.hexdigest()
-    ):
         return None
     return covered, latest
 
 
 class _CheckpointOversize(Exception):
     """The checkpoint would exceed ``_CHECKPOINT_PAYLOAD_MAX_BYTES``."""
+
+
+def _publish_keyed_file(
+    target: Path, header: bytes, entries: Iterable[Any], *, max_payload_bytes: int
+) -> str:
+    """Atomically publish ``header``, one compact JSON line per entry and a
+    trailer with the entry count, payload length and payload sha256 -- the
+    one file format of archive checkpoints and key indexes. Returns the
+    outcome (``written``, ``write_skipped_oversize`` or ``write_failed``); a
+    failure never leaves its temporary behind."""
+
+    temporary = target.with_name(f".{target.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    published = False
+    outcome = "write_failed"
+    try:
+        target.parent.mkdir(mode=0o700, exist_ok=True)
+        info = target.parent.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError("process_event_checkpoint_dir_invalid")
+        # A writer killed mid-write never reaches the ``finally`` below, so its
+        # temporary would stay forever; a live write takes seconds, so any
+        # temporary older than an hour is such an orphan and is removed first.
+        horizon = time.time() - 3600
+        for orphan in target.parent.glob(".*.tmp"):
+            try:
+                if orphan.lstat().st_mtime < horizon:
+                    orphan.unlink()
+            except OSError:
+                pass
+        digest = hashlib.sha256()
+        payload_bytes = 0
+        rows = 0
+        with os.fdopen(os.open(temporary, flags, 0o600), "wb") as handle:
+            handle.write(header)
+            for entry in entries:
+                line = (
+                    json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n"
+                ).encode("ascii")
+                payload_bytes += len(line)
+                if payload_bytes > max_payload_bytes:
+                    raise _CheckpointOversize
+                digest.update(line)
+                handle.write(line)
+                rows += 1
+            trailer = {
+                "rows": rows,
+                "payload_bytes": payload_bytes,
+                "payload_sha256": digest.hexdigest(),
+            }
+            handle.write(
+                (json.dumps(trailer, ensure_ascii=True, sort_keys=True) + "\n").encode(
+                    "ascii"
+                )
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(temporary, target)
+        published = True
+        outcome = "written"
+    except _CheckpointOversize:
+        outcome = "write_skipped_oversize"
+    except (OSError, TypeError, ValueError):
+        outcome = "write_failed"
+    finally:
+        if not published:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+    return outcome
+
+
+def _verified_payload(handle: Iterable[bytes], add: Callable[[bytes], bool]) -> bool:
+    """Feed every payload line after an already-read header to ``add`` and
+    check the trailer ``_publish_keyed_file`` wrote. ``False`` on any
+    rejected line or trailer mismatch; json errors propagate to the caller."""
+
+    digest = hashlib.sha256()
+    payload_bytes = 0
+    rows = 0
+    pending: bytes | None = None
+    for line in handle:
+        if pending is not None:
+            if not add(pending):
+                return False
+            digest.update(pending)
+            payload_bytes += len(pending)
+            rows += 1
+        pending = line
+    if pending is None or not pending.endswith(b"\n"):
+        return False
+    trailer = json.loads(pending)
+    return (
+        isinstance(trailer, dict)
+        and trailer.get("rows") == rows
+        and trailer.get("payload_bytes") == payload_bytes
+        and trailer.get("payload_sha256") == digest.hexdigest()
+    )
 
 
 def _write_checkpoint(
@@ -2123,66 +2206,12 @@ def _write_checkpoint(
         _count_checkpoint("write_skipped_oversize")
         return
     target = _checkpoint_path(path, identity)
-    temporary = target.with_name(f".{target.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    published = False
-    outcome = "write_failed"
-    try:
-        target.parent.mkdir(mode=0o700, exist_ok=True)
-        info = target.parent.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise OSError("process_event_checkpoint_dir_invalid")
-        # A writer killed mid-write never reaches the ``finally`` below, so its
-        # temporary would stay forever; a live write takes seconds, so any
-        # temporary older than an hour is such an orphan and is removed first.
-        horizon = time.time() - 3600
-        for orphan in target.parent.glob(".*.tmp"):
-            try:
-                if orphan.lstat().st_mtime < horizon:
-                    orphan.unlink()
-            except OSError:
-                pass
-        digest = hashlib.sha256()
-        payload_bytes = 0
-        with os.fdopen(os.open(temporary, flags, 0o600), "wb") as handle:
-            handle.write(header)
-            for key, row in latest.items():
-                line = (
-                    json.dumps([key, row], ensure_ascii=True, separators=(",", ":"))
-                    + "\n"
-                ).encode("ascii")
-                payload_bytes += len(line)
-                if payload_bytes > _CHECKPOINT_PAYLOAD_MAX_BYTES:
-                    raise _CheckpointOversize
-                digest.update(line)
-                handle.write(line)
-            trailer = {
-                "rows": len(latest),
-                "payload_bytes": payload_bytes,
-                "payload_sha256": digest.hexdigest(),
-            }
-            handle.write(
-                (json.dumps(trailer, ensure_ascii=True, sort_keys=True) + "\n").encode(
-                    "ascii"
-                )
-            )
-            handle.flush()
-            os.fsync(handle.fileno())
-        atomic_replace(temporary, target)
-        published = True
-        outcome = "written"
-    except _CheckpointOversize:
-        outcome = "write_skipped_oversize"
-    except (OSError, TypeError, ValueError):
-        outcome = "write_failed"
-    finally:
-        if not published:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
+    outcome = _publish_keyed_file(
+        target,
+        header,
+        ([key, row] for key, row in latest.items()),
+        max_payload_bytes=_CHECKPOINT_PAYLOAD_MAX_BYTES,
+    )
     _count_checkpoint(outcome)
 
 
@@ -2487,6 +2516,455 @@ def latest_events(
     return copy_projection(view)
 
 
+# --- Persisted per-archive key index (NF-2026-00966) -------------------------
+#
+# ``latest_event``'s exact single-key scan (NF-2026-02013) still read every
+# byte of every rotated archive for each key, and retention asks once per
+# card: the dashboard server streamed 50 archives / 2.4 GB over and over at
+# ~1.2 cores. Rotated archives are immutable, so the lines a key's rows sit on
+# are a pure function of an archive's bytes: they are indexed once per
+# (archive, key field), persisted beside the checkpoints, and a lookup then
+# reads only that key's own lines. The active file keeps an in-memory index
+# that each lookup extends by the appended bytes only.
+#
+# An index records a line iff the exact scan would fold it: the line parses
+# to an object whose ``str(row[key_field])`` has an exact raw token
+# (``_key_token``) that the raw line contains. It is never an authority: one
+# that is missing, corrupt (length + sha256), from another schema, rule
+# version or key field, written before its archive, or naming an archive whose
+# (name, size, mtime_ns) differs is rebuilt from the archive; a line that does
+# not re-verify on read discards the index and the lookup falls back to the
+# exact scan. Spills keep the full projection, as before.
+
+_KEY_INDEX_SCHEMA_ID = "aiworkhub.process_event_key_index.v1"
+_KEY_INDEX_RULE_VERSION = 1
+_KEY_INDEX_SUFFIX = ".keyidx"
+# A persisted index larger than this is neither written nor decoded.
+_KEY_INDEX_PAYLOAD_MAX_BYTES = 64 * 1024 * 1024
+_KEY_INDEX_CACHE_MAX_ENTRIES = 512
+_KEY_INDEX_CACHE_MAX_BYTES = 64 * 1024 * 1024
+# Estimated retained bytes per indexed key beyond its text and packed offsets:
+# the str header, the bytes header and one dict slot.
+_KEY_INDEX_ENTRY_OVERHEAD = 56 + 33 + 24
+# The active file's first bytes are kept so an index is never extended over a
+# file that was replaced in place.
+_KEY_INDEX_HEAD_BYTES = 256
+
+
+@dataclass(frozen=True)
+class _KeyIndex:
+    signature: _FileSignature
+    # Bytes indexed from the segment start: an archive's whole size, or the
+    # end of the active file's last complete row.
+    complete_offset: int
+    # key -> packed native uint64 line starts, ascending.
+    offsets: Mapping[str, bytes]
+    head: bytes = b""
+    estimated_bytes: int = 0
+
+
+_KEY_INDEX_CACHE_LOCK = threading.RLock()
+_KEY_INDEX_CACHE: OrderedDict[tuple[str, str], _KeyIndex] = OrderedDict()
+_KEY_INDEX_STATS_LOCK = threading.Lock()
+_KEY_INDEX_STATS: dict[str, int] = {
+    "built": 0,
+    "extended": 0,
+    "loaded": 0,
+    "absent": 0,
+    "rejected": 0,
+    "written": 0,
+    "write_failed": 0,
+    "write_skipped_oversize": 0,
+    "verify_failed": 0,
+    "fallback": 0,
+}
+
+
+def _count_key_index(outcome: str) -> None:
+    with _KEY_INDEX_STATS_LOCK:
+        _KEY_INDEX_STATS[outcome] = _KEY_INDEX_STATS.get(outcome, 0) + 1
+
+
+def latest_event_key_index_stats() -> dict[str, int]:
+    """Process-local key-index outcomes plus the in-memory index footprint."""
+
+    with _KEY_INDEX_STATS_LOCK:
+        stats = dict(_KEY_INDEX_STATS)
+    with _KEY_INDEX_CACHE_LOCK:
+        stats["entries"] = len(_KEY_INDEX_CACHE)
+        stats["estimated_bytes"] = sum(
+            _projection_weight(item) for item in _KEY_INDEX_CACHE.values()
+        )
+    stats["budget_bytes"] = _KEY_INDEX_CACHE_MAX_BYTES
+    return stats
+
+
+def reset_key_index_cache() -> None:
+    """Drop every in-memory key index (persisted indexes stay valid)."""
+
+    with _KEY_INDEX_CACHE_LOCK:
+        _KEY_INDEX_CACHE.clear()
+
+
+def _cache_key_index(cache_key: tuple[str, str], index: _KeyIndex) -> None:
+    _cache_bounded_projection(
+        _KEY_INDEX_CACHE,
+        _KEY_INDEX_CACHE_LOCK,
+        cache_key,
+        index,
+        _KEY_INDEX_CACHE_MAX_ENTRIES,
+        max_bytes=_KEY_INDEX_CACHE_MAX_BYTES,
+    )
+
+
+def _key_index_path(path: Path, archive_name: str, key_field: str) -> Path:
+    digest = hashlib.sha256(key_field.encode("utf-8")).hexdigest()[:16]
+    return checkpoint_dir(path) / f"{archive_name}.{digest}{_KEY_INDEX_SUFFIX}"
+
+
+def _indexed_row(raw_line: bytes, key_field: str) -> tuple[str, dict[str, Any]] | None:
+    """(key, row) when the exact single-key scan would fold ``raw_line`` under
+    ``key`` -- the line holds that key's exact raw token -- else ``None``.
+    json errors other than a decode failure propagate (the scan's own)."""
+
+    try:
+        row = json.loads(raw_line.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(row, dict):
+        return None
+    key = str(row.get(key_field) or "")
+    token = _key_token(key) if key else None
+    if token is None or token not in raw_line:
+        return None
+    return key, row
+
+
+def _key_index_weight(offsets: Mapping[str, bytes], head: bytes) -> int:
+    return len(head) + sum(
+        _KEY_INDEX_ENTRY_OVERHEAD + len(key) + len(value)
+        for key, value in offsets.items()
+    )
+
+
+def _build_key_index(
+    segment: Path,
+    signature: _FileSignature,
+    key_field: str,
+    *,
+    base: _KeyIndex | None,
+    archive: bool,
+) -> _KeyIndex | None:
+    """Index ``segment`` from ``base``'s end (or its start) up to the size in
+    ``signature``. An archive is indexed to its last byte, as the scan reads
+    it; the active file only through its last complete row. ``None`` when the
+    segment is not the one described, was replaced under ``base``, or holds a
+    line json cannot judge."""
+
+    start = base.complete_offset if base is not None else 0
+    limit = signature[3]
+    found: dict[str, list[int]] = {}
+    position = start
+    try:
+        with segment.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            size = int(opened.st_size)
+            if (
+                (int(opened.st_dev), int(opened.st_ino)) != signature[1:3]
+                or size < limit
+                or (archive and size != limit)
+            ):
+                return None
+            head = handle.read(_KEY_INDEX_HEAD_BYTES)
+            if base is not None and head[: len(base.head)] != base.head:
+                return None
+            handle.seek(start)
+            for raw_line in handle:
+                end = position + len(raw_line)
+                if end > limit or (not archive and not raw_line.endswith(b"\n")):
+                    break
+                indexed = _indexed_row(raw_line, key_field)
+                if indexed is not None:
+                    found.setdefault(indexed[0], []).append(position)
+                position = end
+    except (OSError, ValueError, RecursionError):
+        return None
+    offsets: dict[str, bytes] = dict(base.offsets) if base is not None else {}
+    for key, starts in found.items():
+        offsets[key] = offsets.get(key, b"") + array("Q", starts).tobytes()
+    return _KeyIndex(
+        signature=signature,
+        complete_offset=position,
+        offsets=offsets,
+        head=head,
+        estimated_bytes=_key_index_weight(offsets, head),
+    )
+
+
+def _decode_key_index(
+    target: Path, signature: _FileSignature, key_field: str
+) -> _KeyIndex | None:
+    size = signature[3]
+    offsets: dict[str, bytes] = {}
+
+    def add(line: bytes) -> bool:
+        if not line.endswith(b"\n"):
+            return False
+        entry = json.loads(line)
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or entry[0] in offsets
+            or not isinstance(entry[1], list)
+            or not entry[1]
+        ):
+            return False
+        previous = -1
+        for start in entry[1]:
+            if type(start) is not int or not previous < start < size:
+                return False
+            previous = start
+        offsets[entry[0]] = array("Q", entry[1]).tobytes()
+        return True
+
+    try:
+        with target.open("rb") as handle:
+            header_line = handle.readline(_CHECKPOINT_HEADER_MAX_BYTES + 1)
+            if not header_line.endswith(b"\n"):
+                return None
+            header = json.loads(header_line)
+            if (
+                not isinstance(header, dict)
+                or header.get("schema_id") != _KEY_INDEX_SCHEMA_ID
+                or header.get("rule_version") != _KEY_INDEX_RULE_VERSION
+                or header.get("key_field") != key_field
+                or _valid_coverage([header.get("archive")], _archive_coverage((signature,)))
+                != 1
+            ):
+                return None
+            if not _verified_payload(handle, add):
+                return None
+    except (OSError, ValueError, RecursionError):
+        return None
+    return _KeyIndex(
+        signature=signature,
+        complete_offset=size,
+        offsets=offsets,
+        estimated_bytes=_key_index_weight(offsets, b""),
+    )
+
+
+def _load_key_index(
+    target: Path, signature: _FileSignature, key_field: str
+) -> _KeyIndex | None:
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        _count_key_index("absent")
+        return None
+    except OSError:
+        _count_key_index("rejected")
+        return None
+    loaded = None
+    if (
+        stat.S_ISREG(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_size <= _KEY_INDEX_PAYLOAD_MAX_BYTES + 2 * _CHECKPOINT_HEADER_MAX_BYTES
+        # Stale: written before the archive it names.
+        and info.st_mtime_ns >= signature[4]
+    ):
+        loaded = _decode_key_index(target, signature, key_field)
+    _count_key_index("rejected" if loaded is None else "loaded")
+    return loaded
+
+
+def _prune_key_indexes(path: Path) -> None:
+    """Remove persisted key indexes whose archive left the ledger (retention
+    compaction or a merge retired it), so the directory tracks live history."""
+
+    present = {item.name for item in ledger_paths(path)}
+    try:
+        candidates = list(
+            checkpoint_dir(path).glob(f"{path.stem}.*{_KEY_INDEX_SUFFIX}")
+        )
+    except OSError:
+        return
+    for candidate in candidates:
+        if candidate.name.rsplit(".", 2)[0] not in present:
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+
+
+def _write_key_index(path: Path, index: _KeyIndex, key_field: str) -> None:
+    header = (
+        json.dumps(
+            {
+                "schema_id": _KEY_INDEX_SCHEMA_ID,
+                "rule_version": _KEY_INDEX_RULE_VERSION,
+                "key_field": key_field,
+                "archive": _archive_coverage((index.signature,))[0],
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("ascii")
+        + b"\n"
+    )
+    if len(header) > _CHECKPOINT_HEADER_MAX_BYTES:
+        _count_key_index("write_skipped_oversize")
+        return
+    target = _key_index_path(path, Path(index.signature[0]).name, key_field)
+    outcome = _publish_keyed_file(
+        target,
+        header,
+        ([key, array("Q", packed).tolist()] for key, packed in index.offsets.items()),
+        max_payload_bytes=_KEY_INDEX_PAYLOAD_MAX_BYTES,
+    )
+    _count_key_index(outcome)
+    if outcome == "written":
+        _prune_key_indexes(path)
+
+
+def _archive_key_index(
+    path: Path, signature: _FileSignature, key_field: str
+) -> _KeyIndex | None:
+    cache_key = (signature[0], key_field)
+    with _KEY_INDEX_CACHE_LOCK:
+        cached = _KEY_INDEX_CACHE.get(cache_key)
+        if cached is not None and cached.signature == signature:
+            _KEY_INDEX_CACHE.move_to_end(cache_key)
+            return cached
+    archive = Path(signature[0])
+    index = _load_key_index(
+        _key_index_path(path, archive.name, key_field), signature, key_field
+    )
+    if index is None:
+        index = _build_key_index(archive, signature, key_field, base=None, archive=True)
+        if index is None:
+            return None
+        _count_key_index("built")
+        _write_key_index(path, index, key_field)
+    _cache_key_index(cache_key, index)
+    return index
+
+
+def _active_key_index(
+    signature: _FileSignature, key_field: str
+) -> _KeyIndex | None:
+    cache_key = (signature[0], key_field)
+    with _KEY_INDEX_CACHE_LOCK:
+        cached = _KEY_INDEX_CACHE.get(cache_key)
+        if cached is not None:
+            _KEY_INDEX_CACHE.move_to_end(cache_key)
+    base = (
+        cached
+        if cached is not None
+        and cached.signature[1:3] == signature[1:3]
+        and cached.complete_offset <= signature[3]
+        else None
+    )
+    if base is not None and base.signature == signature:
+        return base
+    segment = Path(signature[0])
+    index = _build_key_index(segment, signature, key_field, base=base, archive=False)
+    if index is None and base is not None:
+        base = None
+        index = _build_key_index(segment, signature, key_field, base=None, archive=False)
+    if index is None:
+        return None
+    _count_key_index("extended" if base is not None else "built")
+    _cache_key_index(cache_key, index)
+    return index
+
+
+def _discard_key_index(path: Path, index: _KeyIndex, key_field: str) -> None:
+    _count_key_index("verify_failed")
+    with _KEY_INDEX_CACHE_LOCK:
+        if _KEY_INDEX_CACHE.get((index.signature[0], key_field)) is index:
+            del _KEY_INDEX_CACHE[(index.signature[0], key_field)]
+    try:
+        _key_index_path(path, Path(index.signature[0]).name, key_field).unlink()
+    except OSError:
+        pass
+
+
+def _read_indexed_rows(
+    path: Path,
+    index: _KeyIndex,
+    key: str,
+    token: bytes,
+    key_field: str,
+    rows: list[dict[str, Any]],
+    *,
+    active: bool,
+) -> bool:
+    """Append ``key``'s indexed rows of one segment to ``rows`` -- and, for the
+    active file, every token-holding row past the index, to EOF, as the scan
+    reads it. ``False`` when the segment or an indexed line does not verify."""
+
+    packed = index.offsets.get(key)
+    if packed is None and not active:
+        return True
+    signature = index.signature
+    try:
+        with Path(signature[0]).open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            size = int(opened.st_size)
+            if (
+                (int(opened.st_dev), int(opened.st_ino)) != signature[1:3]
+                or size < signature[3]
+                or (not active and size != signature[3])
+            ):
+                return False
+            for start in array("Q", packed or b""):
+                handle.seek(start)
+                indexed = _indexed_row(handle.readline(), key_field)
+                if indexed is None or indexed[0] != key:
+                    _discard_key_index(path, index, key_field)
+                    return False
+                rows.append(indexed[1])
+            if active:
+                handle.seek(index.complete_offset)
+                rows.extend(_rows_containing(handle, [token]))
+    except (OSError, ValueError, RecursionError):
+        return False
+    return True
+
+
+def _indexed_key_rows(
+    path: Path, key: str, key_field: str
+) -> list[dict[str, Any]] | None:
+    """The rows the exact single-key scan yields for ``key``, oldest first,
+    read through the key indexes; ``None`` when they cannot answer exactly
+    (no exact raw token, a spill, or a segment that does not verify)."""
+
+    token = _key_token(key)
+    if token is None:
+        return None
+    segments = _checkpoint_segments(path, _ledger_signatures(path))
+    if segments is None:
+        return None
+    archives, active = segments
+    rows: list[dict[str, Any]] = []
+    for signature in archives:
+        index = _archive_key_index(path, signature, key_field)
+        if index is None or not _read_indexed_rows(
+            path, index, key, token, key_field, rows, active=False
+        ):
+            _count_key_index("fallback")
+            return None
+    if active is not None:
+        index = _active_key_index(active, key_field)
+        if index is None or not _read_indexed_rows(
+            path, index, key, token, key_field, rows, active=True
+        ):
+            _count_key_index("fallback")
+            return None
+    return rows
+
+
 def latest_event(
     path: Path,
     key: str,
@@ -2495,28 +2973,40 @@ def latest_event(
     skip_event_kinds: tuple[str, ...] = (),
     replace: bool = False,
     drop_fields: tuple[str, ...] = (),
+    keep_fields: Sequence[str] = (),
 ) -> dict[str, Any] | None:
     """The latest merged row for ``key`` (a copy), or ``None``.
 
     A cached projection for these exact fold options is served, with its
     incremental replay, as ``latest_events`` would. Otherwise one exact
-    single-key scan (NF-2026-02013) folds only the rows whose raw line holds
-    the key's JSON-quoted value: under merge, replace, skip_event_kinds and
-    drop_fields a row for another key cannot change this key's row, so the
-    answer equals ``latest_events(...).get(key)`` while the full-projection
-    cache is neither filled nor evicted. Spills and keys without an exact raw
-    token (``_key_token``) use the full projection.
+    single-key fold (NF-2026-02013) of only the rows whose raw line holds the
+    key's JSON-quoted value: under merge, replace, skip_event_kinds,
+    drop_fields and keep_fields a row for another key cannot change this
+    key's row, so the answer equals ``latest_events(...).get(key)`` while the
+    full-projection cache is neither filled nor evicted. Those rows are read
+    through the per-archive key index (NF-2026-00966), so a lookup costs the
+    key's own lines plus the active file's unindexed tail, not the history;
+    the raw scan answers whenever the index cannot. Spills and keys without
+    an exact raw token (``_key_token``) use the full projection.
     """
 
+    if isinstance(keep_fields, (str, bytes)):
+        raise ValueError("keep_fields must be a sequence of field names, not a string")
+    keep = tuple(sorted(set(keep_fields)))
     options: dict[str, Any] = {
         "key_field": key_field,
         "skip_event_kinds": skip_event_kinds,
         "replace": replace,
         "drop_fields": drop_fields,
+        "keep_fields": keep,
     }
     with _LATEST_EVENT_CACHE_LOCK:
         cached = _projection_key(path, **options) in _LATEST_EVENT_CACHE
-    rows = None if cached else _iter_events_containing(path, [_key_token(key)])
+    rows: Iterable[dict[str, Any]] | None = None
+    if not cached:
+        rows = _indexed_key_rows(path, key, key_field)
+        if rows is None:
+            rows = _iter_events_containing(path, [_key_token(key)])
     if rows is None:
         row = _latest_view(path, **options).get(key)
         return None if row is None else _copy_row(row)
@@ -2530,8 +3020,9 @@ def latest_event(
                 skip_event_kinds=skip_event_kinds,
                 replace=replace,
                 drop_fields=drop_fields,
+                keep_fields=keep,
             )
-    # Every retained value came from this scan's own parse: nothing is shared.
+    # Every retained value came from this fold's own parse: nothing is shared.
     return latest.get(key)
 
 
@@ -2576,8 +3067,10 @@ def latest_event_cache_stats() -> dict[str, int]:
 
 
 def reset_latest_event_cache() -> None:
-    """Drop every retained latest-event projection (costs one cold replay)."""
+    """Drop every retained latest-event projection and in-memory key index
+    (costs one cold replay; persisted checkpoints and key indexes stay)."""
 
+    reset_key_index_cache()
     with _LATEST_EVENT_CACHE_LOCK:
         _LATEST_EVENT_CACHE.clear()
 

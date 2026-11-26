@@ -1053,11 +1053,27 @@ def _candidate_ids(
     return selected
 
 
+# The only ledger fields the archive-eligibility fence reads. Retention asks
+# for these alone (NF-2026-00966), as ``manager_callback_wait`` does, so a
+# fallback projection is a few small fields per request instead of the
+# packet-dropped fold of every full row.
+_PROCESS_ROW_FIELDS: tuple[str, ...] = (
+    "request_id",
+    "task_id",
+    "state",
+    "terminal_state",
+    "timestamp",
+)
+
+
 def _latest_process_row(root: Path | str, request_id: str) -> Mapping[str, Any] | None:
     from . import process_event_ledger
 
     return process_event_ledger.latest_event(
-        _process_event_log_path(root), request_id, key_field="request_id", drop_fields=("packet",)
+        _process_event_log_path(root),
+        request_id,
+        key_field="request_id",
+        keep_fields=_PROCESS_ROW_FIELDS,
     )
 
 
