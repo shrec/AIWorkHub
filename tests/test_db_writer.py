@@ -73,9 +73,11 @@ db = %(db)r
 stamp = %(stamp)r
 with db_writer.write_lease(db, timeout_s=30):
     # Record an interval; overlapping intervals prove the lease was not honoured.
-    start = time.time()
+    # Monotonic, not wall clock: CLOCK_MONOTONIC is system-wide, so the children's
+    # stamps compare, and a host clock resync (WSL steps it) cannot fake an overlap.
+    start = time.monotonic()
     time.sleep(0.30)
-    end = time.time()
+    end = time.monotonic()
 with open(stamp, "a") as fh:
     fh.write("%%f %%f %%d\n" %% (start, end, os.getpid()))
 """
