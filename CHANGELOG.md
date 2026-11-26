@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.13.15] - 2026-11-26
+
+### Fixed
+
+- Linux hosts: the callback-watcher command published by the Stop guard and the manager contract names the exact interpreter and `PYTHONPATH` the server runs under, so it no longer fails with `ModuleNotFoundError` when the bundled runtime is not importable from the system Python; when no package parent can be found the guard says so instead of publishing a command known to fail (NF-2026-02438).
+- Process-event ledger: an unchanged status snapshot is no longer re-appended on every reconcile pass (one request had written 2,808 identical rows, another 71k); rotated archives beyond eight active-file generations are compacted, removing only pure-duplicate rows, with bounded work per rotation and no rewrite of an out-of-order archive while a spill exists (measured: 49 segments, 2.3 GB); the per-request projection cache keeps up to 4096 keys inside a 64 MiB byte budget, so status calls stop re-reading all history (NF-2026-02443).
+- Accept: red finalization neighbour tests stop the card before `review_ready` on the route a failing declared validation takes, and `review_packet`/`accept_preview` name the failed tests; accept refuses from a recorded test verdict on the same tree instead of re-running it, and re-runs a record that proved nothing (unrunnable or environment-blocked) (NF-2026-02436). The neighbour lane names failed tests from the full-output digest and caps the xdist width by available memory (NF-2026-02435, NF-2026-02434).
+- Review: `accept_preview` reports a queued auto-review instead of `required_reviewer_missing` with `reviewer_running: false` (NF-2026-02440); the callback review digest carries the real `open_finding_count` and a `review_phase` that tells the two `review_ready` wakes apart (NF-2026-02439); the `accept_review` tool description documents the `manager_measured`, `validation:<i>` and `manager:` evidence ids (NF-2026-02437).
+- A reject lesson derives its own canonical evidence reference, so it reaches AI Memory (NF-2026-02442).
+- Worker Source Graph `bodygrep` shows live-overlay files under a directory or prefix target (NF-2026-02441).
+- Windows: the `opencode models` probe runs from the executable's own directory inside a kill-on-close job, so the long-lived process opencode leaves behind no longer holds the caller's working directory (pytest tmp dirs, worktrees and scratch stayed undeletable, failing the release suite with WinError 32) (NF-2026-02445, NF-2026-02447).
+
 ## [0.13.14] - 2026-11-25
 
 ### Added

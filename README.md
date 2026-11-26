@@ -177,13 +177,12 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.14
+## What's new in 0.13.15
 
-- Manager Chat panel: no wake for an already-terminal card and no redelivered wake; rotation happens before the provider's auto-compaction point; turn teardown stops the worker supervisors it launched; a Claude turn no longer ends early on an injected task notification.
-- Callbacks for cards created by a Claude or Codex session stay on that session instead of moving to the Manager Chat panel.
-- Disk: terminal task worktrees, worker logs and earlier releases' pytest scratch are reclaimed; worker workspaces refuse a path that is not a git toplevel.
-- Review and accept: no replay of a reviewer whose receipt is gone, per-finding diff context in `review_packet`, neighbour tests never silently cut, `stored_hash_mismatch` names its paths, and per-sub-phase accept timing.
-- `needfix_convert` can launch the card in the same call; `claude_*` runners prefer `claude_cli`.
+- Linux: the callback-watcher command names the exact interpreter and `PYTHONPATH`, so it starts where the bundled runtime is not importable from the system Python.
+- The process-event ledger stops re-writing unchanged status rows and compacts old duplicate history (2.3 GB measured on a long-running host).
+- Accept: a red finalization neighbour test stops the card before review and names the failed tests; `accept_preview` reports a queued auto-review; the callback digest carries real finding counts.
+- Reject lessons reach AI Memory; worker `bodygrep` sees live-overlay files under a directory target.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

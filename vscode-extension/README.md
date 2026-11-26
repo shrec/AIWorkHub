@@ -94,11 +94,12 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.14
+## What's new in 0.13.15
 
-- Manager Chat panel: no wake for an already-terminal card and no redelivered wake; rotation before the provider's auto-compaction point; turn teardown stops the worker supervisors it launched; a Claude turn no longer ends early on an injected task notification.
-- Callbacks for cards created by a Claude or Codex session stay on that session instead of moving to the Manager Chat panel.
-- Terminal task worktrees, worker logs and earlier releases' test scratch are reclaimed; worker workspaces refuse a path that is not a git toplevel.
+- Linux: the callback-watcher command names the exact interpreter and `PYTHONPATH`, so it starts where the bundled runtime is not importable from the system Python.
+- The process-event ledger stops re-writing unchanged status rows and compacts old duplicate history (2.3 GB measured on a long-running host).
+- Accept: a red finalization neighbour test stops the card before review and names the failed tests; `accept_preview` reports a queued auto-review; the callback digest carries real finding counts.
+- Reject lessons reach AI Memory; worker `bodygrep` sees live-overlay files under a directory target.
 - Review and accept fixes: no replay of a reviewer whose receipt is gone, per-finding diff context, neighbour tests never silently cut, per-sub-phase accept timing.
 
 ## Get started

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.15 — 2026-11-26
+
+### Fixed
+
+- Bundles runtime 0.13.15: on Linux the callback-watcher command names the exact interpreter and `PYTHONPATH`; the process-event ledger stops re-appending unchanged status rows and compacts duplicate history (2.3 GB measured); red finalization neighbour tests stop a card before review and name the failed tests; queued auto-review, callback finding-count, reject-lesson and worker `bodygrep` overlay fixes; on Windows the `opencode models` probe no longer leaves a process that locks the caller's directory.
+
 ## 0.13.14 — 2026-11-25
 
 ### Fixed
