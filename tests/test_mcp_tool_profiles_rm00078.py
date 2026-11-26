@@ -42,15 +42,19 @@ _MANAGER_PROBE = "aiworkhub_task_list"
 _NEVER_EXISTED = "aiworkhub_no_such_tool_rm00078"
 _WORKER_ONLY = "aiworkhub_worker_source_graph_query"
 _WRITE_PROBE = "aiworkhub_task_mark_done"
+# NF-2026-00964: a renamed tool and its pre-rename alias; called with no id, both refuse before any read.
+_RENAME_PROBES = ("aiworkhub_needfix_show", "needfix_show")
 
 # Measured on base 739a7c70, plus aiworkhub_manager_callback_lane_claim (NF-2026-01802), minus the five
 # retired manager Hub Mail tools and the three retired dashboard ones, plus the dashboard peers view,
-# plus aiworkhub_manager_recipe_run_status (NF-2026-01849), plus the manager needfix_transition.
-_PRE_TABLE_ALL_COUNT = 231
-_PRE_TABLE_ALL_READ_ONLY_COUNT = 227
+# plus aiworkhub_manager_recipe_run_status (NF-2026-01849), plus the manager needfix_transition, plus the
+# 20 pre-rename needfix_*/roadmap_* rename aliases (NF-2026-00964).
+_PRE_TABLE_ALL_COUNT = 251
+_PRE_TABLE_ALL_READ_ONLY_COUNT = 247
 # NF-2026-02139: manager 130 -> 115, the 15 rows below moved to manager-callable. Then 118 -> 117:
 # aiworkhub_dashboard_snapshot and aiworkhub_dashboard_needfix_transition left, needfix_transition joined.
 # NF-2026-01979: 117 -> 118, aiworkhub_manager_skill_propose is listed (skill_mine tells clients to call it).
+# NF-2026-00964: 118 -> 116, the needfix_count and aiworkhub_task_codex_handoff_markdown facet aliases left.
 _LISTED_COUNTS = {"manager": mcp_tool_metadata.MANAGER_LISTED_CEILING, "worker": 19, "dashboard": 67}
 # NF-2026-02139: callable by exact name on manager, absent from its tools/list. The extension (dashboard
 # surface) calls the loop/vscode_lm rows; managers finalize with accept_review/reject_review, not mark_*.
@@ -181,7 +185,8 @@ _RUNS = {
     "manager": {
         "surface": "manager", "writes": True,
         "args": {
-            "probes": [_HIDDEN_PROBE, _NEVER_EXISTED, _WORKER_ONLY], "callable_only": _CALLABLE_ONLY,
+            "probes": [_HIDDEN_PROBE, _NEVER_EXISTED, _WORKER_ONLY, *_RENAME_PROBES],
+            "callable_only": _CALLABLE_ONLY,
             "arg_probes": list(_NF02139_MANAGER_CALLABLE),
         },
     },
@@ -598,7 +603,15 @@ def test_aliases_are_manager_callable_but_unlisted_and_canonicals_stay_listed(ru
         assert server.mcp_tool_callable(alias, "manager") is True
         assert server.mcp_tool_listed(alias, "manager") is False
         assert alias in manager["registered"] and alias not in manager["listed"]
-        assert server.mcp_tool_listed(canonical, "manager") is True
+        # A rename alias keeps its canonical's own visibility: a canonical that
+        # is itself callable-only on manager (needfix_purge, roadmap_events)
+        # stays unlisted under its new aiworkhub_ name.
+        canonical_listed = (
+            mcp_tool_metadata.MCP_TOOL_PROFILES[canonical].get(mcp_tool_metadata.MCP_PROFILE_MANAGER)
+            == mcp_tool_metadata.MCP_VISIBILITY_LISTED
+        )
+        assert server.mcp_tool_callable(canonical, "manager") is True
+        assert server.mcp_tool_listed(canonical, "manager") is canonical_listed
         assert server.mcp_tool_listed(alias, "all") is True
         assert server.mcp_tool_callable(alias, "worker") is False
         assert server.mcp_tool_callable(alias, "dashboard") is False
@@ -614,8 +627,14 @@ def test_alias_description_carries_the_deprecation_prefix() -> None:
         cleaned, _ = mcp_tool_metadata.split_docstring(function.__doc__)
         _args, kwargs, _signature = mcp_tool_metadata.prepare_registration(function, (alias,), {})
         assert kwargs["description"] == _ALIAS_DESCRIPTION_PREFIX.format(canonical=canonical) + cleaned
+        # NF-2026-00964: a prefix-renamed tool's Python function keeps the pre-rename (alias) name.
+        if alias in mcp_tool_metadata.MCP_PREFIX_RENAMED_TOOLS:
+            assert canonical == f"aiworkhub_{alias}" and not hasattr(server, canonical)
+            canonical_function = function
+        else:
+            canonical_function = getattr(server, canonical)
         _canonical_args, canonical_kwargs, _canonical_signature = mcp_tool_metadata.prepare_registration(
-            getattr(server, canonical), (canonical,), {}
+            canonical_function, (canonical,), {}
         )
         assert kwargs["annotations"].readOnlyHint == canonical_kwargs["annotations"].readOnlyHint
 
@@ -646,3 +665,42 @@ def test_nf02139_rows_are_manager_callable_by_exact_name_but_unlisted(runs: dict
     # The Manager Chat seat enables these for its LLM (runtime_adapters.MANAGER_SEAT_MCP_TOOLS): kept listed.
     for name in ("aiworkhub_manager_loop_status", "aiworkhub_manager_loop_events"):
         assert name in manager["listed"] and name in dashboard["listed"], name
+
+
+def test_prefix_renamed_tools_are_listed_under_the_new_name_and_alias_the_old_one(runs: dict) -> None:
+    # NF-2026-00964: every needfix_*/roadmap_* tool is listed as aiworkhub_<name>; the old name is a
+    # manager-callable rename alias whose reply is stamped, and server.<old name> stays the canonical function.
+    renamed = mcp_tool_metadata.MCP_PREFIX_RENAMED_TOOLS
+    assert len(renamed) == len(set(renamed)) == 20
+    assert all(name.startswith(("needfix_", "roadmap_")) for name in renamed)
+    manager = runs["manager"]
+    unprefixed_listed = sorted(name for name in manager["listed"] if not name.startswith("aiworkhub_"))
+    assert unprefixed_listed == []
+    kept_callable_names = ("aiworkhub_needfix_purge", "aiworkhub_roadmap_events")
+    for old in renamed:
+        new = f"aiworkhub_{old}"
+        record = mcp_tool_metadata.MCP_TOOL_ALIASES[old]
+        assert (record["canonical"], record["since"], record["remove_in"]) == (new, "0.13.16", "0.14.0")
+        assert dict(mcp_tool_metadata.MCP_TOOL_PROFILES[old]) == {"manager": "callable"}
+        assert old in manager["registered"] and old not in manager["listed"], old
+        if new in kept_callable_names:
+            assert new in manager["registered"] and new not in manager["listed"], new
+        else:
+            assert new in manager["listed"], new
+        function = getattr(server, old)
+        assert function.__name__ == old and not hasattr(function, "__wrapped__") and not hasattr(server, new)
+    for kept_callable in ("aiworkhub_needfix_purge", "aiworkhub_roadmap_events"):
+        assert dict(mcp_tool_metadata.MCP_TOOL_PROFILES[kept_callable]) == {"manager": "callable"}
+    for facet_alias in mcp_tool_metadata.MCP_DEPRECATED_FACET_ALIASES:
+        assert dict(mcp_tool_metadata.MCP_TOOL_PROFILES[facet_alias]) == {"manager": "callable"}
+        assert facet_alias in manager["registered"] and facet_alias not in manager["listed"]
+
+    refusal = {"ok": False, "error": "needfix_id_or_needfix_ids_required"}
+    assert server.needfix_show() == refusal
+    stamp = {"alias": "needfix_show", "canonical": "aiworkhub_needfix_show", "remove_in": "0.14.0"}
+    replies = {}
+    for name in _RENAME_PROBES:
+        result = manager["probes"][name]["result"]
+        replies[name] = json.loads(result["content"][0]["text"])
+    assert replies["aiworkhub_needfix_show"] == refusal
+    assert replies["needfix_show"] == {**refusal, mcp_tool_metadata.MCP_ALIAS_REPLY_KEY: stamp}

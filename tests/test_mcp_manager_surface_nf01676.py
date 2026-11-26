@@ -42,7 +42,7 @@ _SYNTHETIC_DASHBOARD_ONLY = ("aiworkhub_dashboard_snapshot", "aiworkhub_dashboar
 _SYNTHETIC_ALL = [
     "synthetic_echo", "synthetic_accented", "synthetic_list", "synthetic_int", "synthetic_none",
     "synthetic_text", "synthetic_path", "synthetic_failing", _SYNTHETIC_HIDDEN,
-    *_SYNTHETIC_DASHBOARD_ONLY, "needfix_transition",
+    *_SYNTHETIC_DASHBOARD_ONLY, "aiworkhub_needfix_transition",
     "aiworkhub_dashboard", "aiworkhub_manager_dashboard_view",
 ]
 _SYNTHETIC_MANAGER = [
@@ -59,7 +59,7 @@ _SYNTHETIC_RESULTS = {
     _SYNTHETIC_HIDDEN: {"tool": "hidden"},
     "aiworkhub_dashboard_snapshot": {"tool": "snapshot"},
     "aiworkhub_dashboard_needfix_transition": {"tool": "transition"},
-    "needfix_transition": {"tool": "manager_transition"},
+    "aiworkhub_needfix_transition": {"tool": "manager_transition"},
     "aiworkhub_dashboard": {"tool": "bare"},
     "aiworkhub_manager_dashboard_view": {"tool": "view"},
 }
@@ -67,11 +67,11 @@ _MANAGER_VISIBILITY = {
     "aiworkhub_dashboard_health": False,
     "aiworkhub_dashboard_needfix_transition": False,
     "aiworkhub_dashboard_snapshot": False,
-    "needfix_transition": True,
+    "aiworkhub_needfix_transition": True,
     "aiworkhub_dashboard": True,
     "aiworkhub_manager_dashboard_view": True,
     "aiworkhub_task_create": True,
-    "needfix_add": True,
+    "aiworkhub_needfix_add": True,
 }
 
 _CHILD_PREAMBLE = """
@@ -213,7 +213,7 @@ synthetic = {
     "aiworkhub_dashboard_synthetic_hidden": dashboard_hidden,
     "aiworkhub_dashboard_snapshot": dashboard_snapshot,
     "aiworkhub_dashboard_needfix_transition": dashboard_transition,
-    "needfix_transition": manager_transition,
+    "aiworkhub_needfix_transition": manager_transition,
     "aiworkhub_dashboard": dashboard_bare,
     "aiworkhub_manager_dashboard_view": manager_dashboard_view,
 }

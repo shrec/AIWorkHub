@@ -29,7 +29,8 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
 
 def _cluster(*names: str) -> frozenset:
-    return frozenset(name if name.startswith(("needfix_", "roadmap_")) else f"aiworkhub_{name}" for name in names)
+    # NF-2026-00964: every listed tool carries the aiworkhub_ prefix, needfix_*/roadmap_* included.
+    return frozenset(f"aiworkhub_{name}" for name in names)
 
 
 CLUSTERS = {
@@ -46,7 +47,7 @@ CLUSTERS = {
     ),
     "NEEDFIX": _cluster(
         "needfix_update", "needfix_archive", "needfix_restore", "needfix_add", "needfix_list", "needfix_show",
-        "needfix_count", "needfix_events", "manager_needfix_draft", "needfix_transition",
+        "needfix_events", "manager_needfix_draft", "needfix_transition",
     ),
     "ROADMAP": _cluster(
         "roadmap_list", "roadmap_show", "roadmap_snapshot", "roadmap_transition", "roadmap_link_task",

@@ -76,10 +76,10 @@ MANAGER_TOOLSEARCH_SELECT_NAMES: tuple[str, ...] = (
     "aiworkhub_agent_accept_preview",
     "aiworkhub_agent_accept_review",
     "aiworkhub_task_reject_review",
-    "needfix_show",
-    "needfix_list",
-    "needfix_preview_convert",
-    "needfix_convert",
+    "aiworkhub_needfix_show",
+    "aiworkhub_needfix_list",
+    "aiworkhub_needfix_preview_convert",
+    "aiworkhub_needfix_convert",
     "aiworkhub_agent_launch_task",
     "aiworkhub_claude_callback_wait",
     "aiworkhub_claude_callback_ack",
@@ -237,12 +237,12 @@ _REASONS = {
     ),
 }
 REMINDER = (
-    "AIWorkHub tool guard (PreToolUse hook) is active for indexed source:\n"
+    "AIWorkHub tool guard is active for indexed source:\n"
     "- Search: aiworkhub_manager_source_graph_query or aiworkhub_worker_source_graph_query"
     ' mode="bodygrep", not grep/rg/findstr/Select-String/git grep.\n'
     '- Listing: mode="slice", not find/fd/tree/ls -R/Get-ChildItem -Recurse/dir /s.\n'
     '- Reading: mode="body" for a symbol or mode="file" query="START-END" for a line'
-    " window; built-in Read is denied on indexed files; not cat/head/sed/Get-Content or"
+    " window; Read is denied on indexed files; not cat/head/sed/Get-Content or"
     " python/node file reads.\n"
     "- Editing an existing file: aiworkhub_worker_semantic_edit_prepare then"
     " aiworkhub_worker_semantic_edit_apply (worker) or scripts/manager_semantic_edit.py"

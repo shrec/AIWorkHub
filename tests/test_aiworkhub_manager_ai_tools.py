@@ -1195,8 +1195,8 @@ def test_needfix_sdk_gate_rechecks_same_process_after_open_to_closed(tmp_path, m
     from aiworkhub import needfix_store
 
     root = _difficulty_repo(tmp_path, monkeypatch)
-    add = server.mcp._tool_manager.get_tool("needfix_add")
-    update = server.mcp._tool_manager.get_tool("needfix_update")
+    add = server.mcp._tool_manager.get_tool("aiworkhub_needfix_add")
+    update = server.mcp._tool_manager.get_tool("aiworkhub_needfix_update")
     created = asyncio.run(add.run({"title": "Open fixture", "description": "Open gate", "kind": " Defect "}))
     identity = created["id"]
     assert created["kind"] == "bug"
@@ -1217,10 +1217,10 @@ def test_needfix_schema_hints_publish_authoritative_choices_without_constraints(
     from aiworkhub import needfix_store
 
     tools = {item.name: item for item in asyncio.run(server.mcp.list_tools())}
-    for tool_name in ("needfix_add", "needfix_update"):
+    for tool_name in ("aiworkhub_needfix_add", "aiworkhub_needfix_update"):
         tool = tools[tool_name]
         choices = {"kind": needfix_store.KINDS, "severity": needfix_store.SEVERITIES}
-        if tool_name == "needfix_add":
+        if tool_name == "aiworkhub_needfix_add":
             choices["status"] = needfix_store.STATUSES
         for name, values in choices.items():
             field = tool.inputSchema["properties"][name]
@@ -1230,14 +1230,14 @@ def test_needfix_schema_hints_publish_authoritative_choices_without_constraints(
                 assert value in field["description"]
             assert '"enum"' not in json.dumps(field)
             assert '"const"' not in json.dumps(field)
-            if tool_name == "needfix_update":
+            if tool_name == "aiworkhub_needfix_update":
                 assert field["default"] is None
                 assert {"type": "null"} in field["anyOf"]
             else:
                 assert field["type"] == "string"
                 assert field["default"] == {"kind": "other", "severity": "medium", "status": "captured"}[name]
-    assert "``status`` defaults to captured" in tools["needfix_add"].description
-    assert "field hint" in tools["needfix_add"].description
+    assert "``status`` defaults to captured" in tools["aiworkhub_needfix_add"].description
+    assert "field hint" in tools["aiworkhub_needfix_add"].description
 
 
 def test_needfix_schema_hints_real_binding_preserves_normalization_and_refusals(tmp_path, monkeypatch):
@@ -1246,8 +1246,8 @@ def test_needfix_schema_hints_real_binding_preserves_normalization_and_refusals(
     from mcp.server.fastmcp.exceptions import ToolError
 
     root = _difficulty_repo(tmp_path, monkeypatch)
-    add = server.mcp._tool_manager.get_tool("needfix_add")
-    update = server.mcp._tool_manager.get_tool("needfix_update")
+    add = server.mcp._tool_manager.get_tool("aiworkhub_needfix_add")
+    update = server.mcp._tool_manager.get_tool("aiworkhub_needfix_update")
     created = asyncio.run(add.run({"title": "Bound hints", "description": "Real binding", "kind": " Defect "}))
     identity = created["id"]
     assert created["kind"] == "bug"

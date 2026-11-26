@@ -368,7 +368,14 @@ def test_public_mcp_surface_exposes_roadmap_contract() -> None:
         "roadmap_transition",
         "roadmap_link_task",
     ):
+        # NF-2026-00964: listed as aiworkhub_<name>; <name> is the Python function and a rename alias.
+        # roadmap_events keeps its pre-rename visibility: manager-callable, not listed.
         assert hasattr(server, name)
+        new_name = f"aiworkhub_{name}"
+        assert server.mcp_tool_listed(new_name, "manager") is (name != "roadmap_events"), new_name
+        assert server.mcp_tool_callable(new_name, "manager") is True, new_name
+        assert server.mcp_tool_listed(name, "manager") is False
+        assert server.mcp_tool_callable(name, "manager") is True
     assert "needfix_ids" in inspect.signature(server.roadmap_add).parameters
     assert set(dashboard_mcp_app.ROADMAP_READ_TOOLS) == {
         "aiworkhub_dashboard_roadmap_list",

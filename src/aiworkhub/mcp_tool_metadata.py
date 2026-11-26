@@ -30,6 +30,7 @@ __all__ = [
     "prepare_registration",
     "MCP_TOOL_PROFILES",
     "MCP_TOOL_ALIASES",
+    "MCP_PREFIX_RENAMED_TOOLS",
     "MCP_ALIAS_RECORD_KEYS",
     "MCP_ALIAS_REPLY_KEY",
     "MANAGER_LISTED_CEILING",
@@ -464,7 +465,7 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_task_audit_log_read": _MANAGER_CALLABLE,
     "aiworkhub_task_review_summarize": _MANAGER,
     "aiworkhub_task_codex_handoff": _MANAGER,
-    "aiworkhub_task_codex_handoff_markdown": _MANAGER,
+    "aiworkhub_task_codex_handoff_markdown": _MANAGER_CALLABLE,
     "aiworkhub_supervisor_loop_status": _MANAGER,
     "aiworkhub_cli_adapter_plan_readonly": _MANAGER_CALLABLE,
     "aiworkhub_cli_adapter_audit_summary_readonly": _MANAGER_CALLABLE,
@@ -567,17 +568,17 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_quality_calibration_report": _MANAGER_CALLABLE,
     "aiworkhub_environment_preflight": _MANAGER,
     "aiworkhub_storage_recover_stranded_worktrees": _MANAGER,
-    "needfix_list": _MANAGER,
-    "needfix_show": _MANAGER,
+    "aiworkhub_needfix_list": _MANAGER,
+    "aiworkhub_needfix_show": _MANAGER,
     "aiworkhub_manager_needfix_draft": _MANAGER,
-    "needfix_add": _MANAGER,
-    "needfix_update": _MANAGER,
-    "needfix_transition": _MANAGER,
-    "needfix_archive": _MANAGER,
-    "needfix_restore": _MANAGER,
-    "needfix_purge": _MANAGER_CALLABLE,
-    "needfix_count": _MANAGER,
-    "needfix_events": _MANAGER,
+    "aiworkhub_needfix_add": _MANAGER,
+    "aiworkhub_needfix_update": _MANAGER,
+    "aiworkhub_needfix_transition": _MANAGER,
+    "aiworkhub_needfix_archive": _MANAGER,
+    "aiworkhub_needfix_restore": _MANAGER,
+    "aiworkhub_needfix_purge": _MANAGER_CALLABLE,
+    "needfix_count": _MANAGER_CALLABLE,
+    "aiworkhub_needfix_events": _MANAGER,
     "aiworkhub_manager_sdlc_outcome_metrics": _MANAGER,
     "aiworkhub_manager_sdlc_case_create": _MANAGER_CALLABLE,
     "aiworkhub_manager_sdlc_stage_record": _MANAGER_CALLABLE,
@@ -585,17 +586,38 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_manager_sdlc_stage_packet": _MANAGER_CALLABLE,
     "aiworkhub_manager_sdlc_case_create_for_task": _MANAGER_CALLABLE,
     "aiworkhub_manager_sdlc_case_for_task": _MANAGER_CALLABLE,
-    "needfix_preview_convert": _MANAGER,
-    "needfix_convert": _MANAGER,
-    "needfix_link_existing_task": _MANAGER,
-    "needfix_reopen_superseded_task_link": _MANAGER,
-    "roadmap_list": _MANAGER,
-    "roadmap_show": _MANAGER,
+    "aiworkhub_needfix_preview_convert": _MANAGER,
+    "aiworkhub_needfix_convert": _MANAGER,
+    "aiworkhub_needfix_link_existing_task": _MANAGER,
+    "aiworkhub_needfix_reopen_superseded_task_link": _MANAGER,
+    "aiworkhub_roadmap_list": _MANAGER,
+    "aiworkhub_roadmap_show": _MANAGER,
+    "aiworkhub_roadmap_events": _MANAGER_CALLABLE,
+    "aiworkhub_roadmap_snapshot": _MANAGER,
+    "aiworkhub_roadmap_add": _MANAGER,
+    "aiworkhub_roadmap_transition": _MANAGER,
+    "aiworkhub_roadmap_link_task": _MANAGER,
+    # NF-2026-00964: pre-rename names, served as MCP_TOOL_ALIASES rename aliases.
+    "needfix_list": _MANAGER_CALLABLE,
+    "needfix_show": _MANAGER_CALLABLE,
+    "needfix_add": _MANAGER_CALLABLE,
+    "needfix_update": _MANAGER_CALLABLE,
+    "needfix_transition": _MANAGER_CALLABLE,
+    "needfix_archive": _MANAGER_CALLABLE,
+    "needfix_restore": _MANAGER_CALLABLE,
+    "needfix_purge": _MANAGER_CALLABLE,
+    "needfix_events": _MANAGER_CALLABLE,
+    "needfix_preview_convert": _MANAGER_CALLABLE,
+    "needfix_convert": _MANAGER_CALLABLE,
+    "needfix_link_existing_task": _MANAGER_CALLABLE,
+    "needfix_reopen_superseded_task_link": _MANAGER_CALLABLE,
+    "roadmap_list": _MANAGER_CALLABLE,
+    "roadmap_show": _MANAGER_CALLABLE,
     "roadmap_events": _MANAGER_CALLABLE,
-    "roadmap_snapshot": _MANAGER,
-    "roadmap_add": _MANAGER,
-    "roadmap_transition": _MANAGER,
-    "roadmap_link_task": _MANAGER,
+    "roadmap_snapshot": _MANAGER_CALLABLE,
+    "roadmap_add": _MANAGER_CALLABLE,
+    "roadmap_transition": _MANAGER_CALLABLE,
+    "roadmap_link_task": _MANAGER_CALLABLE,
     "aiworkhub_worker_source_graph_query": _WORKER,
     "aiworkhub_worker_semantic_edit_prepare": _WORKER,
     "aiworkhub_worker_semantic_edit_apply": _WORKER,
@@ -621,7 +643,8 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
 # cards lower this toward 45; a change that lists one more manager tool must
 # first unlist or fold another. tests/test_mcp_surface_contract_nf01979.py pins
 # listed <= ceiling and ceiling == the measured count.
-MANAGER_LISTED_CEILING = 118
+# NF-2026-00964: 118 -> 116, the needfix_count and codex_handoff_markdown facet aliases left.
+MANAGER_LISTED_CEILING = 116
 
 # Duplicate tool names: callable by exact name on the manager profile, absent from its tools/list.
 # Each canonical must be listed on every profile that lists the alias. Verified same delegate and parameters.
@@ -646,6 +669,33 @@ def _alias_record(
     })
 
 
+# NF-2026-00964: the needfix_*/roadmap_* tools are registered under their
+# ``aiworkhub_``-prefixed names; each pre-rename name below is a rename alias of
+# ``aiworkhub_<name>`` until 0.14.0. The server's Python function keeps the
+# pre-rename name, so server.<name> is the canonical function, not a delegate.
+MCP_PREFIX_RENAMED_TOOLS: tuple[str, ...] = (
+    "needfix_list",
+    "needfix_show",
+    "needfix_add",
+    "needfix_update",
+    "needfix_transition",
+    "needfix_archive",
+    "needfix_restore",
+    "needfix_purge",
+    "needfix_events",
+    "needfix_preview_convert",
+    "needfix_convert",
+    "needfix_link_existing_task",
+    "needfix_reopen_superseded_task_link",
+    "roadmap_list",
+    "roadmap_show",
+    "roadmap_events",
+    "roadmap_snapshot",
+    "roadmap_add",
+    "roadmap_transition",
+    "roadmap_link_task",
+)
+
 MCP_TOOL_ALIASES: Mapping[str, Mapping[str, Any]] = MappingProxyType({
     "aiworkhub_router_known_repositories": _alias_record(
         "aiworkhub_repo_list", since="0.13.7", remove_in="0.14.0"
@@ -656,6 +706,10 @@ MCP_TOOL_ALIASES: Mapping[str, Mapping[str, Any]] = MappingProxyType({
     "aiworkhub_manager_task_supersede": _alias_record(
         "aiworkhub_task_supersede", since="0.13.7", remove_in="0.14.0"
     ),
+    **{
+        name: _alias_record(f"aiworkhub_{name}", since="0.13.16", remove_in="0.14.0")
+        for name in MCP_PREFIX_RENAMED_TOOLS
+    },
 })
 
 
@@ -679,8 +733,9 @@ def canonical_tool_name(tool_name: Any) -> Any:
 # already unlisted on manager: these take their own parameters until removal.
 DEPRECATED_ALIAS_REPLY_KEY = "deprecated_alias_of"
 MCP_DEPRECATED_FACET_ALIASES: Mapping[str, Mapping[str, Any]] = MappingProxyType({
+    # NF-2026-00964: needfix_count stays a facet alias, of the renamed list tool.
     "needfix_count": MappingProxyType({
-        "surviving_tool": "needfix_list",
+        "surviving_tool": "aiworkhub_needfix_list",
         "facet": MappingProxyType({"count_only": True}),
     }),
     "aiworkhub_task_codex_handoff_markdown": MappingProxyType({
@@ -695,7 +750,7 @@ MCP_FOLD_KEPT_REASONS: Mapping[str, str] = MappingProxyType({
         "not a duplicate: it is the only reader that joins storage health, queue counts, "
         "callback delivery, manager identity and repository routing in one call, and the "
         "VS Code webview reads its full=true shape; aiworkhub_task_plan_snapshot, "
-        "aiworkhub_task_health and roadmap_snapshot each return one of those parts only"
+        "aiworkhub_task_health and aiworkhub_roadmap_snapshot each return one of those parts only"
     ),
 })
 

@@ -92,12 +92,12 @@ def test_derive_annotations():
 
 
 def test_derive_annotations_name_rules():
-    assert derive_annotations("needfix_show", "Show one.") == _READ
+    assert derive_annotations("aiworkhub_needfix_show", "Show one.") == _READ
     assert derive_annotations("aiworkhub_task_auto_pickup_dryrun", "Preview.") == _READ
     assert derive_annotations("aiworkhub_cli_adapter_plan_readonly", "Plan.") == _READ
     assert derive_annotations("aiworkhub_claude_callback_ack", "WRITE: ack.") == _WRITE
     assert derive_annotations("aiworkhub_task_queue_request", "Append.") == _WRITE
-    assert derive_annotations("needfix_update", "Update.") == {**_WRITE, "idempotentHint": True}
+    assert derive_annotations("aiworkhub_needfix_update", "Update.") == {**_WRITE, "idempotentHint": True}
     assert derive_annotations("aiworkhub_dispatcher_ensure_started", "Start.") == {
         **_WRITE,
         "idempotentHint": True,
@@ -270,9 +270,12 @@ def test_every_server_tool_publishes_annotations_with_read_only_hint(all_surface
     def hints(name):
         return tools[name]["annotations"]
 
-    assert hints("needfix_show")["readOnlyHint"] is True
-    assert hints("roadmap_list")["readOnlyHint"] is True
-    assert hints("needfix_purge") == _DESTRUCTIVE
+    assert hints("aiworkhub_needfix_show")["readOnlyHint"] is True
+    assert hints("aiworkhub_roadmap_list")["readOnlyHint"] is True
+    assert hints("aiworkhub_needfix_purge") == _DESTRUCTIVE
+    # NF-2026-00964: a rename alias publishes its canonical tool's hints.
+    for old in ("needfix_show", "roadmap_list", "needfix_purge"):
+        assert hints(old) == hints(f"aiworkhub_{old}"), old
     create = hints("aiworkhub_task_create")
     assert create["readOnlyHint"] is False and create["destructiveHint"] is False
     assert hints("aiworkhub_claude_callback_ack")["readOnlyHint"] is False

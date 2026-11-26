@@ -23,7 +23,10 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import core, dashboard_mcp_app, mcp_tool_metadata, needfix_store, server  # noqa: E402
 
+# The name replies carry (needfix_store.TRANSITION_TOOL, unchanged); NF-2026-00964 made it the rename
+# alias of the listed MCP tool _MANAGER_MCP_TOOL.
 _MANAGER_TOOL = "needfix_transition"
+_MANAGER_MCP_TOOL = "aiworkhub_needfix_transition"
 _DASHBOARD_TRANSITION = "aiworkhub_dashboard_needfix_transition"
 _DASHBOARD_SNAPSHOT = "aiworkhub_dashboard_snapshot"
 _PREFIX = mcp_tool_metadata.MCP_DASHBOARD_TOOL_PREFIX
@@ -78,7 +81,8 @@ def test_manager_profile_lists_no_dashboard_tool_and_lists_needfix_transition(mo
     assert server.MANAGER_SURFACE_DASHBOARD_KEEP == frozenset()
     assert server.MANAGER_SURFACE_DASHBOARD_KEEP_REASONS == {}
     monkeypatch.setenv(server.MCP_SURFACE_ENV, "manager")
-    assert server.mcp_tool_listed(_MANAGER_TOOL) is True
+    assert server.mcp_tool_listed(_MANAGER_MCP_TOOL) is True
+    assert server.mcp_tool_listed(_MANAGER_TOOL) is False and server.mcp_tool_callable(_MANAGER_TOOL) is True
     for name in (_DASHBOARD_TRANSITION, _DASHBOARD_SNAPSHOT):
         assert server.mcp_tool_callable(name) is False, name
         assert server.mcp_tool_listed(name) is False, name
@@ -86,10 +90,13 @@ def test_manager_profile_lists_no_dashboard_tool_and_lists_needfix_transition(mo
 
 def test_needfix_transition_has_the_needfix_update_profile() -> None:
     profiles = mcp_tool_metadata.MCP_TOOL_PROFILES
-    assert dict(profiles[_MANAGER_TOOL]) == dict(profiles["needfix_update"]) == {"manager": "listed"}
-    # Registration order: the new row sits right after needfix_update.
+    assert dict(profiles[_MANAGER_MCP_TOOL]) == dict(profiles["aiworkhub_needfix_update"]) == {"manager": "listed"}
+    # Registration order: the new row sits right after aiworkhub_needfix_update.
     names = list(profiles)
-    assert names.index(_MANAGER_TOOL) == names.index("needfix_update") + 1
+    assert names.index(_MANAGER_MCP_TOOL) == names.index("aiworkhub_needfix_update") + 1
+    # NF-2026-00964: the pre-rename name is a manager-callable rename alias.
+    assert dict(profiles[_MANAGER_TOOL]) == {"manager": "callable"}
+    assert mcp_tool_metadata.alias_canonical(_MANAGER_TOOL) == _MANAGER_MCP_TOOL
 
 
 def test_dashboard_profile_still_lists_both_dashboard_tools_unchanged() -> None:
@@ -97,6 +104,7 @@ def test_dashboard_profile_still_lists_both_dashboard_tools_unchanged() -> None:
         assert dict(mcp_tool_metadata.MCP_TOOL_PROFILES[name]) == {"dashboard": "listed"}, name
         assert server.mcp_tool_listed(name, "dashboard") is True, name
         assert server.mcp_tool_listed(name, "all") is True, name
+    assert server.mcp_tool_callable(_MANAGER_MCP_TOOL, "dashboard") is False
     assert server.mcp_tool_callable(_MANAGER_TOOL, "dashboard") is False
     # The webview keeps calling the same names, bound to the same view functions.
     assert dashboard_mcp_app.NEEDFIX_WRITE_TOOLS[_DASHBOARD_TRANSITION] is dashboard_mcp_app.needfix_transition_view
@@ -113,7 +121,7 @@ def test_manager_tool_takes_the_dashboard_arguments_and_names_no_dashboard_tool(
     cleaned, documented = mcp_tool_metadata.split_docstring(server.needfix_transition.__doc__)
     assert set(documented) == set(manager)
     assert _PREFIX not in cleaned
-    assert "needfix_update" in cleaned and "needfix_archive" in cleaned
+    assert "aiworkhub_needfix_update" in cleaned and "aiworkhub_needfix_archive" in cleaned
 
 
 # --- same transition path, result and refusals -------------------------------------
@@ -245,7 +253,11 @@ def test_conversion_refusal_and_next_action_name_the_manager_tool(repo: Path, st
     reason = needfix_store._conversion_refusal_reason(rec["id"], status)
     assert f"call {_MANAGER_TOOL} action={action}" in reason
     assert _PREFIX not in reason and _PREFIX not in preview["refusal_reason"]
-    assert server.mcp_tool_listed(preview["next_action"]["tool"], "manager") is True
+    # NF-2026-00964: the named tool is the manager-callable rename alias of a listed manager tool.
+    named_tool = preview["next_action"]["tool"]
+    assert server.mcp_tool_callable(named_tool, "manager") is True
+    assert mcp_tool_metadata.canonical_tool_name(named_tool) == _MANAGER_MCP_TOOL
+    assert server.mcp_tool_listed(_MANAGER_MCP_TOOL, "manager") is True
 
 
 def test_resolve_verified_writes_readiness_and_evidence_then_resolves(repo: Path) -> None:

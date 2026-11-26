@@ -47,6 +47,17 @@ _EXISTING_ALIASES = {
     "aiworkhub_router_known_repositories": "aiworkhub_repo_list",
     "aiworkhub_manager_task_archive": "aiworkhub_task_archive",
     "aiworkhub_manager_task_supersede": "aiworkhub_task_supersede",
+    # NF-2026-00964: pre-rename needfix_*/roadmap_* names alias their aiworkhub_-prefixed tools.
+    **{
+        name: f"aiworkhub_{name}"
+        for name in (
+            "needfix_list", "needfix_show", "needfix_add", "needfix_update", "needfix_transition",
+            "needfix_archive", "needfix_restore", "needfix_purge", "needfix_events",
+            "needfix_preview_convert", "needfix_convert", "needfix_link_existing_task",
+            "needfix_reopen_superseded_task_link", "roadmap_list", "roadmap_show", "roadmap_events",
+            "roadmap_snapshot", "roadmap_add", "roadmap_transition", "roadmap_link_task",
+        )
+    },
 }
 
 _CHILD_PREAMBLE = """
@@ -278,14 +289,24 @@ def test_no_listed_description_names_a_tool_its_profile_does_not_list(runs: dict
         assert _reference_problems(listed, known) == {}, (label, profile)
 
 
+def _registered_functions() -> dict:
+    # The registered name -> function map; a listed name need not be a server attribute
+    # (NF-2026-00964: aiworkhub_needfix_* is registered from the Python function needfix_*).
+    if server._MCP_SDK_AVAILABLE:
+        return {name: tool.fn for name, tool in server.mcp._tool_manager._tools.items()}
+    return dict(server.mcp._tools)
+
+
 def test_no_listed_docstring_names_a_tool_its_profile_does_not_list() -> None:
     # In-process mirror of the published scan, over the raw docstrings this process holds.
     known = set(mcp_tool_metadata.MCP_TOOL_PROFILES) | set(mcp_tool_metadata.MCP_TOOL_ALIASES)
+    registered = _registered_functions()
+    assert registered
     for profile in _SCANNED_PROFILES:
         listed = {
-            name: getattr(server, name).__doc__ or ""
+            name: registered[name].__doc__ or ""
             for name in _listed_on(profile)
-            if callable(getattr(server, name, None))
+            if callable(registered.get(name))
         }
         assert listed, profile
         assert _reference_problems(listed, known) == {}, profile

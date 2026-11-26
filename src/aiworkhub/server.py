@@ -9283,7 +9283,7 @@ _NEEDFIX_LIST_KEYS = (
 )
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_list")
 def needfix_list(
     status: str | None = None,
     kind: str | None = None,
@@ -9300,7 +9300,7 @@ def needfix_list(
 ) -> list[dict] | int | dict:
     """List repo-scoped NeedFix entries (bounded); rows are a compact projection.
 
-    Measured: 379 rows were 452 KB, about 1.2 KB each (NF-2026-01722, NF-2026-01726). By default each row keeps only id, title, status, severity, kind, converted_task_id and updated_at; ``full=true`` or needfix_show returns the full row, which on the derived listing also carries work_state and linked_card_id/linked_card_status.
+    Measured: 379 rows were 452 KB, about 1.2 KB each (NF-2026-01722, NF-2026-01726). By default each row keeps only id, title, status, severity, kind, converted_task_id and updated_at; ``full=true`` or aiworkhub_needfix_show returns the full row, which on the derived listing also carries work_state and linked_card_id/linked_card_status.
 
     count_only=true returns the count of the same status/kind/severity selection instead of rows; breakdown=true splits it by work state and status.
 
@@ -9348,13 +9348,13 @@ def needfix_list(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_show")
 def needfix_show(needfix_id: str = "", full: bool = False, needfix_ids: list[str] | None = None) -> dict:
     """Show one NeedFix by id, or up to 25 in one call; a body over 1 KB folds to its own identity.
 
     Use this for the current fields of one NeedFix, or pass needfix_ids to read
-    several in one call; use needfix_list to find ids or needfix_events for
-    its audit history.
+    several in one call; use aiworkhub_needfix_list to find ids or
+    aiworkhub_needfix_events for its audit history.
 
     Measured 2026-10-09: 51 calls, avg 4 KB, max 12 KB, almost all of it the
     description and evidence bodies the filer wrote (NF-2026-01447). Each body
@@ -9417,7 +9417,7 @@ def aiworkhub_manager_needfix_draft(
 
     The DESCRIPTION is deliberately empty -- it is your judgement about what to
     do, not a fact on the card, and this never invents one. Writes nothing:
-    file a candidate with ``needfix_add`` once you have written that
+    file a candidate with ``aiworkhub_needfix_add`` once you have written that
     description. ``finding_id`` / ``check_id`` narrow the draft to exactly one
     finding or one failing check.
 
@@ -9450,7 +9450,7 @@ def aiworkhub_manager_needfix_draft(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_add")
 def needfix_add(
     title: str,
     description: str,
@@ -9495,7 +9495,7 @@ def needfix_add(
     dedupe_key, status, kind, severity, created_at, provenance.origin,
     ``deduped`` with ``existing_id`` when the dedupe key matched a live row
     (the existing row is returned, nothing new is written), kind_normalized.
-    The row itself is one ``needfix_show`` away.
+    The row itself is one ``aiworkhub_needfix_show`` away.
 
     Args:
         title: Short title of the NeedFix; required, non-empty.
@@ -9559,7 +9559,7 @@ def needfix_add(
     return _needfix_add_receipt(row, before=before, kind_normalized=kind_normalized)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_update")
 def needfix_update(
     needfix_id: str,
     title: str | None = None,
@@ -9601,7 +9601,7 @@ def needfix_update(
     the lists in place (add appends missing values, remove filters).
     ``expected_updated_at`` is optimistic concurrency: the update is refused
     (``needfix_update_stale``) when the stored ``updated_at`` differs.
-    ``kind`` vocabulary and synonym normalisation are as in ``needfix_add``.
+    ``kind`` vocabulary and synonym normalisation are as in ``aiworkhub_needfix_add``.
 
     Replies with a delta receipt (``aiworkhub.needfix_update_receipt.v1``):
     id, status, fields_changed, updated_at, evidence_keys_after, event_id,
@@ -9666,7 +9666,7 @@ def needfix_update(
 NEEDFIX_TRANSITION_TOOL = needfix_store.TRANSITION_TOOL
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_transition")
 def needfix_transition(
     needfix_id: str = "",
     action: str = "",
@@ -9684,8 +9684,8 @@ def needfix_transition(
 
     Use this to triage and accept a captured NeedFix before converting it, or to
     reject, defer, mark duplicate or task_planned, resolve, or recover a
-    conversion claim. Edit fields with needfix_update and retire an item with
-    needfix_archive instead. Requires confirm=True and returns the transition
+    conversion claim. Edit fields with aiworkhub_needfix_update and retire an item
+    with aiworkhub_needfix_archive instead. Requires confirm=True and returns the transition
     receipt; ``server_tool`` names this tool.
 
     A task-less fix closes with action=resolve_verified (readiness_score=100,
@@ -9724,12 +9724,13 @@ def needfix_transition(
     return {**result, "server_tool": NEEDFIX_TRANSITION_TOOL}
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_archive")
 def needfix_archive(needfix_id: str, reason: str | None = None) -> dict:
     """Explicitly archive (soft, audited, restorable) a NeedFix.
 
-    Use this to retire a NeedFix from the active inbox; use needfix_restore to
-    bring an archived one back or needfix_update to edit its fields instead.
+    Use this to retire a NeedFix from the active inbox; use aiworkhub_needfix_restore
+    to bring an archived one back or aiworkhub_needfix_update to edit its fields
+    instead.
 
     Args:
         needfix_id: NeedFix id, e.g. NF-2026-01447. A NeedFix that is converting cannot be archived; an already archived one is returned unchanged.
@@ -9738,12 +9739,12 @@ def needfix_archive(needfix_id: str, reason: str | None = None) -> dict:
     return core.needfix_archive(needfix_id, reason=reason)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_restore")
 def needfix_restore(needfix_id: str, target_status: str = "captured") -> dict:
     """Explicitly restore an archived NeedFix.
 
     Use this to bring an archived NeedFix back into the inbox; use
-    needfix_archive to retire an active one.
+    aiworkhub_needfix_archive to retire an active one.
 
     Args:
         needfix_id: Id of an archived NeedFix, e.g. NF-2026-01447; a NeedFix in any other status is refused.
@@ -9752,7 +9753,7 @@ def needfix_restore(needfix_id: str, target_status: str = "captured") -> dict:
     return core.needfix_restore(needfix_id, target_status=target_status)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_purge")
 def needfix_purge(needfix_id: str, audit_reason: str) -> dict:
     """Audited hard delete of an already-archived NeedFix.
 
@@ -9770,12 +9771,12 @@ def needfix_count(
     severity: str | None = None,
     breakdown: bool = False,
 ) -> int | dict:
-    """Deprecated alias of needfix_list(count_only=true); call needfix_list instead.
+    """Deprecated alias of aiworkhub_needfix_list(count_only=true); call aiworkhub_needfix_list instead.
 
-    Kept one release (NF-2026-02270). It returns the needfix_list(count_only=true)
+    Kept one release (NF-2026-02270). It returns the aiworkhub_needfix_list(count_only=true)
     answer as {count, derived, underived_reason} (with breakdown=true: {count,
     by_work_state, by_status, derived, underived_reason}) plus deprecated_alias_of
-    naming needfix_list.
+    naming aiworkhub_needfix_list.
 
     Args:
         status: Count only rows with this exact status, e.g. captured or accepted; archived rows are counted only when asked for here. Omit all three filters for the derived active count.
@@ -9795,12 +9796,12 @@ def needfix_count(
     return _tool_metadata.deprecated_alias_reply("needfix_count", result)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_events")
 def needfix_events(needfix_id: str, limit: int = 100) -> list[dict]:
     """List events for a NeedFix entry.
 
-    Use this for one NeedFix's audit history; use needfix_show for its current
-    fields.
+    Use this for one NeedFix's audit history; use aiworkhub_needfix_show for its
+    current fields.
 
     Args:
         needfix_id: NeedFix id, e.g. NF-2026-01447.
@@ -9923,7 +9924,7 @@ def aiworkhub_manager_sdlc_case_for_task(task_id: str) -> dict[str, Any]:
     return core.sdlc_case_for_task(task_id=task_id)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_preview_convert")
 def needfix_preview_convert(
     needfix_id: str,
     task_plan: dict[str, Any] | None = None,
@@ -9965,7 +9966,7 @@ def needfix_preview_convert(
     return reply
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_convert")
 def needfix_convert(
     needfix_id: str,
     task_plan: dict[str, Any] | None = None,
@@ -9987,8 +9988,8 @@ def needfix_convert(
 
     Args:
         needfix_id: NeedFix id, e.g. NF-2026-01447.
-        task_plan: Task card fields as in needfix_preview_convert. Given without plan_digest, the plan is previewed and committed in one call.
-        plan_digest: plan_digest from the matching needfix_preview_convert; optional when task_plan is given. A digest this server no longer holds is refused.
+        task_plan: Task card fields as in aiworkhub_needfix_preview_convert. Given without plan_digest, the plan is previewed and committed in one call.
+        plan_digest: plan_digest from the matching aiworkhub_needfix_preview_convert; optional when task_plan is given. A digest this server no longer holds is refused.
         include_plan: Return the plan body verbatim instead of a summary of its identity and counts; default false.
         launch: Also launch a worker for the card this call committed, through aiworkhub_agent_launch_task; default false. Only a NEW commit launches; a refused or already-converted NeedFix never does, and the reply then carries launch with skipped set.
         launch_adapter_id: Adapter for that launch, passed through to aiworkhub_agent_launch_task; omit to let it derive the adapter. Refused with launch_adapter_requires_launch unless launch is true.
@@ -10136,7 +10137,7 @@ def _needfix_launch_after_convert(reply: dict, *, launch: bool, launch_adapter_i
     return reply
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_link_existing_task")
 def needfix_link_existing_task(
     needfix_id: str, existing_task_id: str, integrated_commit: str = ""
 ) -> dict:
@@ -10150,7 +10151,7 @@ def needfix_link_existing_task(
     return core.needfix_link_existing_task(needfix_id, existing_task_id, integrated_commit)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_needfix_reopen_superseded_task_link")
 def needfix_reopen_superseded_task_link(needfix_id: str, reason: str) -> dict:
     """Manager-only: reopen a NeedFix whose exact linked task was superseded.
 
@@ -10164,7 +10165,7 @@ def needfix_reopen_superseded_task_link(needfix_id: str, reason: str) -> dict:
 # --- Roadmap MCP manager tools (repository-native; never launch workers) ---
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_roadmap_list")
 def roadmap_list(
     status: str | None = None,
     include_archived: bool = False,
@@ -10175,7 +10176,7 @@ def roadmap_list(
 ) -> list[dict]:
     """List bounded repository Roadmap outcomes; outcome and acceptance bodies fold to their identity.
 
-    Measured: the same rows roadmap_snapshot(limit=60) returned were 174 KB, 61% outcome and acceptance bodies (NF-2026-01726). By default both fold to ``{summarized, bytes, length, sha256}``; ``full=true`` or ``roadmap_show`` gives the full row.
+    Measured: the same rows aiworkhub_roadmap_snapshot(limit=60) returned were 174 KB, 61% outcome and acceptance bodies (NF-2026-01726). By default both fold to ``{summarized, bytes, length, sha256}``; ``full=true`` or ``aiworkhub_roadmap_show`` gives the full row.
 
     Args:
         status: Only outcomes in this status: proposed, approved, in_progress, blocked, deferred, completed or archived. Omit to list every non-archived outcome.
@@ -10216,12 +10217,13 @@ def _fold_roadmap_bodies(row: dict) -> dict:
     return folded
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_roadmap_show")
 def roadmap_show(roadmap_id: str) -> dict:
     """Show one Roadmap outcome.
 
-    Use this for one outcome's stored fields by id; use roadmap_list to find
-    ids or roadmap_snapshot for every outcome joined to its linked tasks.
+    Use this for one outcome's stored fields by id; use aiworkhub_roadmap_list to
+    find ids or aiworkhub_roadmap_snapshot for every outcome joined to its linked
+    tasks.
 
     Args:
         roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
@@ -10229,7 +10231,7 @@ def roadmap_show(roadmap_id: str) -> dict:
     return core.roadmap_show(roadmap_id)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_roadmap_events")
 def roadmap_events(roadmap_id: str, limit: int = 100) -> list[dict]:
     """List bounded audit events for one Roadmap outcome.
 
@@ -10240,20 +10242,21 @@ def roadmap_events(roadmap_id: str, limit: int = 100) -> list[dict]:
     return core.roadmap_events(roadmap_id, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_roadmap_snapshot")
 def roadmap_snapshot(
     limit: int = 200, include_archived: bool = False, full: bool = False
 ) -> dict:
     """Return the Roadmap with each outcome joined to the live status of its linked tasks.
 
-    Measured: ``limit=60`` replied 174 KB, 61% of it the outcome and acceptance bodies (NF-2026-01726). By default each row's ``outcome`` and ``acceptance`` fold to ``{summarized, bytes, length, sha256}``; ``full=true`` or ``roadmap_show`` gives the full row.
+    Measured: ``limit=60`` replied 174 KB, 61% of it the outcome and acceptance bodies (NF-2026-01726). By default each row's ``outcome`` and ``acceptance`` fold to ``{summarized, bytes, length, sha256}``; ``full=true`` or ``aiworkhub_roadmap_show`` gives the full row.
 
     Use this to see what is done, blocked or ready across the roadmap in one call. The
-    other roadmap tools return stored fields only: ``roadmap_list`` the outcome rows,
-    ``roadmap_show`` one outcome with its stored fields. Read-only.
+    other roadmap tools return stored fields only: ``aiworkhub_roadmap_list`` the outcome
+    rows, ``aiworkhub_roadmap_show`` one outcome with its stored fields. Read-only.
 
-    The reply is ``aiworkhub.roadmap_snapshot.v1``: ``total`` and ``active`` outcome
-    counts, ``status_counts``, ``items`` (up to ``limit`` outcome rows) and ``truncated``.
+    The reply's ``schema_id`` is the version 1 roadmap snapshot schema; it carries ``total``
+    and ``active`` outcome counts, ``status_counts``, ``items`` (up to ``limit`` outcome
+    rows) and ``truncated``.
     Each row is the stored outcome plus ``tasks`` (task id and live status, or ``missing``
     / ``purged:<status>`` once the task record is gone), ``linked_total``, ``accepted``
     (finished tasks), ``unresolved`` (the rest), ``dependency_blockers`` and
@@ -10272,7 +10275,7 @@ def roadmap_snapshot(
     return result
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_roadmap_add")
 def roadmap_add(
     title: str,
     outcome: str,
@@ -10310,12 +10313,12 @@ def roadmap_add(
     )
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_roadmap_transition")
 def roadmap_transition(roadmap_id: str, target_status: str, reason: str) -> dict:
     """Manager-only guarded Roadmap lifecycle transition.
 
-    Use this to change an outcome's status; use roadmap_link_task to attach a
-    task without changing status.
+    Use this to change an outcome's status; use aiworkhub_roadmap_link_task to
+    attach a task without changing status.
 
     Args:
         roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
@@ -10325,18 +10328,26 @@ def roadmap_transition(roadmap_id: str, target_status: str, reason: str) -> dict
     return core.roadmap_transition(roadmap_id, target_status, reason=reason)
 
 
-@mcp.tool()
+@mcp.tool(name="aiworkhub_roadmap_link_task")
 def roadmap_link_task(roadmap_id: str, task_id: str) -> dict:
     """Link one existing canonical task to a Roadmap outcome.
 
-    Use this to attach a task to an outcome; use roadmap_transition to change
-    the outcome's status.
+    Use this to attach a task to an outcome; use aiworkhub_roadmap_transition to
+    change the outcome's status.
 
     Args:
         roadmap_id: Roadmap outcome id in the form RM-YYYY-NNNNN, e.g. RM-2026-00001.
         task_id: Id of an existing canonical task in this repository; an already-linked task is not duplicated.
     """
     return core.roadmap_link_task(roadmap_id, task_id)
+
+
+# NF-2026-00964: each pre-rename needfix_*/roadmap_* name stays callable until
+# 0.14.0 as a rename alias of its aiworkhub_-prefixed tool. The module attribute
+# is never rebound, so server.<pre-rename name> stays the canonical function.
+for _renamed_tool in _tool_metadata.MCP_PREFIX_RENAMED_TOOLS:
+    register_deprecated_alias(_renamed_tool, globals()[_renamed_tool])
+del _renamed_tool
 
 
 # NF-2026-01988: registration is complete; later imports execute normally.

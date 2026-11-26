@@ -72,8 +72,8 @@ def forbidden(*args, **kwargs):
 for module, name, original in originals:
     setattr(module, name, forbidden)
 for name, arguments in (
-    ("needfix_add", {"title": "Closed startup", "description": "Must not persist"}),
-    ("needfix_update", {"needfix_id": seed["id"], "title": "Must not change"}),
+    ("aiworkhub_needfix_add", {"title": "Closed startup", "description": "Must not persist"}),
+    ("aiworkhub_needfix_update", {"needfix_id": seed["id"], "title": "Must not change"}),
 ):
     if server._MCP_SDK_AVAILABLE:
         result = asyncio.run(server.mcp._tool_manager.get_tool(name).run(arguments))

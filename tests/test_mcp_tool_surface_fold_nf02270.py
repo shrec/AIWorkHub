@@ -1,10 +1,11 @@
 """NF-2026-02270: MCP tool surface inventory and the phase-1 facet folds.
 
-needfix_count folds into needfix_list(count_only=true[, breakdown]) and
+needfix_count folds into aiworkhub_needfix_list(count_only=true[, breakdown]) and
 aiworkhub_task_codex_handoff_markdown into aiworkhub_task_codex_handoff
 (format='markdown'). The old names stay one release as thin aliases that
 delegate and name the surviving tool in deprecated_alias_of, and
-mcp_tool_metadata marks them for a later card to drop.
+mcp_tool_metadata marks them for a later card to drop. NF-2026-00964 unlisted
+both aliases on manager (still callable by exact name).
 """
 
 from __future__ import annotations
@@ -79,7 +80,7 @@ def test_count_only_returns_the_needfix_count_integer_and_breakdown(repo: Path, 
     assert int(surviving) == int(core.needfix_count(**filters)) == alias["count"]
     assert alias["derived"] == surviving.derived
     assert alias["underived_reason"] == surviving.underived_reason
-    assert alias["deprecated_alias_of"] == "needfix_list"
+    assert alias["deprecated_alias_of"] == "aiworkhub_needfix_list"
     assert alias["server_tool"] == "needfix_count"
     if filters in ({}, {"status": "captured"}):
         assert int(surviving) == 2
@@ -88,7 +89,7 @@ def test_count_only_returns_the_needfix_count_integer_and_breakdown(repo: Path, 
     alias_breakdown = server.needfix_count(breakdown=True, **filters)
     assert surviving_breakdown == core.needfix_count(breakdown=True, **filters)
     assert {k: v for k, v in alias_breakdown.items() if k not in ALIAS_KEYS} == surviving_breakdown
-    assert alias_breakdown["deprecated_alias_of"] == "needfix_list"
+    assert alias_breakdown["deprecated_alias_of"] == "aiworkhub_needfix_list"
     assert surviving_breakdown["count"] == int(surviving)
 
 
@@ -150,29 +151,41 @@ def test_codex_handoff_default_format_is_unchanged_and_unknown_format_refused(em
     assert refused == {"ok": False, "error": "unknown_format", "format": "html", "accepted": ["json", "markdown"]}
 
 
-def test_aliases_are_marked_in_metadata_and_keep_their_profile() -> None:
+def _server_function(tool_name: str) -> Any:
+    # NF-2026-00964: a prefix-renamed tool's Python function keeps its pre-rename name.
+    renamed = tool_name.removeprefix("aiworkhub_")
+    if renamed in mcp_tool_metadata.MCP_PREFIX_RENAMED_TOOLS:
+        return getattr(server, renamed)
+    return getattr(server, tool_name)
+
+
+def test_aliases_are_marked_in_metadata_and_are_manager_callable_but_unlisted() -> None:
     marks = mcp_tool_metadata.MCP_DEPRECATED_FACET_ALIASES
     assert {alias: spec["surviving_tool"] for alias, spec in marks.items()} == {
-        "needfix_count": "needfix_list",
+        "needfix_count": "aiworkhub_needfix_list",
         "aiworkhub_task_codex_handoff_markdown": "aiworkhub_task_codex_handoff",
     }
     for alias, spec in marks.items():
         surviving = spec["surviving_tool"]
         assert alias not in mcp_tool_metadata.MCP_TOOL_ALIASES
-        assert dict(mcp_tool_metadata.MCP_TOOL_PROFILES[alias]) == {"manager": "listed"}
+        # NF-2026-00964: unlisted on manager, still callable by exact name until removal.
+        assert dict(mcp_tool_metadata.MCP_TOOL_PROFILES[alias]) == {"manager": "callable"}
         assert server.mcp_tool_callable(alias, "manager") is True
+        assert server.mcp_tool_listed(alias, "manager") is False
         assert server.mcp_tool_listed(surviving, "manager") is True
-        assert set(spec["facet"]) <= set(inspect.signature(getattr(server, surviving)).parameters)
+        assert set(spec["facet"]) <= set(inspect.signature(_server_function(surviving)).parameters)
         assert f"Deprecated alias of {surviving}" in (getattr(server, alias).__doc__ or "")
 
 
 def test_deprecated_alias_reply_refuses_unmarked_names_and_non_mappings() -> None:
     with pytest.raises(KeyError):
-        mcp_tool_metadata.deprecated_alias_reply("needfix_list", {})
+        mcp_tool_metadata.deprecated_alias_reply("aiworkhub_needfix_list", {})
     with pytest.raises(TypeError):
         mcp_tool_metadata.deprecated_alias_reply("needfix_count", 3)  # type: ignore[arg-type]
     stamped = mcp_tool_metadata.deprecated_alias_reply("needfix_count", {"count": 1})
-    assert stamped == {"count": 1, "server_tool": "needfix_count", "deprecated_alias_of": "needfix_list"}
+    assert stamped == {
+        "count": 1, "server_tool": "needfix_count", "deprecated_alias_of": "aiworkhub_needfix_list",
+    }
 
 
 def test_dashboard_snapshot_stays_with_a_recorded_reason() -> None:
@@ -217,9 +230,9 @@ def test_inventory_script_lists_every_registered_tool(tmp_path: Path) -> None:
     ledger.parent.mkdir(parents=True)
     now = datetime.now(timezone.utc)
     entries = [
-        {"timestamp": (now - timedelta(days=1)).isoformat(), "tool_name": "needfix_list"},
-        {"timestamp": (now - timedelta(days=2)).isoformat(), "tool_name": "needfix_list"},
-        {"timestamp": (now - timedelta(days=45)).isoformat(), "tool_name": "needfix_show"},
+        {"timestamp": (now - timedelta(days=1)).isoformat(), "tool_name": "aiworkhub_needfix_list"},
+        {"timestamp": (now - timedelta(days=2)).isoformat(), "tool_name": "aiworkhub_needfix_list"},
+        {"timestamp": (now - timedelta(days=45)).isoformat(), "tool_name": "aiworkhub_needfix_show"},
     ]
     ledger.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
     env = dict(os.environ)
@@ -248,14 +261,17 @@ def test_inventory_script_lists_every_registered_tool(tmp_path: Path) -> None:
         assert isinstance(row["role"], dict) and row["subsystem"], name
         assert row["call_count_30d"] is None or isinstance(row["call_count_30d"], int), name
         assert name in proc.stdout
-    assert rows["needfix_list"]["call_count_30d"] == 2
-    assert rows["needfix_show"]["call_count_30d"] == 0
+    assert rows["aiworkhub_needfix_list"]["call_count_30d"] == 2
+    assert rows["aiworkhub_needfix_show"]["call_count_30d"] == 0
+    assert rows["needfix_list"]["call_count_30d"] is None
     assert rows["needfix_count"]["call_count_30d"] is None
-    assert rows["needfix_count"]["deprecated_alias_of"] == "needfix_list"
+    assert rows["needfix_count"]["deprecated_alias_of"] == "aiworkhub_needfix_list"
     assert rows["aiworkhub_task_codex_handoff_markdown"]["deprecated_alias_of"] == "aiworkhub_task_codex_handoff"
     assert rows["aiworkhub_dashboard_snapshot"]["fold_kept_reason"]
-    assert rows["needfix_list"]["role"] == {"manager": "listed"}
-    assert rows["needfix_list"]["subsystem"] == "needfix"
+    assert rows["aiworkhub_needfix_list"]["role"] == {"manager": "listed"}
+    assert rows["needfix_list"]["role"] == {"manager": "callable"}
+    assert rows["needfix_count"]["role"] == {"manager": "callable"}
+    assert rows["aiworkhub_needfix_list"]["subsystem"] == "aiworkhub_needfix"
     assert rows["aiworkhub_task_codex_handoff"]["subsystem"] == "aiworkhub_task"
 
     manager = report["totals"]["manager"]

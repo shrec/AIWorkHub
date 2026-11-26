@@ -36,6 +36,9 @@ _HINTED_PARAMS = {
         "apply_contract_patch", "echo_card", "wave_goal_binding", "read_roots",
         "deny_read", "host_commands", "host_sweep", "materialize", "checkout", "evidence",
     ),
+    "aiworkhub_needfix_add": ("status", "kind", "severity"),
+    "aiworkhub_needfix_update": ("kind", "severity"),
+    # NF-2026-00964 rename aliases, listed on surface=all until 0.14.0
     "needfix_add": ("status", "kind", "severity"),
     "needfix_update": ("kind", "severity"),
 }
