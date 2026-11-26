@@ -32,9 +32,9 @@ from aiworkhub import (  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRATCH_PROBE = ".scratch/s1/probe.py"
 SCRATCH_RULE = (
-    "Every seat keeps scratch in .scratch/<session_id>/ of the verified repo, never the"
-    " host/harness scratchpad or system temp, and creates/edits it only with the AIWorkHub"
-    " create/semantic-edit tools."
+    "Every seat keeps scratch in .scratch/<session_id>/ of the verified repo, never host"
+    " scratchpad or system temp, via AIWorkHub create/semantic-edit tools; delete it when its"
+    " step ends. Release/test inputs are tracked repo files, never scratch."
 )
 
 

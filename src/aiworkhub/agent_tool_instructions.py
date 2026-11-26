@@ -270,7 +270,7 @@ POLICY = ToolPolicy(
         "Task MCP receipt is always required; Source Graph is required for code tasks.",
         "Session Manager, AI Memory and KB run only when the card requests them or the task is non-trivial.",
         "Workers submit durable context changes only through the session/AI Memory/KB write-intent tools; a verified manager accepts or rejects each intent before canonical apply. Never write context databases directly.",
-        "Every seat keeps scratch in .scratch/<session_id>/ of the verified repo, never the host/harness scratchpad or system temp, and creates/edits it only with the AIWorkHub create/semantic-edit tools.",
+        "Every seat keeps scratch in .scratch/<session_id>/ of the verified repo, never host scratchpad or system temp, via AIWorkHub create/semantic-edit tools; delete it when its step ends. Release/test inputs are tracked repo files, never scratch.",
         "Do not make empty irrelevant calls to satisfy ceremony.",
     ),
     source_graph=(
