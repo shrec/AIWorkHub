@@ -557,12 +557,15 @@ def test_direct_launch_injects_key_into_child_env_and_cancels(monkeypatch, tmp_p
         adapter_id=ADAPTER, model="deepseek-v4-flash", timeout_seconds=120,
     )
     assert launched["ok"] is True
-    # Wait for the child to dump its env.
+    # Wait for the child to dump its env.  open() creates the file before write()
+    # lands, so wait for the complete three-field record, not mere existence.
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not dump.exists():
+    text = ""
+    while time.monotonic() < deadline and text.count("|") < 2:
+        text = dump.read_text(encoding="utf-8") if dump.exists() else ""
         time.sleep(0.02)
-    assert dump.exists(), "child never wrote env marker"
-    key, base_url, model = dump.read_text(encoding="utf-8").split("|")
+    assert text.count("|") == 2, f"child never wrote env marker: {text!r}"
+    key, base_url, model = text.split("|")
     assert key == FAKE_KEY
     assert base_url == dc.DEEPSEEK_BASE_URL
     assert model == "deepseek-v4-flash"
