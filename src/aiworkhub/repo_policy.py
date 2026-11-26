@@ -1298,6 +1298,25 @@ def _opencode_probe_record(executable: str | None) -> dict[str, Any] | None:
         return dict(record) if record is not None else None
 
 
+def _opencode_probe_cwd(executable: str) -> str | None:
+    """Neutral cwd for an ``opencode models`` child (NF-2026-02447).
+
+    On Windows opencode leaves a process outside the probe's job that keeps
+    its cwd open, so the probe must never inherit a caller's working tree:
+    it runs from the executable's own directory.  None (inherit) only when
+    that directory cannot be resolved, or when the path is relative: it would
+    resolve against, and run under, the caller's cwd.
+    """
+
+    if not os.path.isabs(executable):
+        return None
+    try:
+        directory = Path(executable).resolve().parent
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return str(directory) if directory.is_dir() else None
+
+
 def _opencode_models_probe_once(
     executable: str, timeout: int
 ) -> tuple[list[str], str | None]:
@@ -1309,6 +1328,7 @@ def _opencode_models_probe_once(
             check=False,
             capture_output=True,
             timeout=timeout,
+            cwd=_opencode_probe_cwd(executable),
         )
     except subprocess.TimeoutExpired:
         return [], "timeout"
@@ -1902,6 +1922,7 @@ class _PolledOpencodeModelsProbe(_PolledChild):
             timeout,
             prefix="opencode-models-",
             suffixes=(".out", ".err"),
+            cwd=_opencode_probe_cwd(self._executable),
             **_probe_child_session_kwargs(),
         )
 

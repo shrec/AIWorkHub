@@ -9,6 +9,7 @@ with the old tree kill.  POSIX never touches a job.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -220,3 +221,74 @@ def test_real_grandchild_does_not_pin_the_cwd(tmp_path: Path, ending: str) -> No
         assert _removable_within(held, 5.0), "a probe descendant still holds its cwd"
     finally:
         child.cancel()
+
+
+# NF-2026-02447: both ``opencode models`` spawn sites run from the resolved
+# directory of the executable, never from the caller's working directory.
+
+
+def test_both_opencode_probe_sites_run_from_the_executable_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = sys.executable
+    expected = str(Path(executable).resolve().parent)
+    assert repo_policy._opencode_probe_cwd(executable) == expected
+
+    popen_kwargs: list[dict[str, Any]] = []
+    run_kwargs: list[dict[str, Any]] = []
+
+    def fake_popen(*_a: Any, **kwargs: Any) -> _FakeChild:
+        popen_kwargs.append(kwargs)
+        return _FakeChild(None)
+
+    def fake_run(*_a: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        run_kwargs.append(kwargs)
+        return subprocess.CompletedProcess([executable, "models"], 0, b"", b"")
+
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    probe = repo_policy._PolledOpencodeModelsProbe(executable, tmp_path / "rt")
+    assert probe._start(30) is None
+    probe._process = None  # the fake child is never really reaped
+    probe.cancel()
+    repo_policy._opencode_models_probe_once(executable, 30)
+
+    assert [kwargs.get("cwd") for kwargs in popen_kwargs] == [expected]
+    assert [kwargs.get("cwd") for kwargs in run_kwargs] == [expected]
+
+
+def test_probe_cwd_falls_back_to_inherit_without_a_directory(tmp_path: Path) -> None:
+    missing = tmp_path / "absent" / "opencode"
+    assert repo_policy._opencode_probe_cwd(str(missing)) is None
+    # A relative path would resolve against (and run under) the caller's cwd.
+    assert repo_policy._opencode_probe_cwd(os.path.join("sub", "opencode")) is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or shutil.which("opencode") is None,
+    reason="needs a real opencode on Windows",
+)
+def test_real_opencode_probe_leaves_the_caller_cwd_removable(tmp_path: Path) -> None:
+    executable = shutil.which("opencode")
+    assert executable is not None
+    scratch = tmp_path / "caller-cwd"
+    scratch.mkdir()
+    probe = repo_policy._PolledOpencodeModelsProbe(executable, tmp_path / "rt")
+    # Bounded by the probe's own timeout plus one retry.
+    deadline = time.monotonic() + 2 * (
+        repo_policy._OPENCODE_PROBE_TIMEOUT_SECONDS
+        + repo_policy._OPENCODE_PROBE_RETRY_TIMEOUT_SECONDS
+    )
+    previous = Path.cwd()
+    os.chdir(scratch)
+    try:
+        while not probe.poll():
+            assert time.monotonic() < deadline, "opencode probe never finished"
+            time.sleep(0.05)
+    finally:
+        os.chdir(previous)
+        probe.cancel()
+    shutil.rmtree(scratch)
+    assert not scratch.exists()
