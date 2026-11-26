@@ -2180,6 +2180,22 @@ def manager_watch_command(
     return " ".join(words)
 
 
+def claude_callback_contract() -> str:
+    """NF-2026-02438: the bootstrap callback line, naming the one watcher command.
+
+    A function, not a module constant: the hook runs on every tool call and must
+    not render the watcher launcher at import (core calls it once, at its import).
+    """
+
+    return (
+        "call aiworkhub_dispatcher_ensure_started; once per session after bootstrap, "
+        "start in the background "
+        f"`{manager_watch_command(None, None, provider=None, timeout=None)}`; "
+        "when it exits, call aiworkhub_claude_callback_wait and immediately ack, then "
+        "restart the watcher"
+    )
+
+
 def stop_decision(payload: object, root: str | Path) -> str | None:
     """The block reason for a manager Stop, or None to allow it.
 

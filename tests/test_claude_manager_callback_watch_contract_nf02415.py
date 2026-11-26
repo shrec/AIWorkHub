@@ -53,8 +53,8 @@ def _patch_claude_inbox(monkeypatch, *, backlog: int, oldest: str) -> None:
 
 
 def _claude_contract_line() -> str:
-    # The bootstrap dict's callback["claude"] is this one constant (NF-2026-02438).
-    return core.CLAUDE_CALLBACK_CONTRACT
+    # The bootstrap dict's callback["claude"] comes from this one function (NF-2026-02438).
+    return core.tool_guard_hook.claude_callback_contract()
 
 
 def test_claude_callback_contract_names_the_watcher_and_the_loop():

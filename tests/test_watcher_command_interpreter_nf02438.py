@@ -63,7 +63,7 @@ def test_placeholder_rendering_keeps_the_documented_arguments() -> None:
 
 def test_every_published_text_uses_the_one_helper() -> None:
     placeholder = hook.manager_watch_command(None, None, provider=None, timeout=None)
-    for text in (core.CLAUDE_CALLBACK_CONTRACT, callback_store.MANAGER_INBOX_REMEDIATION):
+    for text in (core.tool_guard_hook.claude_callback_contract(), callback_store.MANAGER_INBOX_REMEDIATION):
         assert f"`{placeholder}`" in text
         assert "`python -m" not in text
         assert "PYTHONPATH=" in text

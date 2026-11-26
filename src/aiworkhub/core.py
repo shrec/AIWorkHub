@@ -2873,17 +2873,6 @@ MCP_MANAGER_CONTRACT_BANNER = (
 # ---------------------------------------------------------------------------
 MANAGER_BOOTSTRAP_SCHEMA_ID = "aiworkhub.manager_bootstrap.v2"
 MANAGER_CONTRACT_VERSION = "aiworkhub.manager_operating_contract.v2"
-# NF-2026-02438: the bootstrap callback line names the exact watcher command from
-# the one helper.  Built here, not in callback_store: MANAGER_CONTRACT is computed
-# at import, and reading callback_store would execute it on the first tools/list
-# (NF-2026-02053 module budget); tool_guard_hook is already loaded by then.
-CLAUDE_CALLBACK_CONTRACT = (
-    "call aiworkhub_dispatcher_ensure_started; once per session after bootstrap, "
-    "start in the background "
-    f"`{tool_guard_hook.manager_watch_command(None, None, provider=None, timeout=None)}`; "
-    "when it exits, call aiworkhub_claude_callback_wait and immediately ack, then "
-    "restart the watcher"
-)
 _CONTRACT_DELIVERY_LOCK = threading.Lock()
 _CONTRACT_DELIVERIES: dict[str, str] = {}
 _CONTRACT_DELIVERY_LIMIT = 256
@@ -3277,7 +3266,7 @@ def _manager_contract() -> dict[str, Any]:
                 "delivers to the repository's current verified Codex manager; "
                 "the originating thread remains immutable audit provenance"
             ),
-            "claude": CLAUDE_CALLBACK_CONTRACT,
+            "claude": tool_guard_hook.claude_callback_contract(),
         },
         "rules": [
             "Managers use AIWorkHub manager AI tools before repository discovery, review, rebase, and planning.",
