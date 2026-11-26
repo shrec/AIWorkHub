@@ -1684,6 +1684,49 @@ def _remove_probe_outputs(paths: Any, wait: float = 0.0) -> None:
                 time.sleep(0.02)
 
 
+def _open_probe_job(process: Any) -> tuple[tuple[Any, Any] | None, str | None]:
+    """Windows: hold ``process`` in a KILL_ON_JOB_CLOSE job (NF-2026-02445).
+
+    Returns ``((kernel32, job), None)``, or ``(None, step)`` naming the step
+    that failed; the probe then keeps the plain tree kill.  POSIX: no job.
+    """
+
+    if not _is_windows_host():
+        return None, None
+    step = "load"
+    job: Any = None
+    try:
+        import ctypes
+
+        from . import platform_io
+        from .windows_job_structures import JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+
+        kernel32 = platform_io._windows_job_kernel32()
+        step = "create"
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None, step
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = platform_io._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        step = "limit"
+        if kernel32.SetInformationJobObject(
+            job,
+            platform_io._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            step = "assign"
+            # ponytail: assigned after Popen, so a grandchild spawned before this call
+            # escapes the job (same ceiling as platform_io._run_under_windows_job).
+            if kernel32.AssignProcessToJobObject(job, int(process._handle)):
+                return (kernel32, job), None
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        pass
+    if job:
+        kernel32.CloseHandle(job)
+    return None, step
+
+
 class _PolledChild:
     """One child process writing to runtime files, polled and never waited on."""
 
@@ -1692,6 +1735,10 @@ class _PolledChild:
         self._process: subprocess.Popen[bytes] | None = None
         self._outputs: tuple[Path, ...] = ()
         self._deadline = 0.0
+        # Windows only: (kernel32, job handle) owning the child's whole tree;
+        # ``_job_refusal`` names the step when the job could not be had.
+        self._job: tuple[Any, Any] | None = None
+        self._job_refusal: str | None = None
 
     def cancel(self) -> None:
         """Kill a still-running child and remove its files; publishes nothing."""
@@ -1737,6 +1784,7 @@ class _PolledChild:
             reason = "invalid"
         else:
             self._process = process
+            self._job, self._job_refusal = _open_probe_job(process)
             self._outputs = tuple(paths)
             self._deadline = time.monotonic() + timeout
         finally:
@@ -1750,9 +1798,21 @@ class _PolledChild:
         return reason
 
     def _take_outputs(self) -> tuple[Path, ...]:
+        # Every path that lets go of the child (cancel, timeout, collected
+        # exit) passes here: no descendant outlives it (NF-2026-02445).
+        self._close_job()
         outputs, self._outputs = self._outputs, ()
         self._process = None
         return outputs
+
+    def _close_job(self) -> None:
+        job, self._job = self._job, None
+        if job is not None:
+            kernel32, handle = job
+            try:
+                kernel32.TerminateJobObject(handle, 1)
+            finally:
+                kernel32.CloseHandle(handle)
 
     def _stop_child(self) -> None:
         process = self._process
@@ -1853,7 +1913,8 @@ class _PolledOpencodeModelsProbe(_PolledChild):
         except (OSError, IndexError):
             return [], "oserror"
         finally:
-            _remove_probe_outputs(outputs)
+            # The terminated job's handles on the files close asynchronously.
+            _remove_probe_outputs(outputs, _OPENCODE_PROBE_KILL_TIMEOUT_SECONDS)
         return _opencode_models_from_output(stdout, stderr, returncode)
 
 
@@ -2066,7 +2127,7 @@ class _PolledAuthProbe(_PolledChild):
         except ValueError:
             return None, "malformed"
         finally:
-            _remove_probe_outputs(outputs)
+            _remove_probe_outputs(outputs, _OPENCODE_PROBE_KILL_TIMEOUT_SECONDS)
 
     def _finish(self, payload: object, failure: str | None) -> None:
         self._done = True
