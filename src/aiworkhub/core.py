@@ -33,8 +33,7 @@ from . import (
 from . import accept_failure_cause
 from . import base_drift_proof as base_drift_proof_module
 from . import manager_console_identity, manager_reroute_identity, manager_route_probe
-from . import platform_io
-from . import repository_state
+from . import platform_io, repo_git_exclude, repository_state
 from . import runtime_generation
 from . import shared_router
 from . import sqlite_readonly
@@ -3543,6 +3542,7 @@ def manager_bootstrap(
         reply["toolsearch_hint"] = (
             "After a context compaction, run this ToolSearch select first to reload the manager tool schemas."
         )
+        reply["host_local_git_exclude"] = repo_git_exclude.bootstrap_receipt(root)  # NF-2026-01013
     return reply
 
 
