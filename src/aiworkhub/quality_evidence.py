@@ -903,12 +903,71 @@ DESTRUCTIVE_MAX_RETAINED_SYMBOL_RATIO = 0.50
 SUMMARY_TRUNCATION_MARKER = "AIWORKHUB_SUMMARY_TRUNCATED"
 
 
+SUMMARY_FAILURE_MARKERS = (
+    "failed with exit code",
+    "not ok",
+    "✖",
+    "AssertionError",
+    "Error:",
+)
+SUMMARY_FAILURE_EXIT_LINE = "failed with exit code"
+SUMMARY_FAILURE_CONTEXT_LINES = 2
+
+
+def _failure_marker_block(text: str, *, budget: int) -> str:
+    """Return the failure-marker lines of ``text`` with context, within ``budget``.
+
+    Exit-code lines claim their window first, then the other markers in their
+    original order. A marker line whose full window does not fit is kept alone
+    when it fits. Output keeps the original line order.
+    """
+
+    lines = text.splitlines()
+    marked = [
+        index
+        for index, line in enumerate(lines)
+        if any(marker in line for marker in SUMMARY_FAILURE_MARKERS)
+    ]
+    marked.sort(key=lambda index: (SUMMARY_FAILURE_EXIT_LINE not in lines[index], index))
+    emitted: set[int] = set()
+
+    def render(indices: set[int]) -> str:
+        parts: list[str] = []
+        previous = -2
+        for j in sorted(indices):
+            if j != previous + 1 and parts:
+                parts.append("...\n")
+            parts.append(f"{lines[j]}\n")
+            previous = j
+        return "".join(parts)
+
+    used = 0
+    for index in marked:
+        if used >= budget:
+            break
+        low = max(0, index - SUMMARY_FAILURE_CONTEXT_LINES)
+        high = min(len(lines), index + SUMMARY_FAILURE_CONTEXT_LINES + 1)
+        window = set(range(low, high))
+        candidate = render(emitted | window)
+        if len(candidate) <= budget:
+            emitted |= window
+            used = len(candidate)
+            continue
+        if index not in emitted:
+            candidate = render(emitted | {index})
+            if len(candidate) <= budget:
+                emitted.add(index)
+                used = len(candidate)
+    return render(emitted)
+
+
 def _bounded_summary(text: str, *, status: str = "") -> str:
     """Bound a summary to ``MAX_SUMMARY_CHARS``, always marking a real cut.
 
-    A failing check keeps the tail so the line that says what broke survives;
-    any truncated result carries :data:`SUMMARY_TRUNCATION_MARKER`, so a reader
-    can never mistake cut output for short output.
+    A failing check keeps the lines that name a failure (with context) first,
+    then the head and tail, so the line that says what broke survives; any
+    truncated result carries :data:`SUMMARY_TRUNCATION_MARKER`, so a reader can
+    never mistake cut output for short output.
     """
 
     if len(text) <= MAX_SUMMARY_CHARS:
@@ -917,14 +976,23 @@ def _bounded_summary(text: str, *, status: str = "") -> str:
         dropped = len(text) - MAX_SUMMARY_CHARS
         head_len = tail_len = 0
         note = ""
+        block = ""
         # The total length is exactly ``MAX_SUMMARY_CHARS`` regardless of
         # convergence; the loop only refines the reported ``dropped`` count.
         for _ in range(4):
             note = (
-                f"\n[{SUMMARY_TRUNCATION_MARKER}: {dropped} characters elided; "
-                "tail retained]\n"
+                f"\n[{SUMMARY_TRUNCATION_MARKER}: {dropped} characters elided from "
+                "head/tail window; failure lines above]\n"
             )
-            available = max(0, MAX_SUMMARY_CHARS - len(note))
+            room = max(0, MAX_SUMMARY_CHARS - len(note))
+            block = _failure_marker_block(text, budget=room // 2)
+            if block:
+                block = (
+                    f"[{SUMMARY_TRUNCATION_MARKER}: failure lines]\n"
+                    + block
+                    + "[end failure lines]\n"
+                )
+            available = max(0, room - len(block))
             head_len = available // 4
             tail_len = available - head_len
             recomputed = len(text) - head_len - tail_len
@@ -932,7 +1000,7 @@ def _bounded_summary(text: str, *, status: str = "") -> str:
                 break
             dropped = recomputed
         tail = text[len(text) - tail_len:] if tail_len else ""
-        return text[:head_len] + note + tail
+        return block + text[:head_len] + note + tail
     note = f"\n[{SUMMARY_TRUNCATION_MARKER}: head retained]"
     available = max(0, MAX_SUMMARY_CHARS - len(note))
     return text[:available] + note
