@@ -75,6 +75,10 @@ DEFAULT_RESOURCE_WAIT_SECONDS = 6 * 3600.0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600.0
 MAX_OUTPUT_TAIL_BYTES = 256 * 1024
 SECTION_TAIL_CHARS = 1024
+# NF-2026-01006: pytest FAILED/ERROR summary lines kept per row from the full output.
+MAX_FAILURE_LINES = 50
+MAX_FAILURE_LINE_CHARS = 512
+_FAILURE_LINE = re.compile(r"(?:FAILED|ERROR) \S")
 MAX_STATE_FILE_BYTES = 8 * 1024 * 1024
 MAX_REPORTED_PATHS = 200
 MARKER_WRITE_GRACE_SECONDS = 60.0
@@ -439,6 +443,29 @@ def _tail(path: Path) -> tuple[str, bool]:
     return data.decode("utf-8", "replace"), size > MAX_OUTPUT_TAIL_BYTES
 
 
+def failure_summary_lines(*paths: Path) -> list[str]:
+    """pytest ``FAILED <nodeid>`` / ``ERROR <nodeid>`` lines from the FULL output files.
+
+    NF-2026-01006: the stored tails keep only the last bytes, so a long run's
+    failing node ids would be lost. Streams each file line by line; keeps at
+    most :data:`MAX_FAILURE_LINES` lines, each cut to :data:`MAX_FAILURE_LINE_CHARS`.
+    """
+    found: list[str] = []
+    for path in paths:
+        try:
+            handle = open(path, "rb")
+        except OSError:
+            continue
+        with handle:
+            for raw in handle:
+                line = raw.decode("utf-8", "replace").strip()
+                if _FAILURE_LINE.match(line):
+                    found.append(line[:MAX_FAILURE_LINE_CHARS])
+                    if len(found) >= MAX_FAILURE_LINES:
+                        return found
+    return found
+
+
 def _terminate_tree(proc: subprocess.Popen[bytes]) -> None:
     from . import platform_io
 
@@ -509,6 +536,7 @@ def run_argv(
                     raise
         stdout_tail, stdout_truncated = _tail(out_path)
         stderr_tail, stderr_truncated = _tail(err_path)
+        failed_tests = failure_summary_lines(out_path, err_path)
     row.update(
         returncode=returncode,
         timed_out=timed_out,
@@ -516,6 +544,7 @@ def run_argv(
         stderr_tail=stderr_tail,
         stdout_truncated=stdout_truncated,
         stderr_truncated=stderr_truncated,
+        failed_tests=failed_tests,
         duration_seconds=round(time.monotonic() - started, 3),
     )
     return row
@@ -540,10 +569,15 @@ def validation_command(
     tokens, _interpreter = ww._normalize_validation_interpreter_argv(workspace, list(argv))
     is_pytest = ww._is_pytest_validation_command(tokens)
     components: tuple[str, ...] = ()
+    # NF-2026-01006: every row gets its own short leaf under the stage's
+    # neutral scratch; its TEMP/TMP/TMPDIR and pytest basetemp live there,
+    # never under the (long) union2 request HOME.
+    scratch = scratch_root / uuid.uuid4().hex[:8]
+    scratch.mkdir(parents=True)
+    row_temp = scratch / "t"
+    row_temp.mkdir()
     if is_pytest:
         components = (str(ww.resolve_trusted_pytest_runtime_root()),)
-        scratch = scratch_root / uuid.uuid4().hex[:12]
-        scratch.mkdir(parents=True)
         tokens = runtime_temp.pytest_basetemp_argv(
             ww._normalize_pytest_validation_argv(tokens), scratch
         )
@@ -573,6 +607,8 @@ def validation_command(
     # host command spawns (xdist/execnet workers, subprocess pythons) inherits
     # this env, so safe-path holds for them too.
     env["PYTHONSAFEPATH"] = "1"
+    for key in ("TEMP", "TMP", "TMPDIR"):
+        env[key] = str(row_temp)
     return tokens, env
 
 
@@ -654,7 +690,7 @@ def host_command_failed(spec: HostStageSpec, argv: Sequence[str], row: Mapping[s
 
 _SUMMARY_KEYS = (
     "argv", "declared_argv", "returncode", "timed_out", "duration_seconds", "spawn_error",
-    "argv_error",
+    "argv_error", "failed_tests",
 )
 
 
