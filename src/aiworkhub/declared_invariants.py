@@ -955,8 +955,10 @@ ACCEPTED_UNDETECTED: dict[str, str] = {
     "task_atomicity:whole_file_regeneration": _NOT_A_SOURCE_PROPERTY,
 }
 
-# The invariant that has no manifest rule to answer to. Declared here rather than
-# silently ignored, so the mapping is total in both directions.
+# The invariants that have no manifest rule to answer to. Declared here rather
+# than silently ignored, so the mapping is total in both directions:
+# ``rule_detector_coverage`` refuses an executing detector that is neither in
+# ``RULE_DETECTORS`` nor here, and one that is in both (NF-2026-00870).
 _DETECTORS_WITHOUT_A_DECLARED_RULE: dict[str, str] = {
     "sqlite_context_managers_close":
         "no manifest rule forbids relying on Connection.__exit__ to close; the "
@@ -965,6 +967,21 @@ _DETECTORS_WITHOUT_A_DECLARED_RULE: dict[str, str] = {
         "measures what the repository DID, not what its source says; the "
         "manifest declares rules about code, and this one has no code to name",
 }
+
+# The languages the tree detectors actually read. Every detector parses Python
+# with ``ast``; a rule the manifest applies to JavaScript or TypeScript (or, with
+# no ``applicability.languages``, to every declared language) is therefore only
+# partly executed, and the coverage report names each unscanned language rather
+# than counting the rule as covered (NF-2026-00870).
+SCANNED_LANGUAGES: frozenset[str] = frozenset({"python"})
+
+
+def _rule_languages(rule: Any, manifest: Any) -> tuple[str, ...]:
+    """Languages a rule governs: its own applicability, else every declared one."""
+
+    applicability = getattr(rule, "applicability", None)
+    own = tuple(getattr(applicability, "languages", ()) or ())
+    return own or tuple(getattr(manifest, "languages", ()) or ())
 
 
 def _obligations(manifest: Any) -> list[tuple[str, str]]:
@@ -993,14 +1010,60 @@ def rule_detector_coverage(manifest: Any) -> dict[str, Any]:
         missing = sorted(set(tokens.values()) - set(INVARIANT_NAMES))
         if missing:
             raise ValueError(f"RULE_DETECTORS names detectors that do not run: {missing}")
+    # Total in the other direction too: every detector that executes answers to
+    # a declared rule or carries a written reason why it does not, never both.
+    mapped = {name for tokens in RULE_DETECTORS.values() for name in tokens.values()}
+    unaccounted = sorted(set(INVARIANT_NAMES) - mapped - set(_DETECTORS_WITHOUT_A_DECLARED_RULE))
+    if unaccounted:
+        raise ValueError(
+            f"executing detectors answer to no manifest rule and carry no reason: {unaccounted}"
+        )
+    contradictory = sorted(mapped & set(_DETECTORS_WITHOUT_A_DECLARED_RULE))
+    if contradictory:
+        raise ValueError(
+            f"detectors are both mapped to a rule and declared rule-less: {contradictory}"
+        )
+    stale = sorted(set(_DETECTORS_WITHOUT_A_DECLARED_RULE) - set(INVARIANT_NAMES))
+    if stale:
+        raise ValueError(f"_DETECTORS_WITHOUT_A_DECLARED_RULE names detectors that do not run: {stale}")
 
-    detected: list[dict[str, str]] = []
+    languages = {rule.id: _rule_languages(rule, manifest) for rule in manifest.rules}
+    detected: list[dict[str, Any]] = []
     accepted: list[dict[str, str]] = []
     undetected: list[dict[str, str]] = []
+    unscanned: list[dict[str, Any]] = []
     for rule_id, token in _obligations(manifest):
         detector = RULE_DETECTORS.get(rule_id, {}).get(token)
         if detector is not None:
-            detected.append({"rule": rule_id, "forbids": token, "detector": detector})
+            governed = languages.get(rule_id, ())
+            missed = sorted(set(governed) - SCANNED_LANGUAGES)
+            if governed and not (set(governed) & SCANNED_LANGUAGES):
+                # The detector exists but reads none of the languages the rule
+                # governs, so it executes for none of its scope: not covered,
+                # never "partly" covered (NF-2026-00870).
+                unscanned.append({
+                    "rule": rule_id, "forbids": token, "detector": detector,
+                    "languages": missed,
+                    "reason": (
+                        f"{detector} reads {', '.join(sorted(SCANNED_LANGUAGES))} only; "
+                        f"the rule governs only {', '.join(missed)}, which no detector scans"
+                    ),
+                })
+                continue
+            detected.append({
+                "rule": rule_id, "forbids": token, "detector": detector,
+                "scanned_languages": sorted(set(governed) & SCANNED_LANGUAGES),
+                "unscanned_languages": missed,
+            })
+            if missed:
+                unscanned.append({
+                    "rule": rule_id, "forbids": token, "detector": detector,
+                    "languages": missed,
+                    "reason": (
+                        f"{detector} reads {', '.join(sorted(SCANNED_LANGUAGES))} only; "
+                        f"the rule also governs {', '.join(missed)}, which no detector scans"
+                    ),
+                })
         elif f"{rule_id}:{token}" in ACCEPTED_UNDETECTED:
             accepted.append({
                 "rule": rule_id, "forbids": token,
@@ -1013,13 +1076,17 @@ def rule_detector_coverage(manifest: Any) -> dict[str, Any]:
             })
 
     covered = {row["rule"] for row in detected}
-    uncovered = {row["rule"] for row in (*accepted, *undetected)}
+    uncovered = {row["rule"] for row in (*accepted, *undetected, *unscanned)}
     return {
         "declared_rules": len(declared),
-        "obligations": len(detected) + len(accepted) + len(undetected),
+        # Every declared obligation, including a detected one whose rule governs
+        # no scanned language and is therefore reported unscanned, not detected.
+        "obligations": len(_obligations(manifest)),
         "detected": detected,
         "accepted_undetected": accepted,
         "undetected": undetected,
+        "scanned_languages": sorted(SCANNED_LANGUAGES),
+        "unscanned_languages": unscanned,
         "rules_fully_covered": sorted(covered - uncovered),
         "rules_partly_covered": sorted(covered & uncovered),
         "rules_not_covered": sorted(uncovered - covered),
@@ -1356,6 +1423,15 @@ def check(
             "invariant": f"{row['rule']}:{row['forbids']}",
             "reason": row["reason"],
         })
+    # A detected obligation whose rule also governs a language no detector reads
+    # is executed for part of its scope only; each unscanned language is named,
+    # so a JS/TS breach can never hide behind a Python-only "covered".
+    for row in coverage.get("unscanned_languages", []):
+        for language in row["languages"]:
+            unevaluated.append({
+                "invariant": f"{row['rule']}:{row['forbids']}@{language}",
+                "reason": row["reason"],
+            })
     if coverage["status"] == "unavailable":
         # A repository that DECLARES rules and cannot read them is broken; one
         # that declares none is simply not this kind of repository.
