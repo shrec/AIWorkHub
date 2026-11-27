@@ -1416,3 +1416,123 @@ def test_task_create_leaves_an_unapplied_binding_pending_for_the_reconciler(
     assert _successor_events(root, wave["id"]) == [
         {"goal_id": "lsp", "from": "LSP_V1", "to": "LSP_V2"}
     ]
+
+
+# --- NF-2026-00987: wave authoring tools on the stdlib production backend ---
+
+_WAVE_TOOL_NAMES = (
+    "aiworkhub_roadmap_wave_open",
+    "aiworkhub_roadmap_wave_goal_upsert",
+    "aiworkhub_roadmap_wave_goal_remove",
+    "aiworkhub_roadmap_wave_attach",
+    "aiworkhub_roadmap_wave_status",
+    "aiworkhub_roadmap_wave_rollover",
+)
+_WAVE_STDLIB_PREFIX = "NF00987_PAYLOAD="
+_WAVE_STDLIB_CHILD = r"""
+try:
+    import sitecustomize  # noqa: F401 - -S skips site; the AppContainer lane shim must still load
+except ImportError:
+    pass
+import json
+from aiworkhub import server
+
+assert not server._MCP_SDK_AVAILABLE
+tools = server.mcp._tools
+
+
+def rpc(method, params=None):
+    return server._stdio_dispatch("AIWorkHub MCP", tools, method, params, "", 1)
+
+
+def call(name, arguments):
+    reply = rpc("tools/call", {"name": name, "arguments": arguments})
+    return json.loads(reply["content"][0]["text"])
+
+
+OPEN = {
+    "milestone": "0.13.18",
+    "title": "Wiring wave",
+    "goals": [{"id": "lsp", "label": "LSP", "acceptance_indices": [1]}],
+    "acceptance": ["LSP integrated"],
+}
+report = {
+    "registered": list(tools),
+    "listed": [entry["name"] for entry in rpc("tools/list")["tools"]],
+}
+report["open"] = call("aiworkhub_roadmap_wave_open", OPEN)
+wave_id = report["open"]["wave"]["id"]
+report["retry"] = call("aiworkhub_roadmap_wave_open", OPEN)
+report["upsert"] = call(
+    "aiworkhub_roadmap_wave_goal_upsert",
+    {
+        "roadmap_id": wave_id,
+        "goal_id": "docs",
+        "label": "Docs",
+        "expected_revision": report["open"]["item_revision"],
+    },
+)
+report["attach"] = call(
+    "aiworkhub_roadmap_wave_attach",
+    {"roadmap_id": wave_id, "goal_id": "lsp", "task_id": "NO_SUCH_TASK"},
+)
+report["remove"] = call(
+    "aiworkhub_roadmap_wave_goal_remove",
+    {
+        "roadmap_id": wave_id,
+        "goal_id": "docs",
+        "expected_revision": report["upsert"]["item_revision"],
+    },
+)
+report["status"] = call("aiworkhub_roadmap_wave_status", {})
+report["rollover"] = call("aiworkhub_roadmap_wave_rollover", {"next_milestone": "0.13.19"})
+print(PREFIX + json.dumps(report))
+"""
+
+
+def test_wave_authoring_tools_are_callable_on_the_stdlib_backend(tmp_path):
+    root = _init_lifecycle_repo(tmp_path)
+    # Extend PYTHONPATH, never replace it, and drop the SDK entries -S could not hide.
+    inherited = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+    inherited = [
+        p for p in inherited if not (Path(p, "mcp").is_dir() or Path(p, "pydantic").is_dir())
+    ]
+    env = dict(
+        os.environ,
+        AIWORKHUB_MCP_STDIO_BACKEND="stdlib",
+        AIWORKHUB_MCP_SURFACE="manager",
+        AIWORKHUB_ALLOW_WRITES="1",
+        AIWORKHUB_REPO_ROOT=str(root),
+        AIWORKHUB_REPO=str(root),
+        PYTHONPATH=os.pathsep.join([str(_SRC), *inherited]),
+    )
+    script = f"PREFIX = {_WAVE_STDLIB_PREFIX!r}\n{_WAVE_STDLIB_CHILD}"
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    [line] = [row for row in completed.stdout.splitlines() if row.startswith(_WAVE_STDLIB_PREFIX)]
+    report = json.loads(line[len(_WAVE_STDLIB_PREFIX):])
+
+    # Manager-only: callable by exact name on the manager surface, absent from its tools/list.
+    for name in _WAVE_TOOL_NAMES:
+        assert name in report["registered"] and name not in report["listed"], name
+    opened = report["open"]
+    assert opened["state"] == "applied", opened
+    wave_id = opened["wave"]["id"]
+    assert opened["wave"]["outcome"]["summarized"] is True
+    assert (report["retry"]["state"], report["retry"]["wave"]["id"]) == ("already_applied", wave_id)
+    assert (report["upsert"]["state"], report["upsert"]["outcome"]) == ("applied", "created")
+    assert (report["attach"]["state"], report["attach"]["reason"]) == ("refused", "task_not_found")
+    assert report["remove"]["state"] == "applied", report["remove"]
+    status = report["status"]
+    assert (status["state"], status["wave"]["id"]) == ("ok", wave_id)
+    assert status["completion"]["state"] == "unknown"
+    rolled = report["rollover"]
+    assert (rolled["state"], rolled["supersedes"]) == ("applied", wave_id), rolled
+    assert roadmap_store.get_item(root, wave_id)["status"] == "archived"
+    assert roadmap_store.get_item(root, rolled["wave"]["id"])["status"] == "in_progress"

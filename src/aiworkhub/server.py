@@ -10370,6 +10370,204 @@ def roadmap_link_task(roadmap_id: str, task_id: str) -> dict:
     return core.roadmap_link_task(roadmap_id, task_id)
 
 
+# --- Wave mini-roadmap authoring (NF-2026-00987) ---
+# Manager-only writes through roadmap_store; none of them can complete a wave:
+# roadmap_store.reconcile_wave_completion stays the only, evidence-only path.
+
+
+def _wave_reply(receipt: dict) -> dict:
+    """Fold each returned outcome row's bodies so a wave receipt stays bounded."""
+    reply = dict(receipt)
+    for key in ("wave", "superseded"):
+        if isinstance(reply.get(key), dict):
+            reply[key] = _fold_roadmap_bodies(reply[key])
+    return reply
+
+
+@mcp.tool(name="aiworkhub_roadmap_wave_open")
+def roadmap_wave_open(
+    milestone: str,
+    title: str,
+    goals: list[dict] | None = None,
+    acceptance: list[str] | None = None,
+    supersedes: str = "",
+    outcome: str = "",
+) -> dict:
+    """Manager-only: open a wave, an in_progress Roadmap outcome whose goals target one release milestone.
+
+    Use this instead of aiworkhub_roadmap_add with hand-written wave_goals provenance; use
+    aiworkhub_roadmap_wave_rollover to replace the current wave at a release. Replies
+    ``{state: applied | already_applied | refused, reason, wave, item_revision}``; the same
+    arguments again return the wave they opened. A wave never completes here: only accepted
+    task evidence completes it.
+
+    Args:
+        milestone: Target version X.Y.Z, optional v prefix, e.g. 0.13.18; a second active wave for the same milestone is refused.
+        title: Short wave title; required, at most 1000 bytes.
+        goals: New goals as [{id, label, acceptance_indices?}]; id is letters, digits and _.:- (at most 64 characters), label at most 120 characters, acceptance_indices 1-based criterion numbers. At most 24 goals including carried ones; each new goal starts with no task.
+        acceptance: Acceptance criteria, 1-100 non-blank strings; the wave completes only when every criterion is mapped to a goal whose tasks are all accepted.
+        supersedes: Roadmap id (RM-YYYY-NNNNN) of the active wave this one replaces; its goals not yet accepted move here with their tasks and it is archived with a superseded_by event. Empty (default) replaces nothing.
+        outcome: What the wave delivers; default "Wave <milestone>: <title>".
+    """
+    return _wave_reply(
+        roadmap_store.open_wave(
+            core.repo_root(),
+            milestone=milestone,
+            title=title,
+            goals=goals,
+            acceptance=acceptance,
+            supersedes=supersedes,
+            outcome=outcome,
+        )
+    )
+
+
+@mcp.tool(name="aiworkhub_roadmap_wave_goal_upsert")
+def roadmap_wave_goal_upsert(
+    roadmap_id: str,
+    goal_id: str,
+    label: str,
+    expected_revision: str,
+    acceptance_indices: list[int] | None = None,
+) -> dict:
+    """Manager-only: add a goal to an active wave or change its label and criterion mapping.
+
+    Use this to edit wave goals; use aiworkhub_roadmap_wave_attach to give a goal tasks and
+    aiworkhub_roadmap_wave_goal_remove to drop one. A goal that already reads exactly so is
+    already_applied; any other edit made from a stale revision is refused with the current one.
+
+    Args:
+        roadmap_id: Wave outcome id in the form RM-YYYY-NNNNN.
+        goal_id: Goal id; letters, digits and _.:-, at most 64 characters. An unknown id adds a new goal with no task.
+        label: Goal label shown in the wave checklist; required, at most 120 characters.
+        expected_revision: The wave's item_revision this edit was decided from, as returned by aiworkhub_roadmap_wave_status or a previous wave tool.
+        acceptance_indices: 1-based numbers of the wave's acceptance criteria this goal proves; omit to keep the goal's current mapping.
+    """
+    return _wave_reply(
+        roadmap_store.upsert_goal(
+            core.repo_root(),
+            roadmap_id=roadmap_id,
+            goal_id=goal_id,
+            label=label,
+            expected_revision=expected_revision,
+            acceptance_indices=acceptance_indices,
+        )
+    )
+
+
+@mcp.tool(name="aiworkhub_roadmap_wave_goal_remove")
+def roadmap_wave_goal_remove(
+    roadmap_id: str,
+    goal_id: str,
+    expected_revision: str,
+    force: bool = False,
+    reason: str = "",
+) -> dict:
+    """Manager-only: remove one goal from an active wave; its tasks stay in the outcome's task history.
+
+    Use this to drop a goal; use aiworkhub_roadmap_wave_goal_upsert to rename one. A goal still
+    holding a task that is not canonically accepted is removed only with force=true and a
+    reason, both recorded in the wave_goal_removed event. The last goal cannot be removed.
+
+    Args:
+        roadmap_id: Wave outcome id in the form RM-YYYY-NNNNN.
+        goal_id: Id of the goal to remove.
+        expected_revision: The wave's item_revision this removal was decided from; a stale revision is refused.
+        force: Remove even though the goal holds unaccepted tasks; default false.
+        reason: Why the goal is removed; required with force when tasks are unaccepted, at most 4000 bytes.
+    """
+    return _wave_reply(
+        roadmap_store.remove_goal(
+            core.repo_root(),
+            roadmap_id=roadmap_id,
+            goal_id=goal_id,
+            expected_revision=expected_revision,
+            force=force,
+            reason=reason,
+        )
+    )
+
+
+@mcp.tool(name="aiworkhub_roadmap_wave_attach")
+def roadmap_wave_attach(
+    roadmap_id: str,
+    goal_id: str,
+    task_id: str = "",
+    needfix_id: str = "",
+) -> dict:
+    """Manager-only: attach one existing task to an active wave goal as a current task, with no predecessor.
+
+    Use this for a goal's first task or to bind an existing card; a successor that replaces a
+    goal's task is declared with wave_goal_binding on aiworkhub_task_create instead. Writes the
+    goal, the outcome's task_ids and one wave_goal_task_attached event in one transaction; the
+    same attach again is already_applied.
+
+    Args:
+        roadmap_id: Wave outcome id in the form RM-YYYY-NNNNN.
+        goal_id: Id of the goal that gains the task.
+        task_id: Id of an existing task in this repository; give exactly one of task_id and needfix_id.
+        needfix_id: NeedFix id (NF-YYYY-NNNNN) whose converted_task_id is attached; refused while the NeedFix has no converted task.
+    """
+    return _wave_reply(
+        roadmap_store.attach_goal_task(
+            core.repo_root(),
+            roadmap_id=roadmap_id,
+            goal_id=goal_id,
+            task_id=task_id,
+            needfix_id=needfix_id,
+        )
+    )
+
+
+@mcp.tool(name="aiworkhub_roadmap_wave_status")
+def roadmap_wave_status(wave_id: str = "") -> dict:
+    """READ-ONLY: the current wave checklist plus one wave's evidence-only completion verdict.
+
+    Use this before aiworkhub_roadmap_wave_goal_upsert or aiworkhub_roadmap_wave_goal_remove to
+    read a wave's goals and item_revision; it never writes, so it never completes a wave.
+    Replies ``current_wave`` (the projection the dashboard shows,
+    against the installed version), ``wave`` (goals, task ids and item_revision) and
+    ``completion`` (completed, pending_evidence or unknown with a typed reason). Bounded to 32
+    active waves of at most 24 goals with 16 tasks each.
+
+    Args:
+        wave_id: Roadmap id (RM-YYYY-NNNNN) of the wave to judge; empty (default) judges the projected current wave.
+    """
+    from . import __version__ as installed_version
+
+    return roadmap_store.wave_status(
+        core.repo_root(), installed_version=installed_version, wave_id=wave_id
+    )
+
+
+@mcp.tool(name="aiworkhub_roadmap_wave_rollover")
+def roadmap_wave_rollover(
+    next_milestone: str,
+    title: str = "",
+    acceptance: list[str] | None = None,
+) -> dict:
+    """Manager-only: open the next wave at a release, superseding the current active wave.
+
+    Exactly aiworkhub_roadmap_wave_open(milestone=next_milestone, supersedes=<current wave>):
+    the current wave's goals not yet accepted move to the new wave with their tasks, and the
+    current wave is archived with a superseded_by event. Use this after a release tag instead
+    of retargeting a wave by hand. A current wave already at next_milestone is already_applied.
+
+    Args:
+        next_milestone: Version the new wave targets, X.Y.Z; must be later than the current wave's milestone.
+        title: New wave title; default "Wave <next_milestone>".
+        acceptance: New acceptance criteria; omit to keep the current wave's, so carried goals keep their criterion mapping.
+    """
+    return _wave_reply(
+        roadmap_store.rollover_wave(
+            core.repo_root(),
+            next_milestone=next_milestone,
+            title=title,
+            acceptance=acceptance,
+        )
+    )
+
+
 # NF-2026-00964: each pre-rename needfix_*/roadmap_* name stays callable until
 # 0.14.0 as a rename alias of its aiworkhub_-prefixed tool. The module attribute
 # is never rebound, so server.<pre-rename name> stays the canonical function.

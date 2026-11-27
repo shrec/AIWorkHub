@@ -1,4 +1,4 @@
-"""Read-only current-wave projection and completion verdict: pure functions, no store access, no writes."""
+"""Current-wave projection, completion verdict and wave authoring validation: pure functions, no store access, no writes."""
 
 from __future__ import annotations
 
@@ -136,6 +136,45 @@ def _project_goals(wave: Mapping[str, Any]) -> list[dict[str, Any]] | None:
     return goals
 
 
+def select_current_wave(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any] | None, str]:
+    """The unique highest-milestone active wave row, or ``None`` with its typed reason.
+
+    The one selection rule behind :func:`project_current_wave` and the
+    rollover's choice of predecessor; it never reads an installed version.
+    """
+    invalid_version = False
+    versioned: list[tuple[tuple[int, ...], Mapping[str, Any]]] = []
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            return None, REASON_MALFORMED_ROW
+        provenance = row.get("provenance")
+        if (
+            row.get("status") != "in_progress"
+            or not isinstance(provenance, Mapping)
+            or "wave_goals" not in provenance
+        ):
+            continue
+        if not isinstance(row.get("id"), str) or not row["id"]:
+            return None, REASON_MALFORMED_ROW
+        version = _version(row.get("milestone"))
+        if version is None:
+            invalid_version = True
+        else:
+            versioned.append((version, row))
+    # One unversioned active wave makes "highest target" unknowable, so never rank the rest.
+    if invalid_version:
+        return None, REASON_INVALID_WAVE_VERSION
+    if not versioned:
+        return None, REASON_NO_ACTIVE_WAVE
+    target = max(version for version, _ in versioned)
+    winners = [row for version, row in versioned if version == target]
+    if len(winners) != 1:
+        return None, REASON_AMBIGUOUS_ACTIVE_WAVE
+    return winners[0], REASON_SELECTED
+
+
 def project_current_wave(
     rows: Sequence[Mapping[str, Any]],
     installed_version: str,
@@ -149,35 +188,12 @@ def project_current_wave(
         return _unknown(REASON_TRUNCATED, installed_text)
     if installed is None:
         return _unknown(REASON_INVALID_INSTALLED_VERSION)
-    invalid_version = False
-    versioned: list[tuple[tuple[int, ...], Mapping[str, Any]]] = []
-    for row in rows or ():
-        if not isinstance(row, Mapping):
-            return _unknown(REASON_MALFORMED_ROW, installed_text)
-        provenance = row.get("provenance")
-        if (
-            row.get("status") != "in_progress"
-            or not isinstance(provenance, Mapping)
-            or "wave_goals" not in provenance
-        ):
-            continue
-        if not isinstance(row.get("id"), str) or not row["id"]:
-            return _unknown(REASON_MALFORMED_ROW, installed_text)
-        version = _version(row.get("milestone"))
-        if version is None:
-            invalid_version = True
-        else:
-            versioned.append((version, row))
-    # One unversioned active wave makes "highest target" unknowable, so never rank the rest.
-    if invalid_version:
+    wave, reason = select_current_wave(rows)
+    if wave is None:
+        return _unknown(reason, installed_text)
+    target = _version(wave["milestone"])
+    if target is None:  # select_current_wave ranks versioned rows only
         return _unknown(REASON_INVALID_WAVE_VERSION, installed_text)
-    if not versioned:
-        return _unknown(REASON_NO_ACTIVE_WAVE, installed_text)
-    target = max(version for version, _ in versioned)
-    winners = [row for version, row in versioned if version == target]
-    if len(winners) != 1:
-        return _unknown(REASON_AMBIGUOUS_ACTIVE_WAVE, installed_text)
-    wave = winners[0]
     goals = _project_goals(wave)
     if goals is None:
         return _unknown(REASON_MISSING_GOAL_DATA, installed_text)
@@ -396,3 +412,252 @@ def wave_completion_verdict(
             "task_ids": sorted(unfinished),
         }
     return {**base, "state": COMPLETION_COMPLETED, "reason": "all_mapped_goals_accepted"}
+
+
+# --- Wave authoring validation (NF-2026-00987) --------------------------------
+#
+# Pure checks behind the wave authoring tools; ``roadmap_store`` performs every
+# write. Each refusal is a stable token naming its cause. Nothing here can
+# complete a wave: completion stays ``wave_completion_verdict`` evidence only.
+
+GOAL_DEFINITION_KEYS = frozenset({"id", "label", "acceptance_indices"})
+
+
+def milestone_refusal(milestone: object) -> str:
+    """``""`` for a target version the projection can rank, else the refusal."""
+    return "" if _version(milestone) is not None else "milestone_invalid"
+
+
+def same_milestone(left: object, right: object) -> bool:
+    """True when both name the same ``X.Y.Z`` version (``v`` prefix ignored)."""
+    version = _version(left)
+    return version is not None and version == _version(right)
+
+
+def milestone_after(candidate: object, current: object) -> bool:
+    """True when ``candidate`` is a strictly later ``X.Y.Z`` version than ``current``."""
+    later, earlier = _version(candidate), _version(current)
+    return later is not None and earlier is not None and later > earlier
+
+
+def goal_id_refusal(goal_id: object) -> str:
+    from .roadmap_store import WAVE_GOAL_ID_RE
+
+    if (
+        not isinstance(goal_id, str)
+        or len(goal_id) > _MAX_GOAL_ID_CHARS
+        or not WAVE_GOAL_ID_RE.fullmatch(goal_id)
+    ):
+        return "goal_id_invalid"
+    return ""
+
+
+def goal_label_refusal(label: object) -> str:
+    if not isinstance(label, str) or not label.strip() or len(label.strip()) > _MAX_LABEL_CHARS:
+        return "goal_label_invalid"
+    return ""
+
+
+def acceptance_indices_refusal(indices: object, criteria: int) -> str:
+    """``""`` when ``indices`` is omitted (None) or valid 1-based criterion indices."""
+    if indices is None:
+        return ""
+    cleaned = _clean_indices(indices, criteria)
+    return f"acceptance_indices_invalid:{cleaned}" if isinstance(cleaned, str) else ""
+
+
+def _goal_record(goal: Mapping[str, Any], criteria: int) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(goal, Mapping) or not set(goal) <= GOAL_DEFINITION_KEYS:
+        return None, "goals_malformed"
+    indices = goal.get("acceptance_indices")
+    reason = (
+        goal_id_refusal(goal.get("id"))
+        or goal_label_refusal(goal.get("label"))
+        or acceptance_indices_refusal(indices, criteria)
+    )
+    if reason:
+        return None, reason
+    record: dict[str, Any] = {"id": goal["id"], "label": goal["label"].strip(), "task_ids": []}
+    if indices is not None:
+        record["acceptance_indices"] = sorted(indices)
+    return record, ""
+
+
+def goal_definitions(goals: object, criteria: int) -> tuple[list[dict[str, Any]], str]:
+    """Normalize new ``[{id, label, acceptance_indices?}]`` goals; each starts with no task."""
+    if goals is None:
+        return [], ""
+    if not isinstance(goals, (list, tuple)):
+        return [], "goals_malformed"
+    if len(goals) > MAX_GOALS:
+        return [], "goal_limit"
+    records: list[dict[str, Any]] = []
+    for goal in goals:
+        record, reason = _goal_record(goal, criteria)
+        if record is None:
+            return [], reason
+        records.append(record)
+    if len({record["id"] for record in records}) != len(records):
+        return [], "goal_duplicate"
+    return records, ""
+
+
+def _declared_goal_task_ids(goal: object) -> list[str] | None:
+    if not isinstance(goal, Mapping) or goal_id_refusal(goal.get("id")) or goal_label_refusal(
+        goal.get("label")
+    ):
+        return None
+    task_ids = goal.get("task_ids")
+    if (
+        not isinstance(task_ids, list)
+        or len(task_ids) > MAX_GOAL_TASKS
+        or not all(isinstance(task_id, str) and task_id for task_id in task_ids)
+        or len(set(task_ids)) != len(task_ids)
+    ):
+        return None
+    return list(task_ids)
+
+
+def declared_goals(wave: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    """The wave's stored goals when every one is well formed, else the refusal."""
+    provenance = wave.get("provenance")
+    declared = provenance.get("wave_goals") if isinstance(provenance, Mapping) else None
+    if not isinstance(declared, list) or len(declared) > MAX_GOALS:
+        return [], "goals_malformed"
+    if any(_declared_goal_task_ids(goal) is None for goal in declared):
+        return [], "goals_malformed"
+    if len({goal["id"] for goal in declared}) != len(declared):
+        return [], "goals_malformed"
+    return [dict(goal) for goal in declared], ""
+
+
+def goal_task_ids(wave: Mapping[str, Any]) -> list[str]:
+    """Every current task id of a well-formed wave's goals, in goal order."""
+    goals, _reason = declared_goals(wave)
+    return list(dict.fromkeys(task_id for goal in goals for task_id in goal["task_ids"]))
+
+
+def unaccepted_task_ids(task_ids: Sequence[str], evidence: Mapping[str, str]) -> list[str]:
+    """Tasks whose evidence is anything but ``accepted`` (missing counts as unaccepted)."""
+    return [task_id for task_id in task_ids if evidence.get(task_id) != TASK_ACCEPTED]
+
+
+def carried_goals(
+    predecessor: Mapping[str, Any],
+    evidence: Mapping[str, str],
+    acceptance: Sequence[str],
+) -> tuple[list[dict[str, Any]], str]:
+    """The predecessor's goals not yet proven by accepted tasks, with their task ids.
+
+    A goal is left behind only when it has tasks and every one is ``accepted``.
+    A carried goal keeps an acceptance index only where the same criterion text
+    appears in the successor's ``acceptance``; it is never mapped by position.
+    """
+    goals, reason = declared_goals(predecessor)
+    if reason:
+        return [], f"predecessor_{reason}"
+    old = predecessor.get("acceptance")
+    old_acceptance = list(old) if isinstance(old, (list, tuple)) else []
+    position: dict[str, int] = {}
+    for index, text in enumerate(acceptance, 1):
+        position.setdefault(text, index)
+    carried: list[dict[str, Any]] = []
+    for goal in goals:
+        task_ids = goal["task_ids"]
+        if task_ids and not unaccepted_task_ids(task_ids, evidence):
+            continue
+        record: dict[str, Any] = {
+            "id": goal["id"],
+            "label": goal["label"].strip(),
+            "task_ids": list(task_ids),
+            "carried_from": str(predecessor.get("id") or "")[:32],
+        }
+        indices = goal.get("acceptance_indices")
+        remapped = sorted(
+            {
+                position[old_acceptance[index - 1]]
+                for index in (indices if isinstance(indices, list) else [])
+                if isinstance(index, int)
+                and not isinstance(index, bool)
+                and 1 <= index <= len(old_acceptance)
+                and old_acceptance[index - 1] in position
+            }
+        )
+        if remapped:
+            record["acceptance_indices"] = remapped
+        carried.append(record)
+    return carried, ""
+
+
+def composed_goals(
+    carried: Sequence[Mapping[str, Any]], new: Sequence[Mapping[str, Any]]
+) -> tuple[list[dict[str, Any]], str]:
+    """Carried goals first, then new ones: unique ids, 1..MAX_GOALS goals."""
+    goals = [dict(goal) for goal in (*carried, *new)]
+    if not goals:
+        return [], "goals_missing"
+    if len(goals) > MAX_GOALS:
+        return [], "goal_limit"
+    if len({goal["id"] for goal in goals}) != len(goals):
+        return [], "goal_duplicate"
+    return goals, ""
+
+
+def upserted_goals(
+    wave: Mapping[str, Any],
+    goal_id: object,
+    label: object,
+    acceptance_indices: object,
+) -> tuple[list[dict[str, Any]], str, str]:
+    """``(goals, outcome, reason)``; outcome is created, updated or unchanged.
+
+    ``acceptance_indices=None`` keeps an existing goal's mapping; a new goal
+    starts with no task.
+    """
+    acceptance = wave.get("acceptance")
+    criteria = len(acceptance) if isinstance(acceptance, (list, tuple)) else 0
+    reason = (
+        goal_id_refusal(goal_id)
+        or goal_label_refusal(label)
+        or acceptance_indices_refusal(acceptance_indices, criteria)
+    )
+    if reason:
+        return [], "", reason
+    goals, reason = declared_goals(wave)
+    if reason:
+        return [], "", reason
+    clean_label = str(label).strip()
+    indices = sorted(acceptance_indices) if isinstance(acceptance_indices, (list, tuple)) else None
+    for goal in goals:
+        if goal["id"] != goal_id:
+            continue
+        updated = {**goal, "label": clean_label}
+        if indices is not None:
+            updated["acceptance_indices"] = indices
+        if updated == goal:
+            return goals, "unchanged", ""
+        return [updated if item is goal else item for item in goals], "updated", ""
+    if len(goals) >= MAX_GOALS:
+        return [], "", "goal_limit"
+    created: dict[str, Any] = {"id": goal_id, "label": clean_label, "task_ids": []}
+    if indices is not None:
+        created["acceptance_indices"] = indices
+    return [*goals, created], "created", ""
+
+
+def removed_goals(
+    wave: Mapping[str, Any], goal_id: object
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str]:
+    """``(remaining goals, removed goal, reason)``; a wave keeps at least one goal."""
+    reason = goal_id_refusal(goal_id)
+    if reason:
+        return [], None, reason
+    goals, reason = declared_goals(wave)
+    if reason:
+        return [], None, reason
+    matching = [goal for goal in goals if goal["id"] == goal_id]
+    if not matching:
+        return [], None, "goal_missing"
+    if len(goals) == 1:
+        return [], None, "wave_requires_one_goal"
+    return [goal for goal in goals if goal["id"] != goal_id], matching[0], ""

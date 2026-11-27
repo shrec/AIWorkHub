@@ -6,6 +6,10 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Added
+
+- Wave mini-roadmap authoring: manager-only, exact-name-callable tools `aiworkhub_roadmap_wave_open` (an `in_progress` wave per milestone; `supersedes` carries the predecessor's not-yet-accepted goals with their tasks and archives it with a `superseded_by` event), `aiworkhub_roadmap_wave_goal_upsert` / `aiworkhub_roadmap_wave_goal_remove` (guarded by `item_revision`; removing a goal with unaccepted tasks needs `force` plus a recorded reason), `aiworkhub_roadmap_wave_attach` (a goal's first task, or a NeedFix's converted task, in one transaction with one `wave_goal_task_attached` event), the read-only `aiworkhub_roadmap_wave_status` (current-wave projection plus completion verdict) and `aiworkhub_roadmap_wave_rollover` (wave_open superseding the current wave). Every write refuses with a typed reason and a retry is `already_applied`; completion stays evidence-only through `reconcile_wave_completion` (NF-2026-00987).
+
 ### Changed
 
 - Quality gate sparse fill: `SPARSE_TOOLCHAIN_INPUT_ROOTS` now includes `docs/assets`, so a sparse validation tree gets the tracked raster assets `vscode-extension/test/extension-static.test.js` asserts under the repository root and the extension-regression gate no longer fails "missing local raster asset" (NF-2026-00983).

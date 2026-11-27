@@ -597,6 +597,14 @@ MCP_TOOL_PROFILES: dict[str, Mapping[str, str]] = {
     "aiworkhub_roadmap_add": _MANAGER,
     "aiworkhub_roadmap_transition": _MANAGER,
     "aiworkhub_roadmap_link_task": _MANAGER,
+    # NF-2026-00987: wave authoring is manager-only and callable by exact name;
+    # MANAGER_LISTED_CEILING may only fall, so none of them joins tools/list.
+    "aiworkhub_roadmap_wave_open": _MANAGER_CALLABLE,
+    "aiworkhub_roadmap_wave_goal_upsert": _MANAGER_CALLABLE,
+    "aiworkhub_roadmap_wave_goal_remove": _MANAGER_CALLABLE,
+    "aiworkhub_roadmap_wave_attach": _MANAGER_CALLABLE,
+    "aiworkhub_roadmap_wave_status": _MANAGER_CALLABLE,
+    "aiworkhub_roadmap_wave_rollover": _MANAGER_CALLABLE,
     # NF-2026-00964: pre-rename names, served as MCP_TOOL_ALIASES rename aliases.
     "needfix_list": _MANAGER_CALLABLE,
     "needfix_show": _MANAGER_CALLABLE,

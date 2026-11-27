@@ -48,9 +48,10 @@ _RENAME_PROBES = ("aiworkhub_needfix_show", "needfix_show")
 # Measured on base 739a7c70, plus aiworkhub_manager_callback_lane_claim (NF-2026-01802), minus the five
 # retired manager Hub Mail tools and the three retired dashboard ones, plus the dashboard peers view,
 # plus aiworkhub_manager_recipe_run_status (NF-2026-01849), plus the manager needfix_transition, plus the
-# 20 pre-rename needfix_*/roadmap_* rename aliases (NF-2026-00964).
-_PRE_TABLE_ALL_COUNT = 251
-_PRE_TABLE_ALL_READ_ONLY_COUNT = 247
+# 20 pre-rename needfix_*/roadmap_* rename aliases (NF-2026-00964), plus the six manager-callable
+# aiworkhub_roadmap_wave_* authoring tools (NF-2026-00987).
+_PRE_TABLE_ALL_COUNT = 257
+_PRE_TABLE_ALL_READ_ONLY_COUNT = 253
 # NF-2026-02139: manager 130 -> 115, the 15 rows below moved to manager-callable. Then 118 -> 117:
 # aiworkhub_dashboard_snapshot and aiworkhub_dashboard_needfix_transition left, needfix_transition joined.
 # NF-2026-01979: 117 -> 118, aiworkhub_manager_skill_propose is listed (skill_mine tells clients to call it).
