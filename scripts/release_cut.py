@@ -51,18 +51,32 @@ The cut:
                   first parent to the working tree, plus the invariant tests
                   and every changed test file, when the recorded map records
                   every changed path as it is now or was at that tag, the
-                  release documents and the bump's rewrites excepted
-                  (_impact_targets); otherwise, or with --full-suite, a
-                  full_suite_required token in the CHANGELOG [VERSION] notes,
-                  no previous tag, or a selector that raises or answers
+                  release documents and the bump's rewrites excepted; a path
+                  the map does not record adds the test modules under tests/
+                  that name it, by a path literal, an import or a fixture
+                  module that loads it (referencing_tests, _impact_targets);
+                  otherwise, or with --full-suite, a full_suite_required
+                  token in the CHANGELOG [VERSION] notes, no previous tag, an
+                  unrecorded path no test names or a scan that cannot
+                  decide, or a selector that raises or answers
                   full_suite_required, the whole tests directory; only that
                   whole-suite run loads -p aiworkhub.test_impact_recorder,
                   which records the map the next cut narrows with, and the
                   narrowed run and every serial rerun never do. wsl_tests
-                  runs the same targets without the plugin; the JSON
-                  summary's test_selection names the lane, the base tag, the
-                  count and the fallback reason. CI on push still runs the
-                  full suite.
+                  runs the same targets without the plugin. A cut that fails
+                  after the bump records what each suite run proved in
+                  .scratch/release/VERSION/resume.json, but for a host run
+                  with --allow-dirty paths dirty; the rerun of VERSION
+                  resumes a suite whose entry matches its inputs (version,
+                  base tag, interpreter, per-test limit and, for WSL, the
+                  baseline): it runs the node ids that failed there plus the
+                  impact selection since the entry's commit, and any other
+                  suite, or a run asked for everything, runs the selection
+                  above, as does one whose recorded node is gone (its file
+                  missing, or pytest exiting 4), its entry dropped. The JSON
+                  summary's test_selection names the lane (resume when the
+                  host suite resumed), the base tag, the count and the
+                  reason. CI on push still runs the full suite.
   package         npm --prefix vscode-extension run package
   commit          git commit "release: VERSION" of exactly the release files
   wsl_tests       a git archive of HEAD written under .scratch/release/VERSION,
@@ -110,12 +124,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
+import hashlib
 import importlib.util
 import io
 import itertools
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -124,6 +140,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import ModuleType
@@ -269,6 +286,37 @@ FULL_SUITE_MARKER = "full_suite_required"
 # with selector_full_suite:map_missing. tests/test_release_cut.py asserts the module
 # documents this opt-in.
 TEST_IMPACT_RECORDER_PLUGIN = "aiworkhub.test_impact_recorder"
+# NF-2026-00976: a changed path the map does not record narrows by the test modules that
+# name it (referencing_tests) instead of forcing the whole suite. The scan reads every file
+# under tests/ and every conftest.py above it whole; a file or a tree over these bounds is
+# a scan that cannot decide, and so is a path followed through more files than the last.
+REFERENCE_SCAN_MAX_FILE_BYTES = 4 * 1024 * 1024
+REFERENCE_SCAN_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+REFERENCE_SCAN_MAX_FOLLOWED = 256
+# pytest loads a conftest.py, and Python a package's __init__.py, before any test module
+# under its directory, so one that names a path selects them all and is followed in turn;
+# one in a directory from the repository root down to tests/ is loaded for every test.
+CONFTEST = "conftest.py"
+LOADED_FIRST: tuple[str, ...] = (CONFTEST, "__init__.py")
+# NF-2026-00976: the rerun of a version after a failed cut resumes each suite from what
+# that cut recorded in .scratch/release/VERSION (_write_resume_record): the commit the run's
+# tree is described by and the node ids that failed, keyed by a digest of the run's
+# inputs. The 0.13.16 rerun after a one-line fix of one failed test ran the whole suite.
+RESUME_RECORD = "resume.json"
+RESUME_SCHEMA_ID = "aiworkhub.release_cut.resume.v1"
+MAX_RESUME_RECORD_BYTES = 1024 * 1024
+LANE_RESUME = "resume"
+COMMIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+# What pytest exits with when it cannot find a node id or a file it is given: a resumed
+# run exiting so names a recorded node that is gone, so its entry is dropped. Under
+# pytest-xdist (-n) the workers swallow that error and the run collects nothing, exit 5:
+# measured 2026-11-27, one missing node id among valid ones ran none of them.
+PYTEST_USAGE_ERROR = 4
+PYTEST_NO_TESTS_COLLECTED = 5
+STALE_NODE_EXITS: tuple[int, ...] = (PYTEST_USAGE_ERROR, PYTEST_NO_TESTS_COLLECTED)
+# How the cut reads HEAD's commit id: the release commit's (the commit step) and, for the
+# resume record entry of a cut that made none, HEAD's (ReleaseCut._head_commit).
+HEAD_COMMIT_ARGS: tuple[str, ...] = ("rev-parse", "--verify", "HEAD")
 
 PREFLIGHT_STEPS: tuple[str, ...] = (
     "version",
@@ -910,6 +958,180 @@ def load_wsl_baseline(path: Path) -> frozenset[str]:
     return frozenset(nodes)
 
 
+def referencing_tests(
+    root: Path,
+    paths: Sequence[str],
+    is_test_module: Callable[[str], bool],
+    *,
+    workers: int = 1,
+) -> tuple[dict[str, tuple[str, ...]], str]:
+    """NF-2026-00976: the test modules under tests/ that reference or load each of ``paths``.
+
+    The recorded map has no edges for these paths (one forced the 0.13.16 cut's whole
+    suite: host 23 min, WSL 26 min), so the text of tests/ stands in for them, every file
+    read whole and in path order (_test_tree_sources): a path literal ends in the file
+    name, and an import, a module spec or ``-m`` names a Python module's stem, a package's
+    directory for its ``__init__``/``__main__`` (_reference_needle), each matched as a
+    whole word. A test module naming a path is selected; a conftest.py or package
+    __init__.py naming it selects every test module under its directory, which loads it
+    first; and each of them, like any other Python file under tests/ (a helper or fixture
+    module) naming it, is followed in turn, so whatever names that file, its module or its
+    package is selected too.
+
+    Returns ``(tests, "")`` with each test's reasons, or ``({}, reason)``:
+    ``impact_map_unmapped:PATH`` for the first path no test module is selected through,
+    and ``impact_map_unmapped_undecided:PATH:WHY`` when the scan cannot tell which tests
+    load it: the tree holds a link or cannot be listed, a file cannot be read whole within
+    REFERENCE_SCAN_MAX_FILE_BYTES, they hold more than REFERENCE_SCAN_MAX_TOTAL_BYTES, a
+    conftest.py or __init__.py every test loads names the path or a file it is followed
+    to (``every_test_loads:FILE``), so does a file that is not Python
+    (``named_outside_python:FILE``), or a path is followed through more than
+    REFERENCE_SCAN_MAX_FOLLOWED files. Either answer is the caller's whole suite.
+    """
+
+    sources, unreadable = _test_tree_sources(root, workers)
+    if unreadable:
+        return {}, f"impact_map_unmapped_undecided:{paths[0] if paths else ''}:{unreadable}"
+    modules = [relative for relative in sources if is_test_module(relative)]
+    picked: dict[str, set[str]] = {}
+    for path in paths:
+        selected = False
+        pending, followed = [path], {path}
+        while pending:
+            target = pending.pop(0)
+            needle = _reference_needle(target)
+            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(needle)}(?![A-Za-z0-9_])")
+            for relative, text in sources.items():
+                # ``in`` first: far cheaper than the regex, which needs the needle anyway.
+                if relative == target or needle not in text or not pattern.search(text):
+                    continue
+                name = relative.rsplit("/", 1)[-1]
+                folder = relative[: -len(name)]
+                why = ""
+                if not name.endswith(".py"):
+                    # Data a test reads or a script it runs: no text says which test does.
+                    why = f"named_outside_python:{relative}"
+                elif name in LOADED_FIRST and f"{FULL_SUITE_TARGET}/".startswith(folder):
+                    why = f"every_test_loads:{relative}"
+                if why:
+                    return {}, f"impact_map_unmapped_undecided:{path}:{why}"
+                if name in LOADED_FIRST:
+                    under = [module for module in modules if module.startswith(folder)]
+                    for test in under:
+                        picked.setdefault(test, set()).add(f"{relative}:references:{target}")
+                    selected = selected or bool(under)
+                elif is_test_module(relative):
+                    picked.setdefault(relative, set()).add(f"references:{target}")
+                    selected = True
+                if relative not in followed:
+                    if len(followed) > REFERENCE_SCAN_MAX_FOLLOWED:
+                        why = f"followed_over_{REFERENCE_SCAN_MAX_FOLLOWED}_files"
+                        return {}, f"impact_map_unmapped_undecided:{path}:{why}"
+                    followed.add(relative)
+                    pending.append(relative)
+        if not selected:
+            return {}, f"impact_map_unmapped:{path}"
+    return {test: tuple(sorted(reasons)) for test, reasons in sorted(picked.items())}, ""
+
+
+def _test_tree_sources(root: Path, workers: int) -> tuple[dict[str, str], str]:
+    """Every file under tests/ and every conftest.py above it, by repository-relative path,
+    in path order.
+
+    pytest loads a conftest.py from the repository root down to tests/ for every test, and
+    a file that is not Python may be data a test reads or a script it runs, so the scan
+    reads each of them too (referencing_tests). Never into __pycache__ and never through a
+    link: pytest collects through one, so a linked tests/, a link under it or a linked
+    conftest.py above it is a tree the scan cannot decide on. A repository without tests/
+    has none. The reads are I/O bound, so they run on ``workers`` threads, and pool.map
+    keeps path order, so the result equals a sequential read. ``({}, why)`` when the tree
+    holds a link, cannot be listed, holds more than its bound, or a file cannot be read
+    whole within its bound.
+    """
+
+    top = root / FULL_SUITE_TARGET
+    found: list[tuple[str, Path]] = []
+    total = 0
+    try:
+        if _is_link(top):
+            return {}, f"tests_linked:{FULL_SUITE_TARGET}"
+        if not top.is_dir():
+            return {}, ""
+        parts = FULL_SUITE_TARGET.split("/")
+        for depth in range(len(parts)):
+            above = "/".join([*parts[:depth], CONFTEST])
+            if _is_link(root / above):
+                return {}, f"tests_linked:{above}"
+            if (root / above).is_file():
+                total += (root / above).stat().st_size
+                found.append((above, root / above))
+        pending = [(top, FULL_SUITE_TARGET)]
+        while pending:
+            directory, relative = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    child = f"{relative}/{entry.name}"
+                    if _is_link(entry):
+                        return {}, f"tests_linked:{child}"
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name != "__pycache__":
+                            pending.append((Path(entry.path), child))
+                    elif entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                        found.append((child, Path(entry.path)))
+    except OSError as exc:
+        return {}, f"tests_unlistable:{type(exc).__name__}"
+    if total > REFERENCE_SCAN_MAX_TOTAL_BYTES:
+        return {}, f"tests_over_{REFERENCE_SCAN_MAX_TOTAL_BYTES}_bytes"
+
+    def read(item: tuple[str, Path]) -> tuple[str | None, str]:
+        relative, path = item
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(REFERENCE_SCAN_MAX_FILE_BYTES + 1)
+        except OSError as exc:
+            return None, f"unreadable:{relative}:{type(exc).__name__}"
+        if len(data) > REFERENCE_SCAN_MAX_FILE_BYTES:
+            return None, f"over_{REFERENCE_SCAN_MAX_FILE_BYTES}_bytes:{relative}"
+        return data.decode("utf-8", "replace"), ""
+
+    found.sort()
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(found) or 1))) as pool:
+        texts = list(pool.map(read, found))
+    sources: dict[str, str] = {}
+    for (relative, _path), (text, why) in zip(found, texts):
+        if text is None:
+            return {}, why
+        sources[relative] = text
+    return sources, ""
+
+
+def _reference_needle(path: str) -> str:
+    """The word that names ``path``: its file name, which every path literal ends in, or a
+    Python module's stem, which an import, a module spec and ``-m`` name too and the file
+    name holds; a package's ``__init__``/``__main__`` is named by its directory."""
+
+    parts = path.split("/")
+    name = parts[-1]
+    if not name.endswith(".py"):
+        return name
+    stem = name[: -len(".py")]
+    return parts[-2] if stem in ("__init__", "__main__") and len(parts) > 1 else stem
+
+
+def _resume_digest(inputs: Mapping[str, Any]) -> str:
+    """The key of one resume record entry: the sha256 of its inputs as canonical JSON."""
+
+    text = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_commit_id(value: object) -> bool:
+    """A full SHA-1 or SHA-256 object id, the one form a resume record's commit takes."""
+
+    return isinstance(value, str) and COMMIT_ID.fullmatch(value) is not None
+
+
 def dirty_paths(porcelain: str) -> list[str]:
     """Every path ``git status --porcelain=v1 -z`` names; a rename or copy names both."""
 
@@ -996,10 +1218,17 @@ def _why(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
 
 
+def _is_link(item: Path | os.DirEntry[str]) -> bool:
+    """``item`` is a symlink, or a junction where this Python tells one apart: Path and
+    os.DirEntry have is_junction from Python 3.12 only, so an older one sees none."""
+
+    return item.is_symlink() or bool(getattr(item, "is_junction", lambda: False)())
+
+
 def _is_real_directory(path: Path) -> bool:
     """``path`` is a directory itself, not a symlink or a junction to one."""
 
-    return path.is_dir() and not path.is_symlink() and not path.is_junction()
+    return path.is_dir() and not _is_link(path)
 
 
 def _clear_read_only(name: str, top: str) -> None:
@@ -1185,15 +1414,31 @@ class ReleaseCut:
         # recovery line truncates back to; None until that step starts.
         self.ledger_bytes_before_receipt: int | None = None
         self.results: list[StepResult] = []
-        # What the host and the WSL suite both run, and the lane that decided it; the
-        # host_tests step decides once (_decide_test_lane), and until then it is everything.
+        # What the host and the WSL suite run, and the lane that decided it; the host_tests
+        # step decides once (_decide_test_lane), and until then each is everything. The two
+        # differ only when one suite resumes from the resume record (NF-2026-00976).
         self.test_targets: tuple[str, ...] = (FULL_SUITE_TARGET,)
+        self.wsl_test_targets: tuple[str, ...] = (FULL_SUITE_TARGET,)
         self.test_selection: dict[str, object] = {
             "lane": None,
             "base_tag": None,
             "selected_count": None,
             "fallback_reason": "host_tests_not_run",
         }
+        # The release tag the lane started from; each suite resumed from the resume record,
+        # with the record's commit and failed node ids; and what each suite run proved, its
+        # commit (a resumed run's) and failed node ids, which a failed cut records.
+        self.base_tag: str | None = None
+        self.resumed: dict[str, tuple[str, tuple[str, ...]]] = {}
+        self.verdicts: dict[str, tuple[str | None, tuple[str, ...]]] = {}
+        # The lane and targets a suite runs unless it resumes, and the reason string's notes
+        # by origin (_note_test_selection); each suite whose entry proved stale
+        # (_drop_resume_entry); and the --allow-dirty paths the worktree step found dirty.
+        self.normal_lane = LANE_FULL_SUITE
+        self.normal_test_targets: tuple[str, ...] = (FULL_SUITE_TARGET,)
+        self.lane_notes: dict[str, str] = {}
+        self.dropped: set[str] = set()
+        self.dirty_allowed: tuple[str, ...] = ()
         # NF-2026-02429: earlier versions' host basetemps, removed on a daemon thread the
         # cut starts with its first cut step (_run_steps) and joins before it reports.
         self.basetemp_prune = BasetempPrune(self.root, self.version, rmtree=host.rmtree)
@@ -1254,6 +1499,11 @@ class ReleaseCut:
         # Before the recovery line, which stays the one just above the summary.
         self.pruned_basetemps = self._join_basetemp_prune()
         recovery = self._recovery(failed)
+        if recovery is not None and self.verdicts:
+            # NF-2026-00976: what the suites proved, which a rerun of this version resumes from.
+            noted = self._write_resume_record()
+            if noted:
+                recovery = f"{recovery}; {noted}"
         if recovery is not None:
             self.host.out(f"recovery: {recovery}")
         self.host.out(json.dumps(self._summary(failed, recovery), sort_keys=True))
@@ -1495,7 +1745,7 @@ class ReleaseCut:
             "-n",
             "0" if nodes else _xdist_flag(self.workers),
             f"{BASETEMP_OPTION}{self.wsl_basetemp}",
-            *(nodes or self.test_targets),
+            *(nodes or self.wsl_test_targets),
         ]
 
     @staticmethod
@@ -1542,9 +1792,12 @@ class ReleaseCut:
             "metadata_check": f"release_metadata.check --tag {self.tag}",
             "host_tests": f"{shlex.join(self._host_test_argv())}; {FULL_SUITE_TARGET} narrows to "
             "the test-impact selection since the last v* tag, the same for wsl_tests, when the "
-            "map vouches for every changed path and neither --full-suite nor the CHANGELOG "
+            "map vouches for every changed path, the tests naming a path it does not record "
+            "standing in for it, and neither --full-suite nor the CHANGELOG "
             f"notes' {FULL_SUITE_MARKER} asks for everything; only a whole-suite run loads "
-            f"-p {TEST_IMPACT_RECORDER_PLUGIN}, which records the map the next cut narrows with",
+            f"-p {TEST_IMPACT_RECORDER_PLUGIN}, which records the map the next cut narrows with; "
+            "a rerun after a failed cut resumes each suite whose entry in "
+            f"{scratch}/{RESUME_RECORD} matches its inputs",
             "package": shlex.join(self._package_argv()),
             "commit": shlex.join(["git", *self._commit_args()]),
             "wsl_tests": f"git archive HEAD to {scratch}/head.tar, read at its wslpath -a path "
@@ -1610,6 +1863,8 @@ class ReleaseCut:
             raise StepFailed(
                 f"dirty outside the release documents and --allow-dirty: {_listing(stray)}"
             )
+        # NF-2026-00976: the host suite runs on these too, and no commit holds them.
+        self.dirty_allowed = tuple(path for path in dirty if path not in documents)
         return f"{len(dirty)} dirty path(s), each a release document or under --allow-dirty"
 
     def _step_branch(self) -> str:
@@ -1672,12 +1927,21 @@ class ReleaseCut:
         return f"projections, tag and release documents all name {self.version}"
 
     def _decide_test_lane(self) -> None:
-        """Set the one target list the host and the WSL suite both run, and record why.
+        """Set the target lists of the host and the WSL suite, and record why.
 
         The test-impact selection since the last release tag (``impact_map``) when the
         map vouches for every path changed since that tag (``_impact_targets``); otherwise
         the whole ``tests`` directory (``full_suite``) with the named reason. An unknown never
-        selects less: every miss, raise or full-suite answer falls back.
+        selects less: every miss, raise or full-suite answer falls back. Both suites run
+        that selection unless one resumes (NF-2026-00976, ``_resume``): in a rerun of this
+        version after a failed cut, a suite whose record entry matches this cut's inputs
+        runs the node ids that failed there plus the impact selection since the entry's
+        commit, and test_selection names the ``resume`` lane when the host suite does.
+        --full-suite, the notes' marker and unreadable notes never resume; a suite whose
+        resumed run pytest exits PYTEST_USAGE_ERROR for runs the normal selection instead
+        (_abandon_resume). The reason string names a widened or resumed selection, a
+        dropped entry and an unusable record as well as a fallback; it is None only for
+        the plain impact selection.
         """
 
         targets: tuple[str, ...] = ()
@@ -1686,33 +1950,290 @@ class ReleaseCut:
             reason = "full_suite_flag"
         else:
             reason = self._metadata_full_suite_reason()
+        # Asked for everything, or notes that cannot be read: no record narrows that run.
+        resumable = not reason
         if not reason:
             base = self._last_release_tag()
             if base is None:
                 reason = "no_previous_tag"
             else:
-                try:
-                    targets, reason = self._impact_targets(base)
-                except Exception as exc:  # a failed selector never narrows the run
-                    targets, reason = (), f"selector_failed:{type(exc).__name__}"
+                targets, reason = self._guarded_impact_targets(base)
                 if not targets and not reason:
                     reason = "impact_map_selected_nothing"
-        if targets:
-            self.test_targets = targets
-            self.test_selection = {
-                "lane": LANE_IMPACT_MAP,
-                "base_tag": base,
-                "selected_count": len(targets),
-                "fallback_reason": None,
-            }
-            return
-        self.test_targets = (FULL_SUITE_TARGET,)
+        self.base_tag = base
+        self.normal_lane = LANE_IMPACT_MAP if targets else LANE_FULL_SUITE
+        self.normal_test_targets = targets or (FULL_SUITE_TARGET,)
+        self.lane_notes = {"normal": reason}
+        host: tuple[str, ...] = ()
+        wsl: tuple[str, ...] = ()
+        if resumable:
+            records, unusable = self._read_resume_records()
+            host, note = self._resume("host_tests", records, unusable)
+            self.lane_notes["host_tests"] = note
+            if not self.options.skip_wsl:
+                wsl, note = self._resume("wsl_tests", records, unusable)
+                self.lane_notes["wsl_tests"] = note
+        self.test_targets = host or self.normal_test_targets
+        self.wsl_test_targets = wsl or self.normal_test_targets
+        self._note_test_selection()
+
+    def _note_test_selection(self) -> None:
+        """test_selection as the suites run now, again once a resumed run proves its entry
+        stale (_abandon_resume): resume while the host suite resumes, else the normal lane;
+        the host count; each note in order, the normal selection's first."""
+
+        lane = LANE_RESUME if "host_tests" in self.resumed else self.normal_lane
+        why = ";".join(note for note in self.lane_notes.values() if note)
         self.test_selection = {
-            "lane": LANE_FULL_SUITE,
-            "base_tag": base,
-            "selected_count": None,
-            "fallback_reason": _one_line(reason),
+            "lane": lane,
+            "base_tag": self.base_tag,
+            "selected_count": None if lane == LANE_FULL_SUITE else len(self.test_targets),
+            "fallback_reason": _one_line(why) if why else None,
         }
+
+    def _guarded_impact_targets(self, base: str) -> tuple[tuple[str, ...], str]:
+        """``_impact_targets(base)``, with a raise as its named reason."""
+
+        try:
+            return self._impact_targets(base)
+        except Exception as exc:  # a failed selector never narrows the run
+            return (), f"selector_failed:{type(exc).__name__}"
+
+    def _resume(
+        self, step: str, records: Mapping[str, Any], unusable: str
+    ) -> tuple[tuple[str, ...], str]:
+        """What ``step`` resumes with from the resume record, and the reason string's note.
+
+        ``((), "")`` without an entry for the step: the first cut of a version has none.
+        With one whose inputs digest equals this cut's (``_resume_inputs``): the node ids
+        that failed in the recorded run plus the impact selection since the entry's commit
+        (``_impact_targets``), which vouches for every path changed since that commit as it
+        does for those changed since a tag, so a map that does not describe that commit's
+        tree, a selector that cannot answer or an unrunnable node falls back. An entry naming
+        a failed node whose file is gone is stale: it leaves the record (_drop_resume_entry)
+        and is ``((), "STEP_resume_dropped:failed_node_missing:FILE")``. Any other
+        entry is ``((), "STEP_resume_skipped:WHY")``, and the step runs the normal selection.
+        """
+
+        def skipped(why: str) -> tuple[tuple[str, ...], str]:
+            return (), f"{step}_resume_skipped:{why}"
+
+        if unusable:
+            return skipped(unusable)
+        entry = records.get(step)
+        if entry is None:
+            return (), ""
+        inputs = entry.get("inputs") if isinstance(entry, Mapping) else None
+        since = inputs.get("since") if isinstance(inputs, Mapping) else None
+        failed = inputs.get("failed") if isinstance(inputs, Mapping) else None
+        if not isinstance(failed, list) or not all(isinstance(node, str) for node in failed):
+            return skipped("record_invalid")
+        if not _is_commit_id(since):
+            return skipped("no_commit_recorded")
+        if failed and not _rerunnable(failed):
+            return skipped("failed_nodes_not_rerunnable")
+        if entry.get("inputs_digest") != _resume_digest(self._resume_inputs(step, since, failed)):
+            return skipped("inputs_digest_mismatch")
+        # _rerunnable held each node's file to a path under tests/, so it joins the root.
+        files = sorted({node.partition("::")[0] for node in failed})
+        missing = next((file for file in files if not (self.root / file).is_file()), None)
+        if missing is not None:
+            return (), self._drop_resume_entry(step, f"failed_node_missing:{missing}")
+        targets, reason = self._guarded_impact_targets(since)
+        if not targets:
+            return skipped(reason or "impact_map_selected_nothing")
+        neighbours, _ = _impact_modules()
+        tests, problem = neighbours._impact_tests(
+            self.root, dict.fromkeys((*targets, *failed), ()), ()
+        )
+        if problem or not tests:
+            return skipped(problem or "impact_map_selected_nothing")
+        self.resumed[step] = (since, tuple(failed))
+        note = f"{step}_resumed:since:{since[:12]}:failed:{len(failed)}"
+        return tests, f"{note};{reason}" if reason else note
+
+    def _read_resume_records(self) -> tuple[dict[str, Any], str]:
+        """The resume record's entries by step, or ``({}, why)`` when it cannot be used.
+
+        No record is no entry rather than a reason: the first cut of a version has none.
+        """
+
+        path = self.scratch / RESUME_RECORD
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(MAX_RESUME_RECORD_BYTES + 1)
+        except FileNotFoundError:
+            return {}, ""
+        except OSError as exc:
+            return {}, f"record_unreadable:{type(exc).__name__}"
+        if len(raw) > MAX_RESUME_RECORD_BYTES:
+            return {}, f"record_over_{MAX_RESUME_RECORD_BYTES}_bytes"
+        try:
+            payload = json.loads(raw)
+        except (ValueError, RecursionError):  # RecursionError: nested past json's depth
+            return {}, "record_unreadable:invalid_json"
+        steps = payload.get("steps") if isinstance(payload, dict) else None
+        if not isinstance(steps, dict) or payload.get("schema_id") != RESUME_SCHEMA_ID:
+            return {}, "record_schema_mismatch"
+        return steps, ""
+
+    def _resume_inputs(
+        self, step: str, since: str | None, failed: Sequence[str]
+    ) -> dict[str, Any]:
+        """What one suite run's verdicts hold for, which keys its resume record entry.
+
+        The version, the release tag the selection started from, the interpreter and the
+        per-test limit, for the WSL suite also the baseline its verdict excuses failures
+        by, and the entry's own commit and failed node ids, so an edited entry matches no
+        cut either.
+        """
+
+        wsl = step == "wsl_tests"
+        inputs: dict[str, Any] = {
+            "step": step,
+            "version": self.version,
+            "base_tag": self.base_tag,
+            "python": self.options.wsl_python if wsl else self.host.python,
+            "timeout": PYTEST_TIMEOUT_SECONDS,
+            "since": since,
+            "failed": sorted(failed),
+        }
+        if wsl:
+            known = "\n".join(sorted(self.baseline)).encode("utf-8")
+            inputs["baseline"] = hashlib.sha256(known).hexdigest()
+        return inputs
+
+    def _verdict(self, step: str, nodes: Sequence[str]) -> None:
+        """Note what one whole suite run proved: every target passed but ``nodes``.
+
+        A resumed run ran only the failed nodes and what changed since its record's commit,
+        so it keeps that commit and adds the nodes that failed there (_write_resume_record).
+        """
+
+        since, earlier = self.resumed.get(step, (None, ()))
+        self.verdicts[step] = (since, tuple(sorted({*earlier, *nodes})))
+
+    def _write_resume_record(self) -> str:
+        """Record each suite run's verdict for a rerun of this version; what the recovery
+        line adds, ``""`` once every verdict is written.
+
+        Called for a cut that failed after the bump. An entry names the commit whose tree
+        its run is described by: a resumed run keeps its record's, any other names the
+        release commit once the commit step made one, else HEAD (_head_commit), which is
+        that run's tree but for the release files, all in the next selection's diff anyway.
+        A host run with --allow-dirty paths dirty tested a tree no commit holds, so it gets
+        no entry and its earlier one goes too: the rerun runs the normal selection. An entry
+        git names no commit for is still written, and the rerun's reason names it; a suite
+        this cut did not run to a verdict keeps its entry unless it was dropped as stale
+        (_drop_resume_entry). A record that cannot be written takes the one there with it
+        (_store_resume_entries), and the recovery line says which happened.
+        """
+
+        records, unusable = self._read_resume_records()
+        entries = {} if unusable else dict(records)
+        for step in self.dropped:
+            entries.pop(step, None)
+        notes: list[str] = []
+        head = self.release_commit if _is_commit_id(self.release_commit) else None
+        asked = head is not None
+        for step, (since, failed) in sorted(self.verdicts.items()):
+            if step == "host_tests" and self.dirty_allowed:
+                entries.pop(step, None)
+                notes.append(
+                    f"the host suite ran with {len(self.dirty_allowed)} --allow-dirty path(s) "
+                    "dirty, so a rerun runs its normal selection"
+                )
+                continue
+            if since is None:
+                if not asked:
+                    head, asked = self._head_commit(), True
+                since = head
+            inputs = self._resume_inputs(step, since, failed)
+            entries[step] = {"inputs": inputs, "inputs_digest": _resume_digest(inputs)}
+        unwritten, kept = self._store_resume_entries(entries)
+        record = self._relative(self.scratch / RESUME_RECORD)
+        if kept:
+            notes.append(
+                f"the resume record {record} was not written ({unwritten}) and the one there "
+                f"could not be removed ({kept}): delete it before a rerun"
+            )
+        elif unwritten:
+            notes.append(
+                f"the resume record {record} was not written ({unwritten}), so a rerun runs "
+                "the normal selection"
+            )
+        return "; ".join(notes)
+
+    def _head_commit(self) -> str | None:
+        """HEAD's commit id through Host.runner, read as the commit step reads its own.
+
+        None when git names none: a root without a .git of its own is no repository (git
+        would answer for an enclosing one), git fails or prints no commit id, or the runner
+        raises instead of answering.
+        """
+
+        if not (self.root / ".git").exists():
+            return None
+        try:
+            done = self._git(*HEAD_COMMIT_ARGS)
+        except (OSError, subprocess.SubprocessError):  # run_subprocess answers these itself
+            return None
+        text = done.stdout.strip() if done.returncode == 0 else ""
+        return text if _is_commit_id(text) else None
+
+    def _store_resume_entries(self, entries: Mapping[str, Any]) -> tuple[str, str]:
+        """Write the resume record with ``entries``, atomically; ``("", "")`` once written.
+
+        Else why not, and the record there goes too, best effort, so no rerun resumes from
+        what it held: ``(why, "")`` once it is gone, ``(why, why_kept)`` while it stays.
+        """
+
+        path = self.scratch / RESUME_RECORD
+        partial = path.with_name(f"{RESUME_RECORD}.partial")
+        try:
+            self.scratch.mkdir(parents=True, exist_ok=True)
+            payload = {"schema_id": RESUME_SCHEMA_ID, "steps": dict(entries)}
+            text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+            partial.write_text(text, encoding="utf-8", newline="")
+            os.replace(partial, path)
+        except (OSError, RecursionError) as exc:  # RecursionError: a kept entry nested too deep
+            with contextlib.suppress(OSError):
+                partial.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as stays:
+                return _why(exc), _why(stays)
+            return _why(exc), ""
+        return "", ""
+
+    def _drop_resume_entry(self, step: str, why: str) -> str:
+        """Drop ``step``'s stale entry from the resume record; the reason string's note.
+
+        A recorded failed node whose file is gone (_resume) or that pytest cannot find
+        (_abandon_resume) makes the entry stale, so it leaves the record now and every
+        record this cut writes later (_write_resume_record): no rerun resumes from it.
+        """
+
+        self.dropped.add(step)
+        note = f"{step}_resume_dropped:{why}"
+        records, unusable = self._read_resume_records()
+        if unusable or step not in records:
+            return note
+        _, kept = self._store_resume_entries(
+            {name: entry for name, entry in records.items() if name != step}
+        )
+        return f"{note}:record_kept:{kept}" if kept else note
+
+    def _abandon_resume(self, step: str, why: str) -> None:
+        """Run ``step``'s normal selection after pytest found a node of its entry gone."""
+
+        self.resumed.pop(step, None)
+        if step == "host_tests":
+            self.test_targets = self.normal_test_targets
+        else:
+            self.wsl_test_targets = self.normal_test_targets
+        self.lane_notes[step] = self._drop_resume_entry(step, why)
+        self._note_test_selection()
 
     def _metadata_full_suite_reason(self) -> str:
         """Why the release metadata requires the whole suite, else ``""``.
@@ -1782,9 +2303,15 @@ class ReleaseCut:
           or recorded as anything when the bump is its only change since ``base`` (HEAD
           holds ``base``'s bytes; the worktree step found it clean before the bump).
 
-        Returns ``(tests, "")``, or ``((), reason)`` when the map is missing, does not
-        record or records stale any other changed path, or records an unchanged non-test
-        path stale. The selection always adds every
+        A changed path the map does not record otherwise has no edges, so the test modules
+        that name it stand in for them (NF-2026-00976, ``referencing_tests``).
+
+        Returns ``(tests, "")``, ``(tests, "impact_map_unmapped_referenced:PATH:COUNT")``
+        when such paths widened the selection by COUNT test files, or ``((), reason)`` when
+        the map is missing, a changed path no test names or the scan cannot decide, the map
+        records stale another changed path, or it records an unchanged non-test path stale.
+        Every ``_impact_targets`` base works alike: a release tag, or the commit a resume
+        record names (``_resume``). The selection always adds every
         ``accept_neighbour_tests.INVARIANT_TESTS`` file (the module size ratchet among
         them) and every changed test file; argv folding and the per-entry checks are
         that module's ``_impact_tests``.
@@ -1823,8 +2350,16 @@ class ReleaseCut:
         unmapped = [
             path for path, state in states.items() if state == "unmapped" and path not in generated
         ]
+        # NF-2026-00976: the map has no edges for an unmapped path, so the test modules that
+        # name it stand in for them; a path no test names, or a tests/ tree the scan cannot
+        # read whole, still runs the whole suite.
+        referencing: dict[str, tuple[str, ...]] = {}
         if unmapped:
-            return (), f"impact_map_unmapped:{unmapped[0]}"
+            referencing, unknown = referencing_tests(
+                self.root, unmapped, impact.is_test_module, workers=self.workers
+            )
+            if unknown:
+                return (), unknown
         stale = [path for path, state in states.items() if state not in ("", "unmapped")]
         at_base.update(self._blob_digests(impact, base, stale))
         # at_head holds generated files only: no other path is accepted on a HEAD match.
@@ -1841,12 +2376,19 @@ class ReleaseCut:
             ):
                 return (), f"impact_map_stale_dependency:{path}"
         entries: dict[str, tuple[str, ...]] = dict(result.selected)
+        for test, reasons in referencing.items():
+            entries.setdefault(test, reasons)
         for test in neighbours.INVARIANT_TESTS:
             entries.setdefault(test, ("invariant",))
         for path in changed:
             if impact.is_test_module(path) and (self.root / path).is_file():
                 entries.setdefault(path, ("changed_test",))
-        return neighbours._impact_tests(self.root, entries, ())
+        tests, problem = neighbours._impact_tests(self.root, entries, ())
+        if problem or not unmapped:
+            return tests, problem
+        # Narrowed, but not by the map alone: the reason string names the widening.
+        more = f"+{len(unmapped) - 1}" if len(unmapped) > 1 else ""
+        return tests, f"impact_map_unmapped_referenced:{unmapped[0]}{more}:{len(referencing)}"
 
     def _blob_digests(self, impact: ModuleType, rev: str, paths: Sequence[str]) -> dict[str, str]:
         """The map's digest of each path's blob at ``rev``; a path without a blob has none."""
@@ -1863,10 +2405,16 @@ class ReleaseCut:
         self.scratch.mkdir(parents=True, exist_ok=True)
         self._decide_test_lane()
         done = self._run(self._host_test_argv())
+        if done.returncode in STALE_NODE_EXITS and "host_tests" in self.resumed:
+            # NF-2026-00976: pytest found no recorded node, so the entry is stale.
+            self._write_log("host_tests_resumed", done)
+            self._abandon_resume("host_tests", f"pytest_exit_{done.returncode}")
+            done = self._run(self._host_test_argv())
         log = self._write_log("host_tests", done)
         cores = max(1, int(self.host.cpu_count or 1))
         detail = f"{_last_line(done.output)} with {self.workers} worker(s) on {cores} core(s)"
         if done.returncode == 0:
+            self._verdict("host_tests", ())
             return detail
         # Exit 1 names failed tests; any other exit is no verdict about a node. One
         # serial rerun of those nodes tells full-load time bounds from a real failure.
@@ -1875,6 +2423,7 @@ class ReleaseCut:
             raise StepFailed(
                 f"pytest exited {done.returncode}: {_last_line(done.output)} (log {log})"
             )
+        self._verdict("host_tests", nodes)
         redone = self._run(self._host_test_argv(nodes))
         rerun_log = self._write_log("host_tests_rerun", redone)
         if redone.returncode != 0:
@@ -1900,7 +2449,7 @@ class ReleaseCut:
         self._require(self._git(*self._commit_args()), "git commit")
         # Named before its sha is read, so a failure from here on still reports it.
         self.release_commit = f"'release: {self.version}'"
-        head = self._require(self._git("rev-parse", "--verify", "HEAD"), "git rev-parse HEAD")
+        head = self._require(self._git(*HEAD_COMMIT_ARGS), "git rev-parse HEAD")
         self.release_commit = head.stdout.strip()
         return (
             f"{self.release_commit} 'release: {self.version}' of "
@@ -1966,6 +2515,11 @@ class ReleaseCut:
             )
             self._commit_wsl_tree(tree)
             done = self._wsl_in(tree, self._wsl_test_command())
+            if done.returncode in STALE_NODE_EXITS and "wsl_tests" in self.resumed:
+                # NF-2026-00976: pytest found no recorded node, so the entry is stale.
+                self._write_log("wsl_tests_resumed", done)
+                self._abandon_resume("wsl_tests", f"pytest_exit_{done.returncode}")
+                done = self._wsl_in(tree, self._wsl_test_command())
             return self._wsl_verdict(done, self._write_log("wsl_tests", done), tree)
         finally:
             # WSL removes the tree, the archive and pytest's basetemp, pass or fail.
@@ -1994,6 +2548,7 @@ class ReleaseCut:
     def _wsl_verdict(self, done: Completed, log: str, tree: PurePosixPath) -> str:
         summary = _last_line(done.output)
         if done.returncode == 0:
+            self._verdict("wsl_tests", ())
             return f"WSL suite passed: {summary}"
         if done.returncode != 1:
             raise StepFailed(f"WSL pytest exited {done.returncode}: {summary} (log {log})")
@@ -2005,6 +2560,8 @@ class ReleaseCut:
             stopped = f"{len(new)} WSL failure(s) not in the baseline: {_listing(new)}"
             if not _rerunnable(new):
                 raise StepFailed(f"{stopped} (log {log})")
+            # Every other target passed or failed in the baseline, which the verdict excuses.
+            self._verdict("wsl_tests", new)
             redone = self._wsl_in(tree, self._wsl_test_command(new))
             rerun_log = self._write_log("wsl_tests_rerun", redone)
             if redone.returncode != 0:
@@ -2013,6 +2570,7 @@ class ReleaseCut:
                 f"{len(new)} WSL failure(s) passed alone: {', '.join(new)}; "
                 f"{len(failing) - len(new)} failure(s) in the baseline: {summary}"
             )
+        self._verdict("wsl_tests", ())
         return f"{len(failing)} WSL failure(s), each in the baseline: {summary}"
 
     def _step_receipt(self) -> str:
