@@ -133,7 +133,7 @@ SOURCE_GRAPH_BUILD_RESULT_TMP_PREFIX = "..build-result."
 SOURCE_GRAPH_BUILD_RESULT_TMP_MAX_AGE_SECONDS = 3600.0
 SOURCE_GRAPH_EXTRACT_WORKERS_ENV = "AIWORKHUB_SOURCE_GRAPH_EXTRACT_WORKERS"
 DEFAULT_SOURCE_GRAPH_EXTRACT_WORKERS = 2
-MAX_SOURCE_GRAPH_EXTRACT_WORKERS = 8
+SOURCE_GRAPH_EXTRACT_RESERVE = 1
 MIN_PARALLEL_EXTRACTION_FILES = 8
 MIN_PARALLEL_EXTRACTION_BYTES = 256 * 1024
 SOURCE_GRAPH_HASH_WORKERS_ENV = "AIWORKHUB_SOURCE_GRAPH_HASH_WORKERS"
@@ -1662,6 +1662,22 @@ class BuildReport:
         }
 
 
+def _source_graph_extract_worker_ceiling() -> int:
+    """Return the extraction-width ceiling derived from observed CPU capacity.
+
+    The ceiling is owned by :func:`parallelism.compute_worker_count`: observed
+    process-visible capacity minus ``SOURCE_GRAPH_EXTRACT_RESERVE`` headroom,
+    never a hardcoded constant.  It is independent of nesting, so the env
+    override clamp stays stable inside an outer pool.
+    """
+
+    _, selection = parallelism.compute_worker_count(
+        candidate_count=1,
+        reserve=SOURCE_GRAPH_EXTRACT_RESERVE,
+    )
+    return max(1, int(selection.ceiling))
+
+
 def _source_graph_extract_workers(
     candidate_count: int, candidate_bytes: int = 0,
 ) -> int:
@@ -1671,7 +1687,8 @@ def _source_graph_extract_workers(
     cross-file resolution remain single-writer and deterministic.  A value of
     ``1`` is used for zero/one candidate so small incremental refreshes do not
     pay executor startup cost.  The environment override is intentionally
-    bounded and cannot create an unbounded process fan-out.
+    bounded by the core-derived ceiling and cannot create an unbounded process
+    fan-out.
     """
 
     configured = os.environ.get(SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "").strip()
@@ -1682,7 +1699,7 @@ def _source_graph_extract_workers(
             requested = 1
         return min(
             max(1, candidate_count),
-            max(1, min(requested, MAX_SOURCE_GRAPH_EXTRACT_WORKERS)),
+            max(1, min(requested, _source_graph_extract_worker_ceiling())),
         )
     if (
         candidate_count < MIN_PARALLEL_EXTRACTION_FILES
@@ -1691,8 +1708,7 @@ def _source_graph_extract_workers(
         return 1
     workers, _ = parallelism.compute_worker_count(
         candidate_count=candidate_count,
-        reserve=1,
-        ceiling=MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+        reserve=SOURCE_GRAPH_EXTRACT_RESERVE,
         min_candidates=MIN_PARALLEL_EXTRACTION_FILES,
     )
     return workers
@@ -1712,7 +1728,7 @@ def _source_graph_extraction_telemetry(
             available_cpus=capacity,
             selected_workers=workers,
             reserve=0,
-            ceiling=MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+            ceiling=_source_graph_extract_worker_ceiling(),
             nested=parallelism.pool_is_nested(),
             reason="env_override",
         ).to_dict()
@@ -1723,15 +1739,14 @@ def _source_graph_extraction_telemetry(
         return parallelism.WorkerSelection(
             available_cpus=capacity,
             selected_workers=workers,
-            reserve=1,
-            ceiling=MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+            reserve=SOURCE_GRAPH_EXTRACT_RESERVE,
+            ceiling=_source_graph_extract_worker_ceiling(),
             nested=parallelism.pool_is_nested(),
             reason="below_threshold",
         ).to_dict()
     _, selection = parallelism.compute_worker_count(
         candidate_count=candidate_count,
-        reserve=1,
-        ceiling=MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+        reserve=SOURCE_GRAPH_EXTRACT_RESERVE,
         min_candidates=MIN_PARALLEL_EXTRACTION_FILES,
     )
     return selection.to_dict()

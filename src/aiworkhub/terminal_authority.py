@@ -180,6 +180,13 @@ def load_or_create_key(
             # Another process won the create race. Re-open and validate the
             # exact file on the next bounded iteration; never recurse.
             continue
+        except PermissionError:
+            # Windows reports a file in its pending-delete window as
+            # PermissionError rather than FileExistsError; retry within the
+            # same bounded loop. POSIX permission failures stay fatal.
+            if is_windows(platform_name):
+                continue
+            raise
         chmod_fd(new_fd, 0o600)
         if is_windows(platform_name):
             # Harden the DACL before this key is ever readable as trusted, so

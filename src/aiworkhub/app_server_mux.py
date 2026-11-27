@@ -606,17 +606,23 @@ def default_sideband_dir() -> Path:
 def _chmod_dir_nofollow(path: Path, mode: int) -> None:
     """chmod a directory through an ``O_NOFOLLOW|O_DIRECTORY`` descriptor so a
     symlink swapped in at ``path`` can never redirect the mode change onto its
-    target. Best-effort: hosts without ``fchmod`` (Windows) simply no-op."""
+    target. Best-effort: where the directory cannot be opened as a descriptor
+    (Windows) the ``OSError`` is absorbed and the call returns; POSIX mode bits
+    do not apply there."""
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(str(path), flags)
+    # Best-effort directory operation: Windows cannot open a directory fd.
     try:
-        chmod_fd(fd, mode)
-    finally:
-        os.close(fd)
+        fd = os.open(str(path), flags)
+        try:
+            chmod_fd(fd, mode)
+        finally:
+            os.close(fd)
+    except OSError:
+        return
 
 
 def ensure_private_dir(path: Path) -> None:

@@ -392,7 +392,7 @@ def advance_record(
     repo_root: str | Path,
     record: SkillRecord,
     *,
-    expected_state_digest: str | None = None,
+    expected_state_digest: str | None,
     _connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """Persist a runtime-state advance of an already-stored ``(identity, version)``.
@@ -410,15 +410,21 @@ def advance_record(
     content ``digest`` all match the advanced record. Content immutability and
     the unique digest binding are therefore never touched.
 
-    ``expected_state_digest`` is an optional compare-and-swap precondition: when
-    supplied (via :func:`state_digest` of the record the caller loaded), the
-    advance is refused unless the stored row's runtime ``state_digest`` still
+    ``expected_state_digest`` is a REQUIRED compare-and-swap precondition (the
+    :func:`state_digest` of the record the caller loaded); ``None`` or an empty
+    token is refused, so no caller can skip the check. The advance is refused
+    unless the stored row's runtime ``state_digest`` still
     equals it. The content digest alone cannot catch this, because a runtime
     advance leaves it unchanged, so a stale read-modify-write would pass the
     content check and overwrite a newer advance. The token is the cross-process
     authority a per-server lock cannot provide. Any refusal raises a
     :class:`SkillStoreConflictError` and leaves the stored row exactly as it was.
     """
+    if not isinstance(expected_state_digest, str) or not expected_state_digest:
+        raise SkillStoreConflictError(
+            "advance_record requires a non-empty expected_state_digest "
+            "compare-and-swap token; refusing an unconditional advance"
+        )
     identity, version, digest, state_digest_value, payload_json = _serialize(record)
     conn = _connection or _connect(repo_root)
     try:
@@ -437,7 +443,7 @@ def advance_record(
                 f"content digest for {identity!r}@{version!r} does not match the stored "
                 "row; an advance may evolve only runtime state, never content"
             )
-        if expected_state_digest is not None and row["state_digest"] != expected_state_digest:
+        if row["state_digest"] != expected_state_digest:
             raise SkillStoreConflictError(
                 f"runtime state for {identity!r}@{version!r} changed under this advance; "
                 "the compare-and-swap precondition no longer holds and a stale advance "

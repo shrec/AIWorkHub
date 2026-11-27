@@ -325,7 +325,13 @@ def test_advance_record_persists_a_runtime_advance_in_place(tmp_path):
     advanced = active_record()
     assert sr.skill_digest(advanced) == sr.skill_digest(proposed)
 
-    result = store.advance_record(tmp_path, advanced)
+    result = store.advance_record(
+        tmp_path,
+        advanced,
+        expected_state_digest=store.state_digest(
+            store.get_record(tmp_path, proposed.identity, proposed.version)
+        ),
+    )
 
     assert result["digest"] == sr.skill_digest(proposed)
     loaded = store.get_record(tmp_path, proposed.identity, proposed.version)
@@ -337,33 +343,49 @@ def test_advance_record_persists_a_runtime_advance_in_place(tmp_path):
 
 
 def test_advance_record_rejects_a_mismatched_content_digest(tmp_path):
-    store.put_record(tmp_path, base_record())
+    stored = base_record()
+    store.put_record(tmp_path, stored)
+    token = store.state_digest(store.get_record(tmp_path, stored.identity, stored.version))
     # Same identity/version, but a changed content field, so the content digest
     # no longer matches the stored row and the advance is refused.
     with pytest.raises(store.SkillStoreConflictError):
-        store.advance_record(tmp_path, base_record(confidence=0.5))
+        store.advance_record(
+            tmp_path, base_record(confidence=0.5), expected_state_digest=token
+        )
 
 
 def test_advance_record_rejects_a_missing_row(tmp_path):
+    missing = active_record()
     with pytest.raises(store.SkillStoreConflictError):
-        store.advance_record(tmp_path, active_record())
+        store.advance_record(
+            tmp_path, missing, expected_state_digest=store.state_digest(missing)
+        )
 
 
 def test_advance_record_rejects_a_changed_version(tmp_path):
-    store.put_record(tmp_path, active_record(version="1.0.0"))
+    stored = active_record(version="1.0.0")
+    store.put_record(tmp_path, stored)
+    token = store.state_digest(store.get_record(tmp_path, stored.identity, stored.version))
     # A different version is a different immutable row that was never stored, so
     # there is nothing to advance -- it is refused rather than inserted.
     with pytest.raises(store.SkillStoreConflictError):
-        store.advance_record(tmp_path, active_record(version="2.0.0"))
+        store.advance_record(
+            tmp_path, active_record(version="2.0.0"), expected_state_digest=token
+        )
 
 
 def test_a_failed_advance_leaves_the_stored_row_exactly_as_it_was(tmp_path):
     proposed = base_record()
     store.put_record(tmp_path, proposed)
     before = _raw_row(tmp_path, proposed.identity, proposed.version)
+    token = store.state_digest(
+        store.get_record(tmp_path, proposed.identity, proposed.version)
+    )
 
     with pytest.raises(store.SkillStoreConflictError):
-        store.advance_record(tmp_path, base_record(confidence=0.5))
+        store.advance_record(
+            tmp_path, base_record(confidence=0.5), expected_state_digest=token
+        )
 
     after = _raw_row(tmp_path, proposed.identity, proposed.version)
     assert after == before

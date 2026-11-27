@@ -12,6 +12,8 @@ noted by package/extension version and release tag.
 
 ### Changed
 
+- Small fixes batch A: Windows pending-delete `PermissionError` on the terminal-authority key `O_EXCL` create now retries in the bounded loop; `_chmod_dir_nofollow` is a true Windows no-op; the Source Graph extraction ceiling derives from observed CPU capacity minus reserve instead of a hardcoded 8; `advance_record` requires a non-empty `expected_state_digest`; the repo-root ancestor symlink-swap test bootstraps its swap target (NF-2026-00022, NF-2026-00670, NF-2026-00562, NF-2026-00579, NF-2026-00020).
+
 - Quality gate sparse fill: `SPARSE_TOOLCHAIN_INPUT_ROOTS` now includes `docs/assets`, so a sparse validation tree gets the tracked raster assets `vscode-extension/test/extension-static.test.js` asserts under the repository root and the extension-regression gate no longer fails "missing local raster asset" (NF-2026-00983).
 
 - Shared POLICY: every rendered instruction projection (CLAUDE.md, AGENTS.md, `.github/copilot-instructions.md`, `docs/AIWORKHUB_TOOL_USE_POLICY.md` and the generated tool instructions) carries the "Incremental by default:" principle: a check, test run, scan or validation never re-verifies unchanged inputs, results are keyed by a content digest, a miss fails closed to the full check, and a rerun after a failure resumes from the failed items (NF-2026-00975).

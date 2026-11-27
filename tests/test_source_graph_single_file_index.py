@@ -1088,6 +1088,11 @@ def test_index_file_rejects_repo_root_ancestor_swap_to_symlink(
 
     outside_parent = tmp_path / "outside_parent"
     outside_repo = outside_parent / "repo"
+    outside_repo.mkdir(parents=True)
+    # Bootstrap the swap target too, so after the ancestor swap the root still
+    # resolves to a valid manifest and the assertion exercises the symlink
+    # refusal rather than a manifest-resolution error.
+    bootstrap_repository(outside_repo, repo_name="repo")
     _write(outside_repo / "victim.py", outside)
 
     original_hash = _sha256(original)

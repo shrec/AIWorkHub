@@ -2033,8 +2033,10 @@ def test_multicore_extraction_is_bounded_and_merge_order_is_deterministic(
 
 
 def test_multicore_extraction_worker_configuration_is_bounded(monkeypatch):
+    monkeypatch.setattr(sg.parallelism, "get_cpu_capacity", lambda: 12)
     monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "999999")
-    assert sg._source_graph_extract_workers(100) == sg.MAX_SOURCE_GRAPH_EXTRACT_WORKERS
+    assert sg._source_graph_extract_workers(100) == sg._source_graph_extract_worker_ceiling()
+    assert sg._source_graph_extract_worker_ceiling() == 12 - sg.SOURCE_GRAPH_EXTRACT_RESERVE
 
     monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "invalid")
     assert sg._source_graph_extract_workers(5) == 1
@@ -3490,10 +3492,12 @@ def test_rework_overlay_is_wired_into_production_source_graph_query(tmp_path):
 def test_extraction_worker_count_env_override_is_bounded_by_ceiling_and_candidates(
     monkeypatch,
 ):
+    monkeypatch.setattr(sg.parallelism, "get_cpu_capacity", lambda: 16)
     monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "999")
     assert (
         sg._source_graph_extract_workers(50, sg.MIN_PARALLEL_EXTRACTION_BYTES)
-        == sg.MAX_SOURCE_GRAPH_EXTRACT_WORKERS
+        == sg._source_graph_extract_worker_ceiling()
+        == 16 - sg.SOURCE_GRAPH_EXTRACT_RESERVE
     )
 
     monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "4")
