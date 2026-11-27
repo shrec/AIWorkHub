@@ -36,6 +36,7 @@ files. A locator whose payload has expired fails closed on retrieval with
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
@@ -144,6 +145,29 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+_PERSIST_CAUSE_CAP = 120
+
+
+def _persist_cause(exc: BaseException) -> str:
+    """``<ExceptionClass>[:<ERRNO_NAME>]`` -- the bounded OS cause of a failure.
+
+    Path-free by construction: the exception message (which embeds the spill
+    path) is deliberately not included, only the class and the symbolic errno
+    (``EACCES``, ``ENOSPC`` ...) or ``errno=<n>`` when no name is known. A
+    Windows ``winerror`` is appended the same way so a sharing violation is
+    distinguishable from an access denial.
+    """
+
+    parts = [type(exc).__name__]
+    code = getattr(exc, "errno", None)
+    if isinstance(code, int):
+        parts.append(errno.errorcode.get(code, f"errno={code}"))
+    winerror = getattr(exc, "winerror", None)
+    if isinstance(winerror, int):
+        parts.append(f"winerror={winerror}")
+    return ":".join(parts)[:_PERSIST_CAUSE_CAP]
+
+
 def spill_text(text: str, *, repo: Path | str) -> SpillReceipt:
     """Atomically persist ``text`` under repository-owned storage.
 
@@ -195,7 +219,12 @@ def spill_text(text: str, *, repo: Path | str) -> SpillReceipt:
     except OutputSpillError:
         raise
     except Exception as exc:  # noqa: BLE001 - one named fail-closed error
-        raise OutputSpillError(f"{_PERSIST_FAILED_PREFIX}:{digest}") from exc
+        # NF-2026-00944: keep the OS cause in the typed message so a caller
+        # (and the worker that sees only ``str(exc)``) can tell a read-only
+        # root from a full disk or a sharing violation.
+        raise OutputSpillError(
+            f"{_PERSIST_FAILED_PREFIX}:{digest}:{_persist_cause(exc)}"
+        ) from exc
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)

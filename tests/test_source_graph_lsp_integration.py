@@ -338,6 +338,50 @@ def _python_pair(fixture: _Lsp) -> None:
     fixture.serve()
 
 
+TS_JS_PREREQUISITE_SKIP_PREFIX = "lsp_ts_js_prerequisite_absent:"
+TS_JS_FIXTURE_FILES = (("app.ts", "typescript"), ("lone.js", "javascript"))
+
+
+def ts_js_enrichment_prerequisite_missing(fixture: _Lsp) -> str:
+    """Name the absent TS/JS *environment* prerequisite, or ``""``.
+
+    Only the server prerequisite -- a server group configured for both
+    languages -- is environmental and may skip. What the extractor indexed is
+    product output and is asserted by ``assert_ts_js_extractor_output``.
+    """
+
+    del fixture  # the server prerequisite is configuration, not index state
+    configured = set(sg._lsp_configured_languages())
+    for _rel, language in TS_JS_FIXTURE_FILES:
+        if language not in configured:
+            return f"server_group_not_configured:{language}"
+    return ""
+
+
+def assert_ts_js_extractor_output(fixture: _Lsp) -> None:
+    """With the server present, TS/JS indexing and the call edge MUST exist.
+
+    A file not indexed under its TS/JS language, or a missing unresolved
+    ``helper`` call edge, is an extractor regression: it fails, never skips.
+    """
+
+    conn = sg.connect(sg.resolve_db_path(fixture.root), read_only=True)
+    try:
+        indexed = {
+            str(row["file_path"]): str(row["language"])
+            for row in conn.execute("SELECT file_path, language FROM files")
+        }
+    finally:
+        conn.close()
+    for rel, language in TS_JS_FIXTURE_FILES:
+        assert indexed.get(rel) == language, (
+            f"extractor_language_unavailable:{rel}:{indexed.get(rel) or 'unindexed'}"
+        )
+        assert any(row["dst_name"] == "helper" for row in fixture.edges(rel)), (
+            f"extractor_call_edge_missing:{rel}:helper"
+        )
+
+
 def test_fake_child_imports_only_stdlib_and_preserves_real_handshake(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -523,7 +567,17 @@ def test_typescript_and_javascript_fixtures_are_enriched(tmp_path, monkeypatch):
     typescript = fixture.index("app.ts")
     javascript = fixture.index("lone.js")
 
-    assert typescript["lsp"]["status"] == "enriched"
+    # NF-2026-00952: only an absent TS/JS server group (an environment
+    # prerequisite) may skip, with the exact missing language named. Once the
+    # server is present, TS/JS indexing and the unresolved ``helper`` call
+    # edge are product output: a missing one fails, then ``enriched`` is
+    # asserted exactly.
+    missing = ts_js_enrichment_prerequisite_missing(fixture)
+    if missing:
+        pytest.skip(f"{TS_JS_PREREQUISITE_SKIP_PREFIX}{missing}")
+    assert_ts_js_extractor_output(fixture)
+
+    assert typescript["lsp"]["status"] == "enriched", typescript["lsp"]
     assert typescript["lsp"]["enriched"] == 1
     assert typescript["lsp"]["language"] == "typescript"
     assert javascript["lsp"]["status"] == "enriched"
