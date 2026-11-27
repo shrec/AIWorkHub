@@ -32,7 +32,7 @@ from . import (
 )
 from . import accept_failure_cause
 from . import base_drift_proof as base_drift_proof_module
-from . import manager_console_identity, manager_route_probe
+from . import manager_console_identity, manager_reroute_identity, manager_route_probe
 from . import platform_io
 from . import repository_state
 from . import runtime_generation
@@ -836,6 +836,7 @@ def _manager_chat_seat_identity() -> dict[str, str] | None:
 def _live_manager_identity() -> dict[str, str] | None:
     """This process's own route, seat first (NF-2026-01383); the panel's console last (NF-2026-02393)."""
     return (_manager_chat_seat_identity() or _claude_manager_identity() or _codex_manager_identity()
+            or manager_reroute_identity.vscode_lm_manager_identity()  # NF-2026-00802
             or manager_console_identity.verified_identity())
 
 
@@ -9393,11 +9394,11 @@ def _verified_manager_rejection_receipt(
     feedback_paths = feedback.get("predecessor_changed_paths")
     instruction = feedback.get("instruction")
     reason_identity = feedback.get("reason_identity")
+    # NF-2026-00791: an empty map is admitted only once re-proven from disk below.
     if (
         feedback.get("schema_id") != "aiworkhub.rework_feedback_delta.v1"
         or str(feedback.get("predecessor_request_id") or "").strip() != request_id
         or not isinstance(changed_hashes, dict)
-        or not changed_hashes
         or feedback_paths != sorted(str(path) for path in changed_hashes)
         or not isinstance(instruction, str)
         or len(instruction.encode("utf-8")) > _MAX_REWORK_FEEDBACK_BYTES
@@ -9412,9 +9413,8 @@ def _verified_manager_rejection_receipt(
     ):
         return None, "reroute_manager_rejection_feedback_invalid"
 
-    retained, retained_error = _verified_retained_predecessor_receipt(
-        card, task_id=task_id
-    )
+    retained, retained_error = (manager_reroute_identity.verified_zero_delta_predecessor_receipt
+        if not changed_hashes else _verified_retained_predecessor_receipt)(card, task_id=task_id)
     if retained_error is not None or retained is None:
         return None, retained_error or "reroute_retained_candidate_unverified"
 
