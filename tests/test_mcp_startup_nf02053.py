@@ -25,8 +25,11 @@ if str(SRC_ROOT) not in sys.path:
 
 # Executed aiworkhub modules (the package included) once the stdlib transport
 # has answered initialize and the first tools/list. Measured 2026-11-04: 54,
-# one of them the child's stand-in aiworkhub.storage_retention.
-STARTUP_AIWORKHUB_MODULE_CEILING = 60
+# one of them the child's stand-in aiworkhub.storage_retention. Measured
+# 2026-11-27: 61 -- NF-2026-00965 makes initialize execute
+# aiworkhub.stdio_fastmcp, the single owner of the protocol-version vocabulary
+# (its own imports were already in the set), so the ceiling grows by exactly one.
+STARTUP_AIWORKHUB_MODULE_CEILING = 61
 CHILD_TIMEOUT_SECONDS = 600
 _PREFIX = "NF02053_PAYLOAD="
 

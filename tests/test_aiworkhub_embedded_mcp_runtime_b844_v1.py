@@ -355,7 +355,12 @@ def test_stdlib_fallback_initialize_and_tools_call_shape(fallback_server_module)
     server_module = fallback_server_module
     tools = server_module.mcp._tools
     init = server_module._stdio_dispatch("AIWorkHub MCP", tools, "initialize", {})
-    assert init["protocolVersion"] == "2024-11-05"
+    # NF-2026-00965: a missing protocolVersion answers the newest supported revision.
+    assert init["protocolVersion"] == "2025-11-25"
+    pinned = server_module._stdio_dispatch(
+        "AIWorkHub MCP", tools, "initialize", {"protocolVersion": "2024-11-05"}
+    )
+    assert pinned["protocolVersion"] == "2024-11-05"
     assert init["capabilities"]["resources"] == {}
     with_banner = server_module._stdio_dispatch(
         "AIWorkHub MCP",

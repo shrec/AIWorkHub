@@ -9,6 +9,7 @@ noted by package/extension version and release tag.
 ### Changed
 
 - MCP tool names: the 20 unprefixed NeedFix and Roadmap tools are registered under `aiworkhub_`-prefixed names (`needfix_list` -> `aiworkhub_needfix_list`, ..., `roadmap_link_task` -> `aiworkhub_roadmap_link_task`; all 13 `needfix_*` and 7 `roadmap_*` tools). Each old name stays callable on the manager surface as a deprecated rename alias (unlisted, reply stamped `deprecated_alias`) and will be removed in 0.14.0. The deprecated facet aliases `needfix_count` and `aiworkhub_task_codex_handoff_markdown` stay callable but are no longer listed on the manager surface (manager listed tools 118 -> 116) (NF-2026-00964).
+- MCP stdio (phase 1): both stdio servers (the stdlib `server` fallback and the worker `stdio_fastmcp`) now negotiate `initialize`: a requested `protocolVersion` in `2024-11-05`/`2025-03-26`/`2025-06-18`/`2025-11-25` is echoed, and a missing, non-string or unknown one answers `2025-11-25` (previously always `2024-11-05`). Both `tools/list` replies list tools sorted by name and add `resultType: "complete"`, `ttlMs: 300000` and `cacheScope: "private"`; worker `tools/list` entries now carry the same `annotations` hints as the server path. The version tuple and negotiation helper live once in `stdio_fastmcp` (NF-2026-00965).
 
 ### Fixed
 

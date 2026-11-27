@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import mcp_tool_metadata as _tool_metadata
 from .tool_recovery import (
     missing_required_refusal,
     resolve_tool_arguments,
@@ -25,9 +26,37 @@ from .tool_recovery import (
 )
 
 
-PROTOCOL_VERSION = "2024-11-05"
+# NF-2026-00965: the MCP protocol revisions both stdio paths speak, oldest to
+# newest. server.py imports these; it must not restate the vocabulary.
+SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
+LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[-1]
+# How long a client may reuse a tools/list reply before asking again (5 min).
+TOOLS_LIST_TTL_MS = 300_000
 MAX_LINE_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+def negotiate_protocol_version(requested: Any) -> str:
+    """Echo a supported ``initialize`` protocolVersion, else answer the newest.
+
+    A missing, non-string or unknown request answers
+    :data:`LATEST_PROTOCOL_VERSION`; the client decides whether it can speak it.
+    """
+
+    if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS:
+        return requested
+    return LATEST_PROTOCOL_VERSION
+
+
+def tools_list_result(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap ``tools/list`` entries: sorted by name, complete, privately cacheable."""
+
+    return {
+        "tools": sorted(entries, key=lambda entry: str(entry.get("name", ""))),
+        "resultType": "complete",
+        "ttlMs": TOOLS_LIST_TTL_MS,
+        "cacheScope": "private",
+    }
 
 
 class ProtocolError(Exception):
@@ -368,7 +397,7 @@ def _dispatch(
     params = _validate_rpc_params(method, params, request_id=request_id)
     if method == "initialize":
         return {
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": negotiate_protocol_version(params.get("protocolVersion")),
             "capabilities": {"tools": {}, "resources": {}},
             "serverInfo": {"name": server_name, "version": __version__},
         }
@@ -377,20 +406,23 @@ def _dispatch(
     if method == "ping":
         return {}
     if method == "tools/list":
-        return {
-            "tools": [
-                {
-                    "name": name,
-                    "description": (inspect.getdoc(function) or "").strip().splitlines()[0]
-                    if (inspect.getdoc(function) or "").strip()
-                    else "",
-                    "inputSchema": _schema_for(function)
-                    if input_schema_transform is None
-                    else input_schema_transform(_schema_for(function)),
-                }
-                for name, function in tools.items()
-            ]
-        }
+        entries = []
+        for name, function in tools.items():
+            doc = (inspect.getdoc(function) or "").strip()
+            description = doc.splitlines()[0] if doc else ""
+            schema = _schema_for(function)
+            entries.append({
+                "name": name,
+                "description": description,
+                "inputSchema": schema
+                if input_schema_transform is None
+                else input_schema_transform(schema),
+                # NF-2026-00965: the same hints server._stdio_tools_list emits.
+                "annotations": _tool_metadata.derive_annotations(
+                    _tool_metadata.canonical_tool_name(name), description
+                ),
+            })
+        return tools_list_result(entries)
     if method == "tools/call":
         return _tool_result(tools, params)
     if method == "resources/list":

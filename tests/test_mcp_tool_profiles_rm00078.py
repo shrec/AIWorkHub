@@ -344,9 +344,10 @@ def test_profile_table_is_one_literal_and_the_module_scans_nothing() -> None:
 def test_all_lists_exactly_the_pre_table_tools(runs: dict) -> None:
     explicit, read_only = runs["all"], runs["all_read_only"]
     assert explicit["surface"] == read_only["surface"] == "all"
-    assert explicit["listed"] == explicit["registered"]
+    # NF-2026-00965: tools/list is sorted by name; registration order stays as declared.
+    assert explicit["listed"] == sorted(explicit["registered"])
     assert len(explicit["listed"]) == len(set(explicit["listed"])) == _PRE_TABLE_ALL_COUNT
-    assert read_only["listed"] == read_only["registered"]
+    assert read_only["listed"] == sorted(read_only["registered"])
     assert len(read_only["listed"]) == _PRE_TABLE_ALL_READ_ONLY_COUNT
     assert read_only["listed"] == [name for name in explicit["listed"] if name not in _WRITE_GATED]
     # No real tool relies on the table's fallback rule for unknown names.
@@ -381,11 +382,11 @@ def test_default_surface_still_refuses_write_tools_without_allow_writes(runs: di
 
 
 def test_manager_lists_the_pre_table_manager_tools_minus_the_callable_only_tools(runs: dict) -> None:
-    full, manager = runs["all"]["listed"], runs["manager"]
+    full, manager = runs["all"]["registered"], runs["manager"]
     assert manager["surface"] == "manager"
     manager_visible = [name for name in full if _pre_table_manager_rule(name)]
     assert manager["registered"] == manager_visible
-    assert manager["listed"] == [name for name in manager_visible if name not in _UNLISTED]
+    assert manager["listed"] == sorted([name for name in manager_visible if name not in _UNLISTED])
     assert {name for name in full if not _pre_table_manager_rule(name)} == _PRE_TABLE_MANAGER_HIDDEN
     assert _profile_names("manager") == set(full) - _PRE_TABLE_MANAGER_HIDDEN
     assert {name for name in _profile_names("manager") if name.startswith(_DASHBOARD)} == set(
@@ -465,8 +466,9 @@ def test_dashboard_profile_is_the_dashboard_app_plus_every_extension_called_tool
     assert dashboard == app_names | extension_names
     run = runs["dashboard"]
     assert run["surface"] == "dashboard"
-    full = runs["all"]["listed"]
-    assert run["listed"] == run["registered"] == [name for name in full if name in dashboard]
+    full = runs["all"]["registered"]
+    assert run["registered"] == [name for name in full if name in dashboard]
+    assert run["listed"] == sorted([name for name in full if name in dashboard])
 
 
 def test_callable_entry_is_callable_by_exact_name_but_absent_from_tools_list(monkeypatch, runs: dict) -> None:

@@ -224,7 +224,10 @@ except ModuleNotFoundError:
     # eval/exec/dynamic import driven by client-supplied data.
     # ------------------------------------------------------------------
 
-    _FALLBACK_PROTOCOL_VERSION = "2024-11-05"
+    # NF-2026-00965: the supported-version tuple, the initialize negotiation
+    # and the tools/list envelope have one owner, stdio_fastmcp.
+    from .stdio_fastmcp import negotiate_protocol_version
+    from .stdio_fastmcp import tools_list_result as _stdio_tools_list_result
     _FALLBACK_MAX_LINE_BYTES = 8 * 1024 * 1024
     _FALLBACK_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -404,7 +407,7 @@ except ModuleNotFoundError:
             if annotations is not None:
                 entry["annotations"] = annotations
             entries.append(entry)
-        return {"tools": entries}
+        return _stdio_tools_list_result(entries)
 
     def _stdio_tools_call(tools: dict[str, Any], params: Any) -> dict[str, Any]:
         if not isinstance(params, dict):
@@ -508,7 +511,7 @@ except ModuleNotFoundError:
         params = _validate_stdio_rpc_params(method, params, request_id=request_id)
         if method == "initialize":
             result = {
-                "protocolVersion": _FALLBACK_PROTOCOL_VERSION,
+                "protocolVersion": negotiate_protocol_version(params.get("protocolVersion")),
                 "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {"name": name, "version": __version__},
             }

@@ -482,7 +482,8 @@ def test_explicit_all_surface_lists_the_full_registry(all_run: dict) -> None:
     explicit = all_run["snapshots"]["all"]
     assert explicit["surface"] == "all" and explicit["env"] == "all"
     registered = all_run["registered"]
-    assert explicit["list"]["names"] == registered
+    # NF-2026-00965: tools/list is sorted by name, independent of registration order.
+    assert explicit["list"]["names"] == sorted(registered)
     assert len(registered) == len(set(registered)) >= 217
     assert len([name for name in registered if name.startswith(_DASHBOARD)]) >= 40
 
@@ -528,7 +529,7 @@ def test_manager_registers_only_visible_tools_and_matches_call_time_filtering(
     imported = manager_run["snapshots"]["manager"]["list"]
     flipped = all_run["snapshots"]["late_manager"]
     assert flipped["surface"] == "manager"
-    assert [name for name in manager_run["registered"] if name not in _UNLISTED] == imported["names"]
+    assert sorted(name for name in manager_run["registered"] if name not in _UNLISTED) == imported["names"]
     assert set(manager_run["registered"]) == set(all_run["registered"]) - set(_hidden_names(all_run["registered"]))
     assert flipped["list"]["names"] == imported["names"]
     assert flipped["list"]["wire_bytes"] == imported["wire_bytes"]
@@ -622,7 +623,7 @@ def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
     on_manager = [all_run["snapshots"]["late_manager"], manager_run["snapshots"]["manager"]]
     for snap in on_all:
         synthetic = snap["synthetic"]
-        assert _names(synthetic["list"]) == _SYNTHETIC_ALL
+        assert _names(synthetic["list"]) == sorted(_SYNTHETIC_ALL)
         assert _error(synthetic["hidden_with_bad_arguments"]["message"])["message"] == "arguments_must_be_object"
         hidden_call = _result(synthetic["calls"][_SYNTHETIC_HIDDEN]["message"])
         assert list(hidden_call) == ["content"]
@@ -631,7 +632,7 @@ def test_synthetic_registry_filters_listing_and_calls_by_prefix_and_keep_set(
     expected = _off_profile_message(_SYNTHETIC_HIDDEN, _SYNTHETIC_MANAGER, exposed=("all",))
     for snap in on_manager:
         synthetic = snap["synthetic"]
-        assert _names(synthetic["list"]) == _SYNTHETIC_MANAGER
+        assert _names(synthetic["list"]) == sorted(_SYNTHETIC_MANAGER)
         assert _error(synthetic["calls"][_SYNTHETIC_HIDDEN]["message"]) == {"code": -32602, "message": expected}
         assert _error(synthetic["hidden_with_bad_arguments"]["message"]) == {"code": -32602, "message": expected}
         # The former keep-set names are dashboard-only profile rows: refused on manager, naming dashboard and all.
