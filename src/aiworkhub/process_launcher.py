@@ -75,7 +75,7 @@ from . import quality_review_ingest
 from . import quality_review_scope
 from . import process_event_ledger
 from . import storage_retention, terminal_failure_classification, validation_auto_rework
-from . import finalize_retry_dispatch
+from . import finalize_retry_dispatch, review_transition_retry
 from . import reviewer_launch_refusal as _refusal
 from .process_launcher_acceptance import accepted_outcome_receipt as _accepted_outcome_receipt
 from .process_launcher_acceptance import changed_path_hashes as _changed_path_hashes
@@ -10955,8 +10955,8 @@ class ProcessManager:
                             cleanup = False
                             terminal_state = "review_ready"
                             review_result = {"ok": True, "idempotent_noop": True}
-                            release_result = phase_clock.transition(self._review_terminal_exact,
-                                metadata,
+                            release_result = review_transition_retry.retry_transient_transition(
+                                lambda: phase_clock.transition(self._review_terminal_exact, metadata,
                                 "review_ready",
                                 request_id=request_id,
                                 notify_manager=False,
@@ -10976,7 +10976,7 @@ class ProcessManager:
                                         "topic": str(metadata["topic"]),
                                     },
                                 },
-                            )
+                            ))
                             if not release_result.get("ok"):
                                 terminal_state = "review_pending"
                                 error = "review_transition_failed:" + str(
@@ -11209,8 +11209,8 @@ class ProcessManager:
                         cleanup = False
                         terminal_state = "review_ready"
                         review_result = {"ok": True, "idempotent_noop": True}
-                        release_result = phase_clock.transition(self._review_terminal_exact,
-                            metadata,
+                        release_result = review_transition_retry.retry_transient_transition(
+                            lambda: phase_clock.transition(self._review_terminal_exact, metadata,
                             "review_ready",
                             request_id=request_id,
                             notify_manager=False,
@@ -11244,7 +11244,7 @@ class ProcessManager:
                                     "claim_epoch": metadata.get("claim_epoch"),
                                 },
                             },
-                        )
+                        ))
                         if not release_result.get("ok"):
                             cleanup = False
                             terminal_state = "review_pending"
