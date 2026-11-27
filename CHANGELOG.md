@@ -13,6 +13,7 @@ noted by package/extension version and release tag.
 ### Fixed
 
 - Process-event ledger: a single-key `latest_event` lookup reads only that key's own lines through a per-archive key index (key -> line offsets) that is built once per immutable rotated archive and persisted beside the checkpoints, validated by (name, size, mtime_ns) and a payload sha256; the active file's index is extended by appended bytes only. A missing, stale, corrupt or non-verifying index is rebuilt or falls back to the exact scan with the same answer. Previously every lookup raw-scanned the whole rotated history, and the dashboard server, asking once per card, streamed 50 archives / 2.4 GB continuously at about 1.2 cores. Task retention now asks only for the five fields its fence reads (NF-2026-00966).
+- Quality gate sparse fill: `SPARSE_TOOLCHAIN_INPUT_ROOTS` includes `vscode-extension`, so a sparse validation tree gets the tracked `vscode-extension/` files from the canonical root and the `extension-regression` check (`npm --prefix vscode-extension test`) no longer fails ENOENT on `vscode-extension/package.json` for cards that change an extension file. Existing fill rules are unchanged: tracked files only, never overwrite, changed paths keep the candidate's bytes, symlinks refused, partial copies cleaned up (NF-2026-00970).
 
 ## [0.13.15] - 2026-11-26
 

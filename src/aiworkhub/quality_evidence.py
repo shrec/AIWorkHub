@@ -2675,9 +2675,10 @@ def _timeout_stream_tail(captured: bytes | str | None) -> str:
 
 # NF-2026-02284: repository-wide inputs a declared command may need. A sparse
 # validation tree can lack them (ruff E902 on scripts/, "No module named" for an
-# unchanged module, pytest collecting no tests); they are filled in from the
-# canonical toolchain root so the tree becomes canonical + candidate.
-SPARSE_TOOLCHAIN_INPUT_ROOTS = ("scripts", "src", "tests")
+# unchanged module, pytest collecting no tests, npm --prefix vscode-extension
+# ENOENT on its package.json); they are filled in from the canonical toolchain
+# root so the tree becomes canonical + candidate (NF-2026-00970 added vscode-extension).
+SPARSE_TOOLCHAIN_INPUT_ROOTS = ("scripts", "src", "tests", "vscode-extension")
 _SPARSE_FILL_SKIPPED_DIRS = frozenset({"__pycache__"})
 SPARSE_FILL_GIT_TIMEOUT_SECONDS = 60
 # Variables git honours over ``-C``: inherited, they would list another index.
@@ -2711,7 +2712,7 @@ class SparseFillResult:
 
 
 def _tracked_sparse_inputs(source_root: Path) -> tuple[list[str], str]:
-    """Tracked scripts/src/tests paths of the canonical root, or a named error.
+    """Tracked scripts/src/tests/vscode-extension paths of the canonical root, or a named error.
 
     Only ``git ls-files`` decides what is canonical: untracked or ignored host
     files are never candidates, and a failed listing never falls back to a walk.
@@ -2820,7 +2821,7 @@ def _fill_sparse_toolchain_inputs(
     toolchain_root: Path | str | None,
     changed_paths: Iterable[str],
 ) -> SparseFillResult:
-    """Fill tracked canonical scripts/src/tests files the sparse tree lacks.
+    """Fill tracked canonical scripts/src/tests/vscode-extension files the sparse tree lacks.
 
     Candidates are the canonical root's ``git ls-files`` entries under
     ``SPARSE_TOOLCHAIN_INPUT_ROOTS``; a listing failure fills nothing and names

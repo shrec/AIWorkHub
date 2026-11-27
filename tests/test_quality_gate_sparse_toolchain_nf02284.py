@@ -414,3 +414,43 @@ def test_executable_bit_is_preserved(tmp_path: Path) -> None:
     filled_mode = stat.S_IMODE((union / "scripts" / "run_check.sh").stat().st_mode)
     assert filled_mode == source_mode
     assert filled_mode & stat.S_IXUSR
+
+
+@requires_git
+def test_vscode_extension_files_are_filled_and_candidate_change_is_kept(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00970: ``npm --prefix vscode-extension test`` needs the extension tree.
+
+    A sparse tree lacking ``vscode-extension/package.json`` failed ENOENT for
+    every card that changed an extension file. The canonical copy fills both
+    tracked extension files when absent, and a candidate-changed one is kept.
+    """
+
+    canonical = tmp_path / "canonical"
+    _canonical_fixture(canonical)
+    _write(canonical, "vscode-extension/package.json", '{"name": "canonical"}\n')
+    _write(canonical, "vscode-extension/test/x.test.js", "// canonical\n")
+    _git_track(canonical)
+
+    absent = tmp_path / "absent"
+    _sparse_union(absent)
+    result = quality_evidence._fill_sparse_toolchain_inputs(absent, canonical, [CONFIG])
+    assert result.error == ""
+    assert "vscode-extension/package.json" in result.filled
+    assert "vscode-extension/test/x.test.js" in result.filled
+    for relative in ("vscode-extension/package.json", "vscode-extension/test/x.test.js"):
+        assert (absent / relative).read_bytes() == (canonical / relative).read_bytes()
+
+    changed = tmp_path / "changed"
+    _sparse_union(changed)
+    _write(changed, "vscode-extension/test/x.test.js", "// candidate\n")
+    result = quality_evidence._fill_sparse_toolchain_inputs(
+        changed, canonical, [CONFIG, "vscode-extension/test/x.test.js"],
+    )
+    assert result.error == ""
+    assert "vscode-extension/package.json" in result.filled
+    assert "vscode-extension/test/x.test.js" not in result.filled
+    assert (changed / "vscode-extension" / "test" / "x.test.js").read_text(
+        encoding="utf-8",
+    ) == "// candidate\n"
