@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, cast
 
 from . import adapter_capability, core, rework_overlay_packet as _rework_overlay_packet
-from . import agent_tool_instructions, sandbox_cpu_budget, worker_context_budget as _wcb
+from . import sandbox_cpu_budget, worker_context_budget as _wcb
 from . import attempt_artifacts
 from . import claude_auth
 from . import cli_model_discovery
@@ -4085,6 +4085,7 @@ MAX_REWORK_TASK_CONTRACT_BYTES = 48 * 1024
 MAX_WORKER_PROMPT_BYTES = 160 * 1024
 MAX_REWORK_WORKER_PROMPT_BYTES = 112 * 1024
 
+
 def build_worker_prompt(
     *,
     task_id: str,
@@ -4173,14 +4174,14 @@ def build_worker_prompt(
     # the rule behind it is the audit ledger rather than a provider refusal.
     # This keeps the prefix stable: it varies per adapter, and a provider prefix
     # cache is per provider already, so no cache is split by task.
-    stable_prefix = agent_tool_instructions.render_worker_runtime_policy(adapter_id, card=card)
+    stable_prefix = runtime_adapters.render_adapter_worker_runtime_policy(adapter_id, card=card)
     prompt = (
         stable_prefix
         + "\n\nTASK_CONTRACT_JSON:\n"
         + contract_json
         + "\nEND_TASK_CONTRACT_JSON"
-        + context_block
-        + retry_block
+        + runtime_adapters.render_adapter_tool_names(adapter_id, context_block)
+        + runtime_adapters.render_adapter_tool_names(adapter_id, retry_block)
         + suffix
     )
     prompt_bytes = len(prompt.encode("utf-8"))
@@ -10619,6 +10620,9 @@ class ProcessManager:
             # that detector held the provider's whole response body; a log tail
             # read later is strictly weaker evidence about the same event.
             provider_sealed_failure = provider_launch_failure or provider_route_failure
+            terminal_state, error, reason = runtime_adapters.opencode_worker_mcp_tools_gate(
+                metadata, request_id, terminal_state, error, reason, provider_sealed_failure
+            )
             terminal_disposition = terminal_failure_classification.failure_disposition_from_paths(
                 state=terminal_state,
                 error=error,

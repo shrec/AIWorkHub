@@ -1202,10 +1202,21 @@ _TERMINAL_STATE_NAMES: tuple[str, ...] = (
 # reaches the finalizer as ``worker_prompt_not_delivered:<detail>`` -- see
 # ``_LAUNCHER_MINTED_SPAWN_RE``.
 _WORKER_PROMPT_NOT_DELIVERED = "worker_prompt_not_delivered"
+# NF-2026-00993: an OpenCode turn that never reached its worker MCP tools. The
+# launcher mints ``worker_mcp_tools_unavailable:<detail>`` where the detail is
+# ``worker_mcp_runtime_not_provisioned``, ``audit_ledger_unverifiable`` or
+# ``worker_mcp_calls=<int>``; runtime_adapters imports these, never restates them.
+WORKER_MCP_TOOLS_UNAVAILABLE = "worker_mcp_tools_unavailable"
+WORKER_MCP_RUNTIME_NOT_PROVISIONED = "worker_mcp_runtime_not_provisioned"
+AUDIT_LEDGER_UNVERIFIABLE = "audit_ledger_unverifiable"
+WORKER_MCP_CALLS_FIELD = "worker_mcp_calls"
 _LAUNCHER_MINTED_REASONS: tuple[str, ...] = (
     "worker_cancelled",
     "worker_timed_out",
     _WORKER_PROMPT_NOT_DELIVERED,
+    WORKER_MCP_TOOLS_UNAVAILABLE,
+    WORKER_MCP_RUNTIME_NOT_PROVISIONED,
+    AUDIT_LEDGER_UNVERIFIABLE,
 )
 
 # The one registry every typed reason draws from. Values are the module's own
@@ -1226,6 +1237,7 @@ _REASON_CONSTANTS: dict[str, str] = {
 _REASON_FIELDS: frozenset[str] = frozenset({
     "state", "supervisor_state", "exit_code", "rc", "http_status",
     "cap_bytes", "observed_bytes", "timeout_seconds", "attempt",
+    WORKER_MCP_CALLS_FIELD,
 })
 
 # The only re-mintable structured evidence: mandatory-output paths, and only
@@ -2004,6 +2016,9 @@ REASON_DISPOSITION: dict[str, str] = {
     "sandbox_spawn_failed": FAILURE_CLASS_TRANSIENT,
     # NF-2026-01749: the route cannot speak the tool protocol; a distinct route can.
     PROVIDER_TEXT_TOOL_CALL_PROTOCOL: FAILURE_CLASS_TRANSIENT,
+    # NF-2026-00993: the launcher's own verdict that an OpenCode worker never
+    # reached its worker MCP tools -- infrastructure, never the candidate's work.
+    WORKER_MCP_TOOLS_UNAVAILABLE: FAILURE_CLASS_TRANSIENT,
 }
 
 # Reasons deliberately left unplaced, and why they cannot be placed:
@@ -3292,6 +3307,9 @@ _REASON_CAUSE: dict[str, str] = {
     PROVIDER_TEXT_TOOL_CALL_PROTOCOL: CAUSE_PROVIDER_TRANSIENT,
     "claude_subscription_session_refresh_required": CAUSE_PROVIDER_CREDENTIAL,
     "validation_unsupported_in_sandbox": CAUSE_SANDBOX_UNSUPPORTED,
+    # NF-2026-00993: an OpenCode worker launched with no worker MCP tools. Same
+    # shape as WORKER_MCP_CONNECT_FAILED: infrastructure, one distinct-route retry.
+    WORKER_MCP_TOOLS_UNAVAILABLE: CAUSE_PROVIDER_TRANSIENT,
     # Every control-plane reason that says the CARD ROW moved or that this
     # finalizer could not complete its transition. None of them says anything
     # about the work or the provider, and every one of them is settled by

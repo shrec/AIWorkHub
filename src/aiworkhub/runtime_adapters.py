@@ -1933,6 +1933,159 @@ def opencode_mcp_tool_name(mcp_tool: str) -> str:
     return f"{OPENCODE_WORKER_MCP_SERVER}_{mcp_tool}"
 
 
+# NF-2026-00993/00994: OpenCode exposes an MCP tool as ``<server>_<tool>``
+# (server key ``awh``), so a worker instruction naming the bare tool names
+# something the model cannot find.  This is the ONE adapter tool-name mapping:
+# derived from ``OPENCODE_WORKER_MCP_SERVER`` -- the key the config builder
+# writes -- and applied to rendered instruction text.  Every other adapter keeps
+# the names it was already given.
+#
+# The ``worker_mcp_tools_unavailable`` reason vocabulary is owned by
+# ``terminal_failure_classification`` and imported lazily inside the rule
+# below, never at module level: ``worker_ai_tools_mcp`` imports this module, and
+# the vendored worker MCP runtime ships a closed file set that does not (and
+# must not need to) include the classifier and its validation_runner closure.
+_BARE_AIWORKHUB_TOOL_NAME = re.compile(r"(?<![A-Za-z0-9_])aiworkhub_[A-Za-z0-9_]+")
+
+
+def adapter_exposed_worker_tool_names(adapter_id: str | None) -> frozenset[str] | None:
+    """The worker MCP tool names ``adapter_id`` exposes, or None when unmapped."""
+    if adapter_id == OPENCODE_CLI_ADAPTER:
+        return frozenset(opencode_mcp_tool_name(tool) for tool in OPENCODE_WORKER_MCP_TOOLS)
+    return None
+
+
+def adapter_worker_tool_name(adapter_id: str | None, mcp_tool: str) -> str:
+    """``mcp_tool`` spelled as ``adapter_id`` exposes it to the model."""
+    if adapter_id == OPENCODE_CLI_ADAPTER and mcp_tool in OPENCODE_WORKER_MCP_TOOLS:
+        return opencode_mcp_tool_name(mcp_tool)
+    return mcp_tool
+
+
+def render_adapter_tool_names(adapter_id: str | None, text: str) -> str:
+    """Rewrite every bare worker MCP tool name in ``text`` for ``adapter_id``.
+
+    Identity for any adapter without a mapping, so Claude and the other
+    transports keep byte-identical instructions.  A bare name the adapter does
+    not expose is left as written (the prompt contract test catches that drift).
+    """
+    if adapter_exposed_worker_tool_names(adapter_id) is None or not text:
+        return text
+    return _BARE_AIWORKHUB_TOOL_NAME.sub(
+        lambda match: adapter_worker_tool_name(adapter_id, match.group(0)), text
+    )
+
+
+def render_adapter_worker_runtime_policy(
+    adapter_id: str | None, *, card: dict[str, Any] | None = None
+) -> str:
+    """The stable worker runtime policy with tool names as ``adapter_id`` exposes them.
+
+    NF-2026-00993/00994: the one composition of
+    ``agent_tool_instructions.render_worker_runtime_policy`` with
+    :func:`render_adapter_tool_names` (OpenCode: ``awh_<tool>``; identity for
+    Claude and every other adapter).
+    """
+    from . import agent_tool_instructions
+
+    return render_adapter_tool_names(
+        adapter_id, agent_tool_instructions.render_worker_runtime_policy(adapter_id, card=card)
+    )
+
+
+def opencode_worker_mcp_tools_unavailable(
+    metadata: Mapping[str, Any], request_id: str, terminal_state: str
+) -> str:
+    """NF-2026-00993: the infra reason for an OpenCode turn that had no worker tools.
+
+    An OpenCode worker's built-in tools are all denied, so the ``awh`` worker
+    MCP server is its only way to read, search or write.  A cleanly ``exited``
+    OpenCode turn whose authenticated audit ledger holds zero worker-side MCP
+    calls (a launch-time prefetch row is the coordinator's, not the worker's)
+    therefore ran with an empty tool list: it is ``launch_failed`` with this
+    reason, never a review_ready or no-work model turn.  Absent or unverifiable
+    ledger evidence is not a pass (fail closed).  A ``worker_failed`` turn (the
+    provider itself exited non-zero) is already a failure with its own,
+    stronger provider evidence and keeps that verdict.  Returns "" when the
+    rule does not apply or the worker demonstrably reached its tools.
+    """
+    if str(metadata.get("adapter_id") or "") != OPENCODE_CLI_ADAPTER:
+        return ""
+    if terminal_state != "exited":
+        return ""
+    if metadata.get("execution_mode") == "validation_only_replay":
+        return ""
+    from . import terminal_failure_classification as tfc
+
+    tools_unavailable = tfc.WORKER_MCP_TOOLS_UNAVAILABLE
+    worker_mcp = metadata.get("worker_mcp")
+    worker_mcp = worker_mcp if isinstance(worker_mcp, Mapping) else {}
+    ledger_path = worker_mcp.get("audit_ledger_path")
+    key_path = worker_mcp.get("audit_hmac_key_path")
+    if not ledger_path or not key_path:
+        return f"{tools_unavailable}:{tfc.WORKER_MCP_RUNTIME_NOT_PROVISIONED}"
+    from . import worker_ai_tools_mcp
+
+    unverifiable = f"{tools_unavailable}:{tfc.AUDIT_LEDGER_UNVERIFIABLE}"
+    try:
+        verification = worker_ai_tools_mcp.verify_audit_ledger(
+            Path(str(ledger_path)),
+            Path(str(key_path)),
+            task_id=str(metadata.get("task_id") or ""),
+            runner=str(metadata.get("runner") or ""),
+            topic=str(metadata.get("topic") or ""),
+            request_id=request_id,
+        )
+    except Exception:  # noqa: BLE001 - a malformed ledger row must fail closed too
+        # The finalizer must never raise out of this rule; an unreadable
+        # ledger proves nothing, so it fails closed.  Any exception type
+        # (e.g. TypeError/KeyError from a malformed row) is caught.
+        return unverifiable
+    # Only a VERIFIED ledger may prove the worker reached its tools: entry
+    # counts from a ledger whose HMAC chain did not verify are not evidence.
+    if not isinstance(verification, Mapping) or verification.get("ok") is not True:
+        return unverifiable
+    provenance = verification.get("provenance_counts")
+    try:
+        prefetch = int(provenance.get("prefetch") or 0) if isinstance(provenance, Mapping) else 0
+        worker_calls = int(verification.get("entries_verified") or 0) - prefetch
+    except (TypeError, ValueError):
+        return unverifiable
+    if worker_calls > 0:
+        return ""
+    return f"{tools_unavailable}:{tfc.WORKER_MCP_CALLS_FIELD}={max(worker_calls, 0)}"
+
+
+def opencode_worker_mcp_tools_gate(
+    metadata: Mapping[str, Any],
+    request_id: str,
+    terminal_state: str,
+    error: Any,
+    reason: Any,
+    provider_sealed_failure: Any,
+) -> tuple[str, Any, Any]:
+    """Finalizer gate: ``(terminal_state, error, reason)`` after the NF-2026-00993 rule.
+
+    A provider-sealed failure keeps its own verdict.  Otherwise an OpenCode
+    turn that never reached its worker MCP tools becomes ``launch_failed`` with
+    the typed ``worker_mcp_tools_unavailable`` infra reason, never a model turn
+    to review or to blame for producing no work.  Every other turn is returned
+    unchanged.
+    """
+    # Truthy, not ``is not None``: the caller passes
+    # ``provider_launch_failure or provider_route_failure``, so an empty mapping
+    # is "no sealed failure" and must not bypass this rule.
+    if provider_sealed_failure:
+        return terminal_state, error, reason
+    tools_unavailable = opencode_worker_mcp_tools_unavailable(metadata, request_id, terminal_state)
+    if not tools_unavailable:
+        return terminal_state, error, reason
+    from . import terminal_failure_classification
+
+    recognised = terminal_failure_classification.recognised_reason(tools_unavailable)
+    return "launch_failed", tools_unavailable, recognised
+
+
 def opencode_worker_permission_contract() -> dict[str, str]:
     permission: dict[str, str] = {"*": OPENCODE_PERMISSION_DENY}
     for tool in OPENCODE_DENIED_BUILTIN_TOOLS:
@@ -2048,6 +2201,15 @@ def _opencode_role_contract(
     return _opencode_mcp_environment, opencode_worker_permission_contract
 
 
+# Schema source: the OpenCode config JSON schema at OPENCODE_CONFIG_SCHEMA_URL
+# (https://opencode.ai/config.json, the ``$schema`` every config written here
+# carries).  Its current MCP block is ``mcp.servers.<name>`` holding a local
+# server ``{type: "local", command: [argv], environment?, codemode}``; the
+# older ``mcp.<name>`` shape is the v1 form OpenCode's ConfigMigrateV1.migrateMcp
+# rewrites (dropping ``codemode``), so it is refused, not emitted.  The server
+# key is OPENCODE_WORKER_MCP_SERVER, which is also the ``<server>_`` prefix
+# ``render_adapter_tool_names`` gives every worker tool name (NF-2026-00993).
+# tests/test_opencode_worker_tools_nf00993.py pins this shape.
 def _build_opencode_mcp_config(
     mcp_command: Sequence[str], *, environment: Mapping[str, str] | None, role: str
 ) -> dict[str, Any]:

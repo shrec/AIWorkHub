@@ -390,6 +390,12 @@ def dispatch(
         result = _launch_as_task(params, legacy)
     else:
         result = legacy(method, params)
+    if method == "tools/list":
+        # Lazy: stdio_fastmcp imports this module at load time. The cache hints
+        # are 2026-07-28 fields, so only this stateless branch carries them.
+        from .stdio_fastmcp import stateless_tools_list_envelope
+
+        result = stateless_tools_list_envelope(result)
     return stamp_result(result, server_name)
 
 

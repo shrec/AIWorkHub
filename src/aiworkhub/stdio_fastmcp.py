@@ -50,14 +50,25 @@ def negotiate_protocol_version(requested: Any) -> str:
 
 
 def tools_list_result(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    """Wrap ``tools/list`` entries: sorted by name, complete, privately cacheable."""
+    """Wrap initialize-era ``tools/list`` entries: sorted by name, spec shape only.
 
-    return {
-        "tools": sorted(entries, key=lambda entry: str(entry.get("name", ""))),
-        "resultType": "complete",
-        "ttlMs": TOOLS_LIST_TTL_MS,
-        "cacheScope": "private",
-    }
+    NF-2026-00993: an initialize-era client (OpenCode negotiates 2024-11-05,
+    2025-03-26 or 2025-06-18) gets exactly the ``ListToolsResult`` its revision
+    defines -- ``tools`` and nothing else.  The 2026-07-28 envelope
+    (``resultType``/``ttlMs``/``cacheScope``) is stamped by
+    :func:`mcp_stateless.dispatch` on stateless requests only; leaking it into
+    the legacy reply is what left OpenCode workers with zero tools.
+    """
+
+    return {"tools": sorted(entries, key=lambda entry: str(entry.get("name", "")))}
+
+
+def stateless_tools_list_envelope(result: Any) -> Any:
+    """The 2026-07-28 cache hints for a ``tools/list`` result (one owner)."""
+
+    if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+        return result
+    return {**result, "ttlMs": TOOLS_LIST_TTL_MS, "cacheScope": "private"}
 
 
 class ProtocolError(Exception):

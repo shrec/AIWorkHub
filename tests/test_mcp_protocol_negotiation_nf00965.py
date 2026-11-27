@@ -100,12 +100,35 @@ def test_both_paths_answer_newest_for_unknown_missing_or_non_string(fallback_ser
 
 
 def _assert_envelope(result: dict) -> None:
+    # NF-2026-00993: an initialize-era tools/list is exactly ListToolsResult;
+    # the 2026-07-28 cache envelope is stamped on stateless requests only.
+    names = [entry["name"] for entry in result["tools"]]
+    assert names == sorted(names)
+    assert set(result) == {"tools"}
+
+
+_STATELESS_META = {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}
+
+
+def _assert_stateless_envelope(result: dict) -> None:
     names = [entry["name"] for entry in result["tools"]]
     assert names == sorted(names)
     assert result["resultType"] == "complete"
     assert result["cacheScope"] == "private"
     assert result["ttlMs"] == stdio_fastmcp.TOOLS_LIST_TTL_MS
     assert isinstance(result["ttlMs"], int) and result["ttlMs"] > 0
+
+
+def test_both_paths_stamp_the_cache_envelope_only_on_stateless_requests(fallback_server):
+    worker = stdio_fastmcp._dispatch("srv", _worker_tools(), "tools/list", _STATELESS_META, 1)
+    server = fallback_server._stdio_dispatch(
+        "srv", fallback_server.mcp._tools, "tools/list", _STATELESS_META, "", 1
+    )
+    _assert_stateless_envelope(worker)
+    _assert_stateless_envelope(server)
+    assert worker["tools"] == stdio_fastmcp._dispatch(
+        "srv", _worker_tools(), "tools/list", {}, 2
+    )["tools"]
 
 
 def test_worker_tools_list_is_sorted_annotated_and_enveloped():
