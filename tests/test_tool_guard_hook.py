@@ -144,7 +144,16 @@ def repo(tmp_path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(text.encode("utf-8"))
     (tmp_path / "outside.py").write_bytes(b"a = 1\n")
+    # NF-2026-01014: the session's transcript names an AIWorkHub MCP tool, so the
+    # guard's denies apply; it sits beside the root, outside the indexed tree.
+    (tmp_path / "transcript.jsonl").write_bytes(MCP_TRANSCRIPT_LINE)
     return root.resolve()
+
+
+MCP_TRANSCRIPT_LINE = (
+    b'{"type":"assistant","message":{"content":[{"type":"tool_use",'
+    b'"name":"mcp__AIWorkHub__aiworkhub_manager_source_graph_query"}]}}\n'
+)
 
 
 def _tool_input(root: Path, spec: Any) -> dict[str, Any]:
@@ -156,7 +165,7 @@ def _tool_input(root: Path, spec: Any) -> dict[str, Any]:
 def _payload(root: Path, tool: str, spec: Any) -> bytes:
     return json.dumps({
         "session_id": "session-1",
-        "transcript_path": str(root / "transcript.jsonl"),
+        "transcript_path": str(root.parent / "transcript.jsonl"),
         "cwd": str(root),
         "hook_event_name": "PreToolUse",
         "tool_name": tool,
@@ -173,7 +182,10 @@ def _single_decision(out: str) -> dict[str, Any]:
     output = decision["hookSpecificOutput"]
     assert output["hookEventName"] == "PreToolUse"
     assert output["permissionDecision"] == "deny"
-    assert len(output["permissionDecisionReason"]) <= tool_guard_hook.REASON_MAX_CHARS
+    reason = output["permissionDecisionReason"]
+    hint = " " + tool_guard_hook.DENY_RESTART_HINT
+    assert reason.endswith(hint)
+    assert len(reason) - len(hint) <= tool_guard_hook.REASON_MAX_CHARS
     return output
 
 

@@ -10,6 +10,13 @@ the only way it refuses anything is a positive rule match, for which it prints
 exactly one ``permissionDecision: deny`` object and exits 0. Allow, malformed
 input and any exception all mean no output and exit 0.
 
+An R1-R7 match (a "use the AIWorkHub MCP tool instead" redirect) is denied only
+when the session can use the AIWorkHub MCP tools the deny names (NF-2026-01014,
+see ``aiworkhub_mcp_loaded``). When the session's readable transcript shows no
+such tool the call is allowed and the hook prints only ``additionalContext``
+telling the model to restart/reload the session; an unknown signal keeps the
+deny. R8 denies regardless; every deny reason carries the restart hint too.
+
 Rules, first match wins:
 
 * R1 raw search (grep, rg, findstr, Select-String, git grep) of indexed source.
@@ -2259,8 +2266,81 @@ def _stop_main() -> int:
     return 0
 
 
+MCP_ABSENT_HINT = (
+    "AIWorkHub MCP tools are not loaded in this session; "
+    "restart/reload the session to load them."
+)
+DENY_RESTART_HINT = (
+    "If the AIWorkHub MCP tools are not loaded in this session, "
+    "restart/reload the session to load them."
+)
+# Raw discovery tools the AIWorkHub tools replace; a session without them hears why.
+_DISCOVERY_TOOLS = frozenset({"Grep", "Glob"})
+# Rules whose deny is a "use the AIWorkHub MCP tool instead" redirect (Source
+# Graph for R1-R5, the semantic editor for R6/R7). Only these relax when the
+# session has no AIWorkHub MCP; R8 (another session's scratch) is not a
+# redirect and denies regardless.
+_MCP_REDIRECT_RULES = frozenset({"R1", "R2", "R3", "R4", "R5", "R6", "R7"})
+# Any MCP tool name of an AIWorkHub server: ``mcp__AIWorkHub__aiworkhub_*`` for
+# the manager, ``mcp__aiworkhub_worker_ai_tools__*`` for a worker.
+_AIWORKHUB_MCP_NAME = re.compile(rb"mcp__[A-Za-z0-9_-]{0,64}?aiworkhub", re.IGNORECASE)
+_TRANSCRIPT_CHUNK_BYTES = 1 << 20
+_TRANSCRIPT_SCAN_MAX_BYTES = 64 << 20
+_TRANSCRIPT_OVERLAP_BYTES = 128
+
+
+def aiworkhub_mcp_loaded(transcript_path: object) -> bool:
+    """False only when this session's readable transcript names no AIWorkHub MCP tool.
+
+    The signal is the session's own Claude Code transcript (``transcript_path``
+    from the hook input): once the host has offered the session an AIWorkHub
+    MCP tool (a deferred-tool listing, a ToolSearch result) or the session has
+    called one, its ``mcp__<server>__`` name is in that file. It is bound to the
+    session by construction, needs no marker anyone must remember to write, and
+    a guard installed mid-session (NF-2026-01014) sees exactly what the session
+    can use. The scan stops at the first hit and reads at most
+    ``_TRANSCRIPT_SCAN_MAX_BYTES``.
+
+    Unknown is never "absent": a missing, empty or non-string
+    ``transcript_path``, a path that does not exist, any ``OSError`` while
+    reading, and a scan that hits its byte cap without an answer all count as
+    loaded, so the guard keeps its old deny behaviour. Only a transcript read
+    to its end without an AIWorkHub MCP reference relaxes the redirect rules.
+    """
+
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        return True
+    try:
+        with open(os.path.expanduser(transcript_path), "rb") as handle:
+            tail = b""
+            scanned = 0
+            while scanned < _TRANSCRIPT_SCAN_MAX_BYTES:
+                chunk = handle.read(_TRANSCRIPT_CHUNK_BYTES)
+                if not chunk:
+                    return False
+                scanned += len(chunk)
+                if _AIWORKHUB_MCP_NAME.search(tail + chunk):
+                    return True
+                tail = chunk[-_TRANSCRIPT_OVERLAP_BYTES:]
+    except OSError:
+        return True
+    return True
+
+
+def _emit(output: dict[str, object]) -> None:
+    sys.stdout.write(json.dumps({"hookSpecificOutput": output}) + "\n")
+    sys.stdout.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Hook entry point. Always returns 0 so a guard failure never blocks a tool call."""
+    """Hook entry point. Always returns 0 so a guard failure never blocks a tool call.
+
+    The single decision point: a match of a rule whose deny redirects to an
+    AIWorkHub MCP tool (``_MCP_REDIRECT_RULES``) is denied only when this session
+    can use those tools (``aiworkhub_mcp_loaded``); otherwise the call is allowed
+    with ``additionalContext`` carrying ``MCP_ABSENT_HINT``. Any other rule (R8)
+    denies regardless. Every deny reason ends with ``DENY_RESTART_HINT``.
+    """
 
     args = sys.argv[1:] if argv is None else list(argv)
     try:
@@ -2282,19 +2362,24 @@ def main(argv: list[str] | None = None) -> int:
             payload.get("cwd"),
             session_id=payload.get("session_id"),
         )
+        redirect = (verdict is not None and verdict[0] in _MCP_REDIRECT_RULES) or (
+            verdict is None
+            and tool_name in _DISCOVERY_TOOLS
+            and isinstance(payload.get("tool_input"), dict)
+            and Path(os.path.realpath(root), ".aiworkhub").is_dir()
+        )
+        if redirect and not aiworkhub_mcp_loaded(payload.get("transcript_path")):
+            _emit({"hookEventName": "PreToolUse", "additionalContext": MCP_ABSENT_HINT})
+            return 0
         if verdict is None:
             return 0
         rule, reason, target = verdict
         _record_denial(root, rule, tool_name, target, payload.get("session_id"))
-        decision = {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        }
-        sys.stdout.write(json.dumps(decision) + "\n")
-        sys.stdout.flush()
+        _emit({
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason + " " + DENY_RESTART_HINT,
+        })
     except Exception:
         return 0
     return 0
