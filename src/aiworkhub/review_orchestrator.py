@@ -2802,21 +2802,83 @@ def _sealed_reviewer_request_id(card: Any) -> str:
     return str(reviewer.get("request_id") or "") if isinstance(reviewer, Mapping) else ""
 
 
+# NF-00853: one recovery pass is bounded by wall clock, not by how many parents
+# are queued. 15 s is half the reconciler's default 30 s scan interval, leaving
+# the rest of the tick to the other scan phases.
+RECOVERY_TICK_BUDGET_S = 15.0
+# Last review_ready request id examined, keyed by str(repo). The next pass of
+# the same repository resumes after it, so a backlog larger than one budget is
+# carried round-robin, never re-read from the head, and two repositories in one
+# process never resume from each other's request id. Single-flight: the
+# reconciler's _REVIEW_RECOVERY_LOCK serialises passes.
+_RECOVERY_STATE: dict[str, tuple[str, int]] = {}
+
+
+def _rotate_after_cursor(
+    cards: Any, cursor_id: str, cursor_pos: int,
+) -> list[tuple[int, Any]]:
+    """Pair each queue card with its index in ``cards``, starting after the cursor.
+
+    The cursor is the last card examined. While it is still queued the pass cuts
+    just after it. Once it has left the queue its successors have shifted down
+    into its old index, so the cut is that index: the pass resumes at the card
+    that followed it rather than restarting at the head, where a card that keeps
+    eating the budget would starve everything behind it. An empty cursor at
+    position 0 starts at the head.
+    """
+    indexed = list(enumerate(cards))
+    ids = [
+        _card_request_id(card) if isinstance(card, Mapping) else ""
+        for _, card in indexed
+    ]
+    if cursor_id and cursor_id in ids:
+        cut = ids.index(cursor_id) + 1
+    else:
+        cut = min(max(int(cursor_pos), 0), len(indexed))
+    return indexed[cut:] + indexed[:cut]
+
+
+def _launchable_reviewer_identity(chain: Any, missing: tuple[str, ...]) -> bool:
+    """True only when a durable launch action exists for every missing lens."""
+    actions = tuple(getattr(chain, "actions", ()) or ())
+    for lens in missing:
+        if not any(
+            str(getattr(action, "action_type", "")) == "launch"
+            and str(getattr(action, "lens", "")) == lens
+            and int(getattr(action, "action_id", 0) or 0) > 0
+            for action in actions
+        ):
+            return False
+    return True
+
+
 def recover_review_ready_targets(
     manager: Manager,
     *,
     db_path: str | Path,
+    budget_s: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """Ensure missing required-lens chains for authenticated review_ready targets.
 
     Discovers current review-queue episodes only. Identity comes from sealed
     terminal evidence or the durable registration payload -- never chat prose.
     Does not launch reviewers and never accepts the target.
+
+    One pass stops after ``budget_s`` of wall clock (default
+    RECOVERY_TICK_BUDGET_S) and resumes after the last examined request id on
+    the next pass. ``ensured`` counts a parent only when a durable launch action
+    exists for each missing lens; any other parent is a typed hold under
+    ``review_recovery_unactionable``.
     """
-    scanned = ensured = skipped = failed = 0
+    scanned = ensured = skipped = failed = unactionable = deferred = 0
+    examined = ""
+    examined_pos = 0
     reasons: dict[str, int] = {}
     failures: list[dict[str, str]] = []
     repo = Path(getattr(manager, "repo", "") or "")
+    # NF-00853: the resume cursor is per repository, never shared across managers.
+    repo_key = str(repo)
     try:
         cards = task_store.list_review_queue_cards(repo, limit=_RECOVERY_SCAN_LIMIT)
     except Exception as exc:  # noqa: BLE001 -- fail closed, never raise through scan
@@ -2832,7 +2894,18 @@ def recover_review_ready_targets(
             "state": "skipped",
             "reason": "store_unreadable",
         }
-    for card in cards:
+    budget = RECOVERY_TICK_BUDGET_S if budget_s is None else float(budget_s)
+    now = clock or time.monotonic
+    deadline = now() + budget
+    total = len(cards)
+    ordered = _rotate_after_cursor(
+        cards, *_RECOVERY_STATE.get(repo_key, ("", 0)),
+    )
+    for position, (origin, card) in enumerate(ordered):
+        if now() >= deadline:
+            # Wall-clock budget spent: the rest waits for the next tick.
+            deferred = total - position
+            break
         if not isinstance(card, Mapping):
             continue
         if str(card.get("topic") or "") == "quality_review":
@@ -2841,6 +2914,8 @@ def recover_review_ready_targets(
             continue
         scanned += 1
         request_id = _card_request_id(card)
+        if request_id:
+            examined, examined_pos = request_id, origin
         if not request_id:
             skipped += 1
             _recovery_reason(reasons, "missing_registration")
@@ -2977,7 +3052,7 @@ def recover_review_ready_targets(
             # what stranded it. One reason per target, counted once.
             _recovery_reason(reasons, "unusable_reviewer")
         try:
-            register_candidate(manager, db_path=db_path, registration=registration)
+            chain = register_candidate(manager, db_path=db_path, registration=registration)
         except Exception as exc:  # noqa: BLE001
             failed += 1
             _recovery_reason(reasons, "ensure_failed")
@@ -2991,13 +3066,29 @@ def recover_review_ready_targets(
                     "error": f"{type(exc).__name__}:{exc}"[:80],
                 })
             continue
+        if not _launchable_reviewer_identity(chain, missing):
+            # NF-00853: no durable launch action for a missing lens means no
+            # reviewer identity exists to act on. Hold it by name; never ensured.
+            unactionable += 1
+            _recovery_reason(reasons, "no_reviewer_identity")
+            _stamp_recovery_skip(
+                manager, identity, missing, "no_reviewer_identity",
+            )
+            continue
         ensured += 1
         _recovery_reason(reasons, "ensured")
+    if deferred and examined:
+        _RECOVERY_STATE[repo_key] = (examined, examined_pos)
+    elif not deferred:
+        _RECOVERY_STATE[repo_key] = ("", 0)
     return {
         "review_recovery_scanned": scanned,
         "review_recovery_ensured": ensured,
         "review_recovery_skipped": skipped,
         "review_recovery_failed": failed,
+        "review_recovery_unactionable": unactionable,
+        "review_recovery_deferred": deferred,
+        "review_recovery_next_cursor": _RECOVERY_STATE.get(repo_key, ("", 0))[0],
         "review_recovery_reasons": reasons,
         "review_recovery_failures": failures,
         "state": "ok",

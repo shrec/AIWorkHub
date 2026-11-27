@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 _TESTS = Path(__file__).resolve().parent
 _SRC = _TESTS.parent / "src"
@@ -100,7 +101,16 @@ class _FakeLauncher:
         self.launches.append(dict(registration))
         if self.error is not None:
             raise self.error
-        return object()
+        # A ReviewChain-shaped result: one durable launch action per lens the
+        # registration asks for, exactly what ReviewOrchestrator.ensure_chain returns.
+        lenses = tuple(registration.get("required_reviewer_lenses") or ())
+        return SimpleNamespace(
+            chain_id=1, chain_identity_sha256="", chain_identity={},
+            actions=tuple(
+                SimpleNamespace(action_type="launch", lens=lens, action_id=index + 1)
+                for index, lens in enumerate(lenses)
+            ),
+        )
 
 
 def _recover(

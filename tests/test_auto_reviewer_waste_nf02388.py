@@ -108,7 +108,10 @@ def _run_recovery(monkeypatch, tmp_path, existing):
     })
     monkeypatch.setattr(
         ro, "register_candidate",
-        lambda _manager, **kw: registered.append(kw) or {"ok": True},
+        lambda _manager, **kw: registered.append(kw) or SimpleNamespace(
+            chain_id=1, chain_identity_sha256="", chain_identity={},
+            actions=(SimpleNamespace(action_type="launch", lens=LENS, action_id=1),),
+        ),
     )
     result = ro.recover_review_ready_targets(manager, db_path=tmp_path / "lifecycle.db")
     return result, registered, manager
