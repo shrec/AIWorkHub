@@ -484,6 +484,11 @@ def append_event(
                 and _append_repeats_latest(path, info, request_key, persisted_event)
             ):
                 return persisted_event
+            starting_key = _starting_identity_key(persisted_event)
+            if starting_key is not None and _starting_already_recorded(
+                path, info, starting_key
+            ):
+                return persisted_event
             rotated = bool(
                 info is not None
                 and info.st_size
@@ -570,11 +575,17 @@ def _row_request_key(row: Mapping[str, Any]) -> str | None:
 @dataclass
 class _AppendDigests:
     """Latest persisted snapshot digest per request for one ledger, valid for
-    exactly the first ``offset`` bytes of the file with ``identity``."""
+    exactly the first ``offset`` bytes of the file with ``identity``.
+
+    ``starting_keys`` holds the ``starting``-row identities (NF-2026-00855) in
+    their own bounded set, so no request key can ever collide with one."""
 
     identity: tuple[int, int] | None
     offset: int
     digests: OrderedDict[str, bytes]
+    starting_keys: OrderedDict[str, None] = _dataclass_field(
+        default_factory=OrderedDict
+    )
 
 
 _APPEND_DIGEST_LOCK = threading.Lock()
@@ -595,6 +606,13 @@ def _remember_digest(index: _AppendDigests, key: str, digest: bytes) -> None:
         index.digests.popitem(last=False)
 
 
+def _remember_starting(index: _AppendDigests, key: str) -> None:
+    index.starting_keys[key] = None
+    index.starting_keys.move_to_end(key)
+    while len(index.starting_keys) > _APPEND_DIGEST_MAX_KEYS:
+        index.starting_keys.popitem(last=False)
+
+
 def _fold_digest_bytes(
     index: _AppendDigests, ledger: Path, start: int, end: int
 ) -> int:
@@ -610,6 +628,9 @@ def _fold_digest_bytes(
         key = _row_request_key(row)
         if key is not None:
             _remember_digest(index, key, _snapshot_digest(row))
+        starting = _starting_identity_key(row)
+        if starting is not None:
+            _remember_starting(index, starting)
     return complete
 
 
@@ -745,6 +766,111 @@ def _record_append(
         index.offset = int(written.st_size)
         if request_key is not None:
             _remember_digest(index, request_key, _snapshot_digest(row))
+        starting = _starting_identity_key(row)
+        if starting is not None:
+            _remember_starting(index, starting)
+
+
+# --- Idempotent ``starting`` append (NF-2026-00855) ---------------------------
+#
+# A supervisor that re-announced one spawn wrote one ``starting`` row per
+# announcement, and every lifecycle audit replayed each of them. A ``starting``
+# row is keyed on request_id + claim_epoch + spawn identity: once that key is
+# in the ledger, a later row with the same key is a repeat of the same spawn
+# and is not written again. A row without a typed claim_epoch or without any
+# spawn-identity field has no identity and is always written (unknown identity
+# never suppresses evidence). Keys live in ``_AppendDigests.starting_keys``,
+# apart from the per-request snapshot digests, so the two can never collide.
+# Exactly the process-identity fields the real ``starting`` writers emit:
+# ``owner_pid``/``owner_pid_start_ticks`` (process_launcher reservations),
+# ``pid`` (process_launcher_quality_reviewer deferred receipt) and
+# ``supervisor_pid``/``supervisor_pid_start_ticks`` (worker_supervisor status).
+_SPAWN_IDENTITY_FIELDS = (
+    "owner_pid",
+    "owner_pid_start_ticks",
+    "pid",
+    "supervisor_pid",
+    "supervisor_pid_start_ticks",
+)
+
+
+def _is_real_spawn_value(value: Any) -> bool:
+    """A spawn-identity value that actually identifies a process: a non-bool
+    int other than 0, a float other than 0, or a non-blank str. ``None``,
+    ``""`` and ``0`` are placeholders, never identity (NF-2026-00855)."""
+
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
+
+
+def _starting_identity_key(row: Mapping[str, Any]) -> str | None:
+    """The idempotency key of a ``starting`` row, or ``None`` when it has none."""
+
+    state = row.get("state")
+    if not (isinstance(state, str) and state.strip().lower() == "starting"):
+        return None
+    request_key = _row_request_key(row)
+    epoch = row.get("claim_epoch")
+    if request_key is None or isinstance(epoch, bool) or not isinstance(epoch, int):
+        return None
+    spawn = {
+        name: row[name]
+        for name in _SPAWN_IDENTITY_FIELDS
+        if _is_real_spawn_value(row.get(name))
+    }
+    if not spawn:
+        # Unknown spawn identity never suppresses evidence: two such rows may
+        # be two different spawns, so the row is always written. A present
+        # but None/""/0 field is not identity (every spawn field is a pid or
+        # a start tick, and 0 is neither).
+        return None
+    text = json.dumps(
+        [request_key, epoch, spawn], ensure_ascii=False, sort_keys=True
+    )
+    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _starting_already_recorded(
+    path: Path, info: os.stat_result | None, key: str
+) -> bool:
+    """True when the active ledger already holds a ``starting`` row with ``key``.
+
+    Called under the append lock. A cold or unfollowable index is rebuilt from
+    the whole active file (bounded by its rotation size), so a fresh process
+    still sees a spawn announced by an earlier one."""
+
+    resolved = str(path.resolve(strict=False))
+    with _APPEND_DIGEST_LOCK:
+        cached = _APPEND_DIGESTS.get(resolved)
+        synced = False
+        if cached is not None:
+            try:
+                synced = _catch_up_digests(path, cached, info)
+            except (OSError, ValueError, RecursionError):
+                synced = False
+        if cached is not None and synced:
+            index = cached
+        else:
+            index = _AppendDigests(
+                identity=_identity_of(info), offset=0, digests=OrderedDict()
+            )
+            if info is not None:
+                try:
+                    index.offset = _fold_digest_bytes(
+                        index, path, 0, int(info.st_size)
+                    )
+                except (OSError, ValueError, RecursionError):
+                    return False
+            _APPEND_DIGESTS[resolved] = index
+            while len(_APPEND_DIGESTS) > _APPEND_DIGEST_MAX_LEDGERS:
+                _APPEND_DIGESTS.popitem(last=False)
+        _APPEND_DIGESTS.move_to_end(resolved)
+        return key in index.starting_keys
 
 
 # --- Bounded archive retention (NF-2026-02443) -------------------------------

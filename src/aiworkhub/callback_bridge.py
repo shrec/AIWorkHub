@@ -586,6 +586,13 @@ class ClaudeCliResumeClient:
         return envelope
 
 
+# Callback delivery modes as reported by health (NF-2026-00240): ``push``
+# means a live transport wakes the manager route; ``passive_mailbox`` means
+# the callback is durably parked until the manager polls for it.
+PUSH_DELIVERY = "push"
+PASSIVE_MAILBOX_DELIVERY = "passive_mailbox"
+
+
 class ClaudeCallbackAdapter:
     """Typed Claude callback adapter with persistent session identity.
 
@@ -611,6 +618,11 @@ class ClaudeCallbackAdapter:
     ) -> None:
         self._wake_transport = wake_transport
         self._cli_client = cli_client
+        # The route of the last acknowledged delivery: positive evidence that
+        # a live session answers on it (NF-2026-00240). Cleared on any
+        # unavailable/protocol failure; a single reference swap, so readers
+        # on another thread see either the old or the new route.
+        self._live_route: CoordinatorRouteKey | None = None
 
     @property
     def mode(self) -> str:
@@ -619,6 +631,21 @@ class ClaudeCallbackAdapter:
         if self._cli_client is not None:
             return "cli_resume"
         return "unavailable"
+
+    @property
+    def live_route(self) -> CoordinatorRouteKey | None:
+        """The route a live session last acknowledged, or ``None``."""
+        return self._live_route
+
+    @property
+    def delivery_mode(self) -> str:
+        """``push`` only when a wake/resume transport is configured AND a live
+        session has acknowledged a delivery on it; a transport object alone is
+        not evidence, so anything else is ``passive_mailbox`` (the manager must
+        poll) -- NF-2026-00240."""
+        if self.mode == "unavailable" or self._live_route is None:
+            return PASSIVE_MAILBOX_DELIVERY
+        return PUSH_DELIVERY
 
     def deliver_or_defer(
         self,
@@ -649,13 +676,18 @@ class ClaudeCallbackAdapter:
             )
 
         if mode == "panel":
-            result = self._wake_transport(route=route, payload=payload)
+            try:
+                result = self._wake_transport(route=route, payload=payload)
+            except Exception:
+                self._live_route = None
+                raise
             ack_matches = bool(
                 isinstance(result, Mapping)
                 and result.get("delivered") is True
                 and result.get("event_id", "") == payload.get("event_id", "")
                 and result.get("request_id", "") == payload.get("request_id", "")
             )
+            self._live_route = route if ack_matches else None
             if not ack_matches and raise_on_defer:
                 raise ClaudePanelDeferralError("claude_panel_wake_deferred_or_unmatched_ack")
             return CallbackDeliveryResult(
@@ -681,6 +713,8 @@ class ClaudeCallbackAdapter:
                 client_user_message_id=payload.get("client_user_message_id"),
             )
         except ClaudeCliBusyError as exc:
+            # Busy is a live session that could not take the turn now: the
+            # recorded live route (if any) stays valid evidence.
             if raise_on_defer:
                 raise
             return CallbackDeliveryResult(
@@ -689,6 +723,7 @@ class ClaudeCallbackAdapter:
                 reason=f"claude_cli_busy:{exc}"[:500],
             )
         except ClaudeCliUnavailableError as exc:
+            self._live_route = None
             if raise_on_defer:
                 raise
             return CallbackDeliveryResult(
@@ -696,10 +731,45 @@ class ClaudeCallbackAdapter:
                 durable=True, delivered=False, action="resume_claude_session",
                 reason=f"claude_cli_resume_unavailable:{exc}"[:500],
             )
+        except ClaudeCliProtocolError:
+            self._live_route = None
+            raise
+        except Exception:
+            self._live_route = None
+            raise
+        self._live_route = route
         return CallbackDeliveryResult(
             provider=self.provider, route=route, state="delivered",
             durable=False, delivered=True, action="delivered", reason="",
         )
+
+
+def claude_push_readiness(
+    adapter: "ClaudeCallbackAdapter | None", *, repo_id: str, window_id: str = ""
+) -> tuple[bool, str]:
+    """Whether ``adapter`` can push a callback to the manager route
+    ``repo_id``/``window_id`` right now, plus the named reason when not
+    (NF-2026-00240).
+
+    Push needs positive evidence: an already-built adapter holding a
+    wake/resume transport whose last delivery was acknowledged by a live
+    session on exactly this repository (and, when bound, window) route --
+    the same repo/window identity delivery resolves through
+    ``CoordinatorRouteKey``. A transport object alone is not evidence.
+    """
+
+    if adapter is None:
+        return False, "claude_adapter_not_built"
+    if adapter.mode == "unavailable":
+        return False, "claude_wake_transport_unavailable"
+    live = adapter.live_route
+    if live is None:
+        return False, "claude_no_live_session"
+    if not repo_id or live.repo_id != repo_id:
+        return False, "claude_route_repo_mismatch"
+    if (window_id or live.window_id) and live.window_id != window_id:
+        return False, "claude_route_window_mismatch"
+    return True, ""
 
 
 def _select_newest_inprogress_turn_id(in_progress: list[dict[str, Any]]) -> str | None:
@@ -1703,6 +1773,7 @@ class CallbackBridge:
         # (default) preserves the existing provider-wide claim behavior.
         self._claude_session_id = str(claude_session_id or "")
         self._claude_adapter: ClaudeCallbackAdapter | None = None
+        self._claude_adapter_lock = threading.Lock()
         self._client: AppServerClient | None = None
         self._sideband_client: SidebandCallbackClient | None = None
         self._stop_event = threading.Event()
@@ -1970,6 +2041,30 @@ class CallbackBridge:
             cwd=self._callback_cwd,
         )
 
+    def claude_adapter(self) -> ClaudeCallbackAdapter:
+        """This bridge's Claude adapter, built once on the CLI resume
+        transport for delivery. Construction is lock-guarded so concurrent
+        delivery calls never build two adapters (NF-2026-00240)."""
+        adapter = self._claude_adapter
+        if adapter is not None:
+            return adapter
+        with self._claude_adapter_lock:
+            adapter = self._claude_adapter
+            if adapter is None:
+                cli_client = ClaudeCliResumeClient(
+                    self._claude_executable,
+                    timeout=self._app_server_timeout,
+                    run_fn=self._claude_cli_run_fn,
+                )
+                adapter = ClaudeCallbackAdapter(cli_client=cli_client)
+                self._claude_adapter = adapter
+        return adapter
+
+    def existing_claude_adapter(self) -> ClaudeCallbackAdapter | None:
+        """The already-built Claude adapter, or ``None``; never constructs one
+        (health reads this, NF-2026-00240)."""
+        return self._claude_adapter
+
     def _deliver_batch_via_claude_cli(self, batch: CallbackBatch, client_user_message_id: str) -> None:
         """Deliver via ``ClaudeCallbackAdapter`` in ``cli_resume`` mode.
 
@@ -1983,13 +2078,7 @@ class CallbackBridge:
         subclass, letting the existing, unmodified ``_process_batch``
         busy/failure handling park or bounded-retry it exactly like Codex.
         """
-        if self._claude_adapter is None:
-            cli_client = ClaudeCliResumeClient(
-                self._claude_executable,
-                timeout=self._app_server_timeout,
-                run_fn=self._claude_cli_run_fn,
-            )
-            self._claude_adapter = ClaudeCallbackAdapter(cli_client=cli_client)
+        adapter = self.claude_adapter()
         route = fail_on_incomplete_coordinator_route(
             repo_id=self._claude_repo_id,
             provider="claude",
@@ -2005,7 +2094,7 @@ class CallbackBridge:
         state["last_claude_session_suffix"] = redacted_thread_suffix(batch.origin_thread_id)
         state["last_claude_attempt_at"] = _utcnow()
         try:
-            self._claude_adapter.deliver_or_defer(route, payload=payload, raise_on_defer=True)
+            adapter.deliver_or_defer(route, payload=payload, raise_on_defer=True)
         except BusyThreadError as exc:
             state["last_claude_reason"] = str(exc)[:500]
             self._write_state(state)
@@ -2278,6 +2367,15 @@ class CallbackDispatcher:
         thread = self._thread
         return bool(thread is not None and thread.is_alive())
 
+    def claude_adapter(self) -> ClaudeCallbackAdapter | None:
+        """The Claude adapter this dispatcher's bridge has already built, or
+        ``None`` (NF-2026-00240). Read-only: health must never construct an
+        adapter, so ``None`` here is absent evidence, never push."""
+        bridge = self._bridge
+        if self.provider != "claude" or bridge is None:
+            return None
+        return bridge.existing_claude_adapter()
+
     def start(self) -> None:
         """Idempotent: a second call while already running is a no-op."""
         with self._lock:
@@ -2502,7 +2600,7 @@ def dispatcher_health(repo_root: Path | str, provider: str = "") -> dict[str, An
     dispatcher = get_dispatcher(repo_root)
     provider = str(provider or "").strip().lower()
     if dispatcher is None:
-        return {
+        shape: dict[str, Any] = {
             "ok": True,
             "dispatcher_running": False,
             "provider": provider,
@@ -2517,8 +2615,38 @@ def dispatcher_health(repo_root: Path | str, provider: str = "") -> dict[str, An
             "registered": False,
             "problems": [],
         }
+        if provider:
+            # NF-2026-00240: a route-scoped readout names how a callback
+            # would reach this route right now. With no registered
+            # dispatcher nothing pushes: the manager only learns of a
+            # callback by polling, i.e. a passive mailbox.
+            shape["delivery_mode"] = PASSIVE_MAILBOX_DELIVERY
+        return shape
     out = dispatcher.health()
     out["registered"] = True
+    if provider:
+        # NF-2026-00240: push is reported only on positive evidence -- a live
+        # delivery thread, a provider the dispatcher reports as supported
+        # (a missing flag is not support), the dispatcher serving exactly the
+        # asked-about route, and, for Claude, an already-built adapter whose
+        # wake/resume transport has acknowledged a session on this exact
+        # repository/window route. Anything else is a passive mailbox.
+        push = (
+            out.get("dispatcher_running") is True
+            and out.get("provider_supported") is True
+            and dispatcher.provider == provider
+        )
+        reason = "" if push else "dispatcher_not_serving_route"
+        if push and provider == "claude":
+            # Health never constructs an adapter: it reads the one delivery
+            # built, so an absent adapter is absent evidence, never push.
+            push, reason = claude_push_readiness(
+                dispatcher.claude_adapter(),
+                repo_id=str(getattr(dispatcher, "repo_id", "") or ""),
+                window_id=str(getattr(dispatcher, "window_id", "") or ""),
+            )
+        out["delivery_mode"] = PUSH_DELIVERY if push else PASSIVE_MAILBOX_DELIVERY
+        out["delivery_mode_reason"] = reason
     return out
 
 

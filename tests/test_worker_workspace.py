@@ -1672,13 +1672,13 @@ def test_npm_prefix_validation_seeds_immutable_support_and_runs_from_candidate(
         fixture = repo / relative
         fixture.parent.mkdir(parents=True, exist_ok=True)
         fixture.write_bytes(b"\x89PNG-raster-fixture\n" + relative.encode("utf-8"))
-    (repo / "README.md").write_text("# AIWorkHub\n", encoding="utf-8")
+    # NF-2026-00024: byte-exact fixtures -- write_text would translate "\n"
+    # to CRLF on Windows and the seeded worktree copy would then differ.
+    (repo / "README.md").write_bytes(b"# AIWorkHub\n")
     scripts = repo / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    (scripts / "aiworkhub-app-server-mux").write_text("#!/bin/sh\n", encoding="utf-8")
-    (scripts / "aiworkhub-app-server-mux.cmd").write_text(
-        "@echo off\r\n", encoding="utf-8"
-    )
+    (scripts / "aiworkhub-app-server-mux").write_bytes(b"#!/bin/sh\n")
+    (scripts / "aiworkhub-app-server-mux.cmd").write_bytes(b"@echo off\r\n")
     runtime_package = repo / "src" / "aiworkhub"
     runtime_package.mkdir(parents=True, exist_ok=True)
     (runtime_package / "__init__.py").write_text(
