@@ -45,15 +45,30 @@ Linux Landlock
     EXECUTE, never a write right); Landlock requires every layer to allow an
     access, so the inner write-only layer still applies unchanged.
 
-    * No denied file: the filesystem root gets ``READ_FILE | READ_DIR`` and each
-      read root gets its own explicit ``READ_FILE | READ_DIR`` rule.
-    * Denied files: the filesystem root gets ``READ_DIR`` only, and every
-      directory on the path from the root to a denied file is *split*: each of
-      its children that is neither a denied file nor itself split gets a
-      ``READ_FILE`` rule for its whole subtree, symlinks are skipped (Landlock
-      checks the resolved target).  A read root containing a denied file is
-      therefore granted child-by-child instead of by one rule.  A split needing
-      more than ``MAX_LAYER_RULES`` rules refuses the launch with
+    * ``read_roots`` declared (NF-2026-01004, the read *allow-list*): nothing
+      outside :func:`read_allow_set` is readable -- the worktree, the card read
+      roots, the request runtime roots the sandbox argv names (home, worker
+      temp, exec scratch, short TMPDIR), the git read surface (the common
+      dir's objects, refs, packed-refs, HEAD, config, info, commondir, shallow
+      and worktrees plus this worktree's own ``worktrees/<name>``; never
+      hooks, logs or the checkout root, so sibling checkouts and
+      ``.aiworkhub/runtime`` / ``.aiworkhub/temp`` stay unreadable), the fixed
+      system set ``SYSTEM_READ_ROOTS`` and the exact toolchain install roots
+      (python prefixes, this package's import root, the adapter's node version
+      root).  A toolchain or request root that is the filesystem root or an
+      ancestor of (or equal to) the account home, the repository or the
+      worktree is dropped, never widened.  The set is computed here in the
+      supervisor and written into the plan; the child only applies the plan.
+      Each allow root gets ``READ_FILE | READ_DIR`` (a file root ``READ_FILE``);
+      one containing a denied file is split as below, starting at that root.
+    * ``deny_read`` only, no denied file: the filesystem root gets
+      ``READ_FILE | READ_DIR``.
+    * ``deny_read`` only, denied files: the filesystem root gets ``READ_DIR``
+      only, and every directory on the path from the root to a denied file is
+      *split*: each of its children that is neither a denied file nor itself
+      split gets a ``READ_FILE`` rule for its whole subtree, symlinks are
+      skipped (Landlock checks the resolved target).  A split needing more than
+      ``MAX_LAYER_RULES`` rules refuses the launch with
       ``deny_read_refused:rule_cap_exceeded``.
 
     The layer is applied by running this file as a direct script in front of
@@ -63,8 +78,12 @@ Linux Landlock
     an entry created after launch directly inside a split directory is
     unreadable to the worker, and hard links to a denied file elsewhere are not
     discovered.  Landlock unavailable with a non-empty ``read_roots`` or
-    ``deny_read`` refuses the launch with ``read_roots_landlock_unavailable`` /
-    ``deny_read_landlock_unavailable``.
+    ``deny_read`` refuses with ``read_roots_landlock_unavailable`` /
+    ``deny_read_landlock_unavailable`` (:func:`check_backend`); at launch
+    :func:`check_read_allowlist` turns every such refusal into
+    ``read_allowlist_unenforceable:<cause>:owner_opt_out=<env>=1``, and only
+    the owner's ``READ_ALLOWLIST_OPT_OUT_ENV=1`` launches it unenforced (the
+    receipt then says ``owner_opt_out_unenforced``).
 
 Windows AppContainer
     Read roots keep their ``read_execute`` grants.  Each denied file inside
@@ -81,6 +100,16 @@ Windows AppContainer
     resolving outside the worktree counts as readable, so one beneath which a
     glob could match refuses with ``deny_read_unenforceable_link:<rel>``.
 
+Linux bubblewrap
+    ``read_roots`` (NF-2026-01004): only the card's read roots (never the
+    Landlock system, toolchain, git or package roots) not already presented by
+    the bubblewrap argv are bound ``--ro-bind <root> <root>``, inserted right
+    after the base mounts and before every original worktree, write or
+    protective op, which keep their order and precedence; no blanket host
+    bind.  Bubblewrap cannot hide a file
+    inside a bound root, so ``deny_read`` there is refused (owner opt-out
+    aside, recorded ``owner_opt_out_unenforced``).
+
 Any other backend with ``read_roots`` or ``deny_read`` is refused.
 
 This module has no package-level relative imports outside the guarded
@@ -94,6 +123,7 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -146,6 +176,80 @@ _GLOB_CHARS = frozenset("*?[")
 _APPCONTAINER_SID = re.compile(r"S-1-15-2(?:-\d{1,10}){1,15}")
 _APPCONTAINER_DENY_TIMEOUT_SECONDS = 30.0
 _IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # a Windows junction (stat module, nt only)
+# NF-2026-01004: host system roots every Landlock worker, its MCP server and its
+# validation read; a host data mount (/mnt, /srv, /data, /media, /home/...) is
+# never listed.  Symlinked entries (/bin -> usr/bin) collapse onto /usr.
+SYSTEM_READ_ROOTS: tuple[str, ...] = (
+    "/usr",
+    "/etc",
+    "/proc",
+    "/dev",
+    "/sys",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/run/systemd/resolve",
+    "/run/resolvconf",
+    "/nix/store",
+)
+# The owner's explicit opt-out for a card read surface no backend can enforce.
+READ_ALLOWLIST_OPT_OUT_ENV = "AIWORKHUB_UNENFORCED_READ_ALLOWLIST_OPT_OUT"
+# worker_workspace.sandbox_argv ``--landlock-exec`` flags naming request roots,
+# the parser's other value flags, and its switches (no value).  The argv is read
+# positionally against these, so a value can never be taken for a flag.
+_LANDLOCK_EXEC_ROOT_FLAGS = frozenset(
+    {"--workspace", "--home", "--worker-temp", "--exec-scratch", "--short-tmp"}
+)
+_LANDLOCK_EXEC_VALUE_FLAGS = _LANDLOCK_EXEC_ROOT_FLAGS | frozenset(
+    {"--allow", "--cwd", "--semlock-dev-shm", "--worker-semlock-dev-shm"}
+)
+_LANDLOCK_EXEC_SWITCHES = frozenset({"--outer-validation-authority", "--noop-chmod"})
+# The git common-dir entries a linked worktree opens on every command; never
+# hooks or logs (this worktree's own gitdir is added apart).  Landlock does not
+# mediate access(2), so an unreadable ``config`` passes git's access_or_die and
+# then fails fopen with EACCES: config, info, commondir, shallow and worktrees
+# are read surface too.
+_GIT_COMMON_READ_ENTRIES: tuple[str, ...] = (
+    "objects", "refs", "packed-refs", "HEAD",
+    "config", "info", "commondir", "shallow", "worktrees",
+)
+# bubblewrap options worker_workspace.sandbox_argv can emit, by argument count;
+# any other option refuses (the argv is never guessed at).
+_BWRAP_OPTION_ARITY: dict[str, int] = {
+    **dict.fromkeys(
+        (
+            "--new-session", "--die-with-parent", "--unshare-all", "--unshare-pid",
+            "--unshare-ipc", "--unshare-uts", "--unshare-net", "--unshare-user",
+            "--unshare-cgroup", "--share-net", "--clearenv", "--as-pid-1",
+        ),
+        0,
+    ),
+    **dict.fromkeys(
+        (
+            "--chdir", "--dir", "--proc", "--dev", "--tmpfs", "--mqueue",
+            "--remount-ro", "--unsetenv", "--hostname", "--perms", "--uid", "--gid",
+            "--cap-add", "--cap-drop",
+        ),
+        1,
+    ),
+    **dict.fromkeys(
+        (
+            "--bind", "--bind-try", "--ro-bind", "--ro-bind-try", "--dev-bind",
+            "--dev-bind-try", "--symlink", "--setenv", "--chmod", "--file",
+            "--bind-data", "--ro-bind-data",
+        ),
+        2,
+    ),
+}
+# Paths the bubblewrap argv already presents (host ro-binds of /usr and /etc,
+# its own /proc and /dev, the /bin-style symlinks into /usr): an allow root
+# beneath one is never bound again, so a host /proc or /dev never replaces them.
+_BWRAP_BASE_MOUNTS: tuple[str, ...] = (
+    "/usr", "/etc", "/proc", "/dev", "/bin", "/sbin", "/lib", "/lib64",
+)
 
 
 class SandboxVisibilityError(ValueError):
@@ -614,21 +718,8 @@ def _list_dir(directory: str) -> list[os.DirEntry[str]]:
         return sorted(iterator, key=lambda entry: entry.name)
 
 
-def plan_read_layer(
-    *,
-    read_roots: Sequence[str],
-    denied: Sequence[str],
-    max_rules: int | None = None,
-) -> list[tuple[str, int]]:
-    """``(path, rights)`` path-beneath rules for the stacked read layer.
-
-    No rule grants ``READ_FILE`` on a denied file or on any directory above
-    one; see the module docstring for the split.  ``max_rules`` defaults to
-    ``MAX_LAYER_RULES``; an unlistable split directory refuses (never skips).
-    """
-    cap = MAX_LAYER_RULES if max_rules is None else max_rules
-    full = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
-    denied_set = set(denied)
+def _split_dirs(denied: Sequence[str]) -> set[str]:
+    """Every directory on the path from the filesystem root to a denied file."""
     split: set[str] = set()
     for path in denied:
         parent = os.path.dirname(path)
@@ -638,16 +729,89 @@ def plan_read_layer(
             if above == parent:
                 break
             parent = above
-    tops = sorted({_top(path) for path in denied}) or [_top(os.path.abspath(os.sep))]
-    rules: list[tuple[str, int]] = [
-        (top, LANDLOCK_ACCESS_FS_READ_DIR if denied else full) for top in tops
-    ]
+    return split
+
+
+def _allow_list_rules(
+    roots: Sequence[str],
+    split: set[str],
+    denied_set: set[str],
+    add: Callable[[str, int], None],
+) -> None:
+    """NF-2026-01004: rules granting reads beneath ``roots`` only.
+
+    A root holding no denied file gets one rule (``READ_FILE`` alone for a
+    file root: Landlock refuses ``READ_DIR`` on a non-directory).  A root
+    holding one is split from that root down: each split directory gets
+    ``READ_DIR`` and each child that is neither split nor denied nor a symlink
+    gets its whole subtree.  Nothing above a root is ever granted.
+    """
+    full = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
+    granted: set[tuple[str, int]] = set()
+    visited: set[str] = set()
+
+    def grant(path: str, rights: int) -> None:
+        if (path, rights) not in granted:
+            granted.add((path, rights))
+            add(path, rights)
+
+    for root in sorted(dict.fromkeys(os.path.realpath(r) for r in roots)):
+        if root in denied_set:
+            continue
+        if root not in split:
+            grant(root, full if os.path.isdir(root) else LANDLOCK_ACCESS_FS_READ_FILE)
+            continue
+        prefix = root.rstrip("\\/") + os.sep
+        for directory in sorted(d for d in split if d == root or d.startswith(prefix)):
+            if directory in visited:
+                continue
+            visited.add(directory)
+            grant(directory, LANDLOCK_ACCESS_FS_READ_DIR)
+            try:
+                children = _list_dir(directory)
+            except OSError as exc:
+                raise _refused("unlistable_directory", directory) from exc
+            for child in children:
+                if child.path in split or child.path in denied_set or child.is_symlink():
+                    continue
+                is_dir = child.is_dir(follow_symlinks=False)
+                grant(child.path, full if is_dir else LANDLOCK_ACCESS_FS_READ_FILE)
+
+
+def plan_read_layer(
+    *,
+    read_roots: Sequence[str],
+    denied: Sequence[str],
+    max_rules: int | None = None,
+    allow_roots: Sequence[str] | None = None,
+) -> list[tuple[str, int]]:
+    """``(path, rights)`` path-beneath rules for the stacked read layer.
+
+    No rule grants ``READ_FILE`` on a denied file or on any directory above
+    one; see the module docstring for the split.  ``max_rules`` defaults to
+    ``MAX_LAYER_RULES``; an unlistable split directory refuses (never skips).
+    ``allow_roots`` (NF-2026-01004, from :func:`read_allow_set`) selects the
+    allow-list layer: only those roots and ``read_roots`` are readable and the
+    filesystem root gets no rule; ``None`` keeps the deny-only layer.
+    """
+    cap = MAX_LAYER_RULES if max_rules is None else max_rules
+    full = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
+    denied_set = set(denied)
+    split = _split_dirs(denied)
+    rules: list[tuple[str, int]] = []
 
     def add(path: str, rights: int) -> None:
         rules.append((path, rights))
         if len(rules) > cap:
             raise _refused("rule_cap_exceeded", f">{cap}")
 
+    if allow_roots is not None:
+        _allow_list_rules([*allow_roots, *read_roots], split, denied_set, add)
+        if not rules:
+            raise SandboxVisibilityError("read_allowlist_refused:empty_allow_set")
+        return rules
+    tops = sorted({_top(path) for path in denied}) or [_top(os.path.abspath(os.sep))]
+    rules.extend((top, LANDLOCK_ACCESS_FS_READ_DIR if denied else full) for top in tops)
     for directory in sorted(split):
         try:
             children = _list_dir(directory)
@@ -885,6 +1049,320 @@ def _default_landlock_abi() -> int:
     return landlock_abi_version()
 
 
+def _within(path: str, root: str) -> bool:
+    """``path`` is ``root`` or lies beneath it (both already resolved)."""
+    key, base = os.path.normcase(path), os.path.normcase(root)
+    return key == base or key.startswith(base.rstrip("\\/") + os.sep)
+
+
+def _account_home() -> str | None:
+    home = os.path.expanduser("~")
+    return os.path.realpath(home) if os.path.isabs(home) else None
+
+
+def _landlock_exec_parts(worker_argv: Sequence[str]) -> tuple[list[str], list[str]]:
+    """``(request root values, adapter argv)`` of a ``--landlock-exec`` argv.
+
+    The flags are read positionally from index 3 to the ``--`` terminator: a
+    value flag consumes the next element, so a value is never read as a flag
+    (``--allow --home`` names no root).  Every root value must be non-empty and
+    absolute; an unknown flag or a missing value refuses.  Any other argv names
+    no request root and is its own adapter argv.
+    """
+    argv = list(worker_argv)
+    if len(argv) < 3 or argv[2] != "--landlock-exec":
+        return [], argv
+    values: list[str] = []
+    index = 3
+    while index < len(argv) and argv[index] != "--":
+        flag = argv[index]
+        if flag in _LANDLOCK_EXEC_SWITCHES:
+            index += 1
+            continue
+        if flag not in _LANDLOCK_EXEC_VALUE_FLAGS:
+            raise SandboxVisibilityError("read_allowlist_refused:landlock_argv_unrecognized", flag)
+        if index + 1 >= len(argv):
+            break
+        value = argv[index + 1]
+        if flag in _LANDLOCK_EXEC_ROOT_FLAGS:
+            if not value or not os.path.isabs(value):
+                raise SandboxVisibilityError(
+                    "read_allowlist_refused:request_root_invalid", f"{flag}={value!r}"
+                )
+            values.append(value)
+        index += 2
+    if index >= len(argv) or argv[index] != "--":
+        raise SandboxVisibilityError("read_allowlist_refused:landlock_argv_unterminated")
+    return values, argv[index + 1 :]
+
+
+def _bubblewrap_parts(
+    worker_argv: Sequence[str],
+) -> tuple[int, list[tuple[str, str, str]], list[str]]:
+    """``(terminator index, two-argument ops, adapter argv)`` of a bubblewrap argv.
+
+    Options are read positionally by :data:`_BWRAP_OPTION_ARITY`; an unknown
+    option or a missing ``--`` refuses, never guesses.
+    """
+    argv = list(worker_argv)
+    ops: list[tuple[str, str, str]] = []
+    index = 1
+    while index < len(argv) and argv[index] != "--":
+        arity = _BWRAP_OPTION_ARITY.get(argv[index])
+        if arity is None or index + arity >= len(argv):
+            raise SandboxVisibilityError(
+                "read_roots_unsupported_backend", f"bubblewrap_argv_unrecognized:{argv[index]}"
+            )
+        if arity == 2:
+            ops.append((argv[index], argv[index + 1], argv[index + 2]))
+        index += 1 + arity
+    if len(argv) < 2 or index >= len(argv):
+        raise SandboxVisibilityError(
+            "read_roots_unsupported_backend", "bubblewrap_argv_unrecognized:unterminated"
+        )
+    return index, ops, argv[index + 1 :]
+
+
+def _git_read_roots(worktree: str) -> list[str]:
+    """A linked worktree's git read surface, never the common dir whole.
+
+    The common dir's :data:`_GIT_COMMON_READ_ENTRIES` that exist (objects,
+    refs, packed-refs, HEAD, config, info, commondir, shallow, worktrees), plus
+    ``worktrees/<name>`` -- the gitdir this worktree's ``.git`` file points to
+    (it holds ``commondir``, so git still resolves).  Never ``hooks``, ``logs``
+    or the checkout.  A ``.git`` directory lies inside the worktree (already
+    granted).
+    """
+    marker = os.path.join(worktree, ".git")
+    if not os.path.lexists(marker) or (os.path.isdir(marker) and not os.path.islink(marker)):
+        return []
+    from .worker_workspace import WorkspaceError, _common_git_dir, _gitdir_pointer
+
+    try:
+        common = os.path.realpath(_common_git_dir(Path(worktree)))
+        gitdir = os.path.realpath(_gitdir_pointer(Path(marker), label="repository_git_marker"))
+    except (WorkspaceError, OSError) as exc:
+        raise SandboxVisibilityError("read_allowlist_refused:git_dir_unavailable", exc) from exc
+    roots = [
+        os.path.join(common, entry)
+        for entry in _GIT_COMMON_READ_ENTRIES
+        if os.path.lexists(os.path.join(common, entry))
+    ]
+    if os.path.normcase(gitdir) == os.path.normcase(common):
+        return roots
+    if os.path.normcase(os.path.dirname(gitdir)) != os.path.normcase(
+        os.path.join(common, "worktrees")
+    ):
+        raise SandboxVisibilityError("read_allowlist_refused:git_dir_unexpected", gitdir)
+    return [*roots, gitdir]
+
+
+def _toolchain_roots(adapter_argv: Sequence[str], *, path: str | None = None) -> list[str]:
+    """Exact install roots: python prefixes, this package, the adapter's node root.
+
+    The package directory follows its import root so a dropped import root
+    (a flat layout whose parent is the repository) still leaves it readable.
+    A PATH-relative adapter resolves with :func:`shutil.which` against ``path``
+    (the launch env's ``PATH``), else ``os.environ``'s; unresolved it refuses
+    with ``read_allowlist_refused:adapter_unresolved``, never granting nothing.
+    """
+    package = os.path.dirname(os.path.realpath(__file__))
+    roots = [
+        sys.prefix,
+        sys.base_prefix,
+        sys.exec_prefix,
+        getattr(sys, "base_exec_prefix", sys.base_prefix),
+        os.path.dirname(os.path.realpath(sys.executable)),
+        os.path.dirname(package),
+        package,
+    ]
+    if not adapter_argv:
+        return roots
+    executable = adapter_argv[0]
+    if not os.path.isabs(executable):
+        search = path if path is not None else os.environ.get("PATH", os.defpath)
+        found = shutil.which(executable, path=search) if executable else None
+        if found is None:
+            raise SandboxVisibilityError(
+                "read_allowlist_refused:adapter_unresolved", executable or "<empty>"
+            )
+        executable = os.path.abspath(found)
+    from .worker_workspace import _node_install_root
+
+    node_root = _node_install_root(executable)
+    roots.append(
+        os.fspath(node_root) if node_root is not None else os.path.realpath(executable)
+    )
+    return roots
+
+
+def _guarded(roots: Iterable[str], anchors: Sequence[str]) -> tuple[list[str], list[str]]:
+    """``(kept, dropped)``: a root that is the filesystem root or an ancestor of
+    (or equal to) an anchor is dropped, never widened; a missing one is skipped."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    for raw in roots:
+        real = os.path.realpath(raw)
+        if not os.path.exists(real):
+            continue
+        if os.path.dirname(real) == real or any(_within(anchor, real) for anchor in anchors):
+            dropped.append(real)
+        else:
+            kept.append(real)
+    return kept, dropped
+
+
+def _outermost(paths: Iterable[str]) -> list[str]:
+    ordered = sorted(dict.fromkeys(paths), key=lambda path: (len(path), path))
+    kept: list[str] = []
+    for path in ordered:
+        if not any(os.path.isdir(root) and _within(path, root) for root in kept):
+            kept.append(path)
+    return sorted(kept)
+
+
+def read_allow_set(
+    *,
+    worktree: str | os.PathLike[str],
+    repo: str | os.PathLike[str],
+    read_roots: Sequence[str],
+    worker_argv: Sequence[str],
+    backend: str = "landlock",
+    launch_path: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """``(allow roots, dropped roots)`` of the NF-2026-01004 read allow-list.
+
+    Computed in the supervisor at plan time: Landlock writes it into the plan
+    (the child never derives it), bubblewrap turns it into ``--ro-bind``s.  The
+    worktree and the card read roots are kept as declared; every derived root
+    (system, toolchain, the request roots the ``--landlock-exec`` argv names,
+    the git read surface) passes the anchor drop against the account home, the
+    repository and the worktree.  ``launch_path`` is the launch env's ``PATH``
+    a PATH-relative adapter resolves against.
+    """
+    real_worktree = os.path.realpath(os.fspath(worktree))
+    anchors = [
+        anchor
+        for anchor in (_account_home(), os.path.realpath(os.fspath(repo)), real_worktree)
+        if anchor
+    ]
+    explicit = [real_worktree, *(os.path.realpath(root) for root in read_roots)]
+    if backend == "bubblewrap":
+        # Only the card's read roots: the system, toolchain, git and package
+        # roots are Landlock-only needs; the base bwrap argv already presents
+        # /usr, /etc, /proc and /dev, and its own binds carry the rest.
+        _bubblewrap_parts(worker_argv)
+        return _outermost(explicit), []
+    request_values, adapter_argv = _landlock_exec_parts(worker_argv)
+    request = [v for v in request_values if os.path.realpath(v) != real_worktree]
+    kept, dropped = _guarded(
+        [
+            *SYSTEM_READ_ROOTS,
+            *_toolchain_roots(adapter_argv, path=launch_path),
+            *request,
+            *_git_read_roots(real_worktree),
+        ],
+        anchors,
+    )
+    return _outermost([*explicit, *kept]), sorted(set(dropped))
+
+
+def bubblewrap_read_binds(allow: Sequence[str], *, worktree: str | os.PathLike[str]) -> list[str]:
+    """The card read roots bubblewrap binds read-only at their own path.
+
+    ``allow`` is the bubblewrap :func:`read_allow_set` (the worktree plus the
+    card ``read_roots``, never a system, toolchain or git root); every root
+    except the worktree (already bound at the sandbox workspace) and roots
+    beneath :data:`_BWRAP_BASE_MOUNTS` (the argv already presents those).
+    Never the filesystem root.
+    """
+    real_worktree = os.path.realpath(os.fspath(worktree))
+    return [
+        root
+        for root in allow
+        if os.path.dirname(root) != root
+        and os.path.normcase(root) != os.path.normcase(real_worktree)
+        and not any(_within(root, base) for base in _BWRAP_BASE_MOUNTS)
+    ]
+
+
+def _bwrap_base_op(option: str, values: Sequence[str]) -> bool:
+    """Whether a bubblewrap op is one of the base mounts the read binds follow:
+    the ``/usr``-style ro-binds and symlinks, ``--proc``, ``--dev`` and the
+    fresh ``--tmpfs /tmp`` (a card root under ``/tmp`` must sit above it)."""
+    if option in {"--proc", "--dev"}:
+        return True
+    if option == "--tmpfs":
+        return values[0] == "/tmp"
+    if option in {"--ro-bind", "--ro-bind-try", "--symlink"}:
+        return values[-1] in _BWRAP_BASE_MOUNTS
+    return False
+
+
+def bubblewrap_read_argv(
+    worker_argv: Sequence[str], allow: Sequence[str], *, worktree: str | os.PathLike[str]
+) -> list[str]:
+    """``worker_argv`` with ``--ro-bind <root> <root>`` per card read root.
+
+    Nothing broader is bound.  The binds are inserted right after the base
+    mounts (:func:`_bwrap_base_op`) and before the first original worktree,
+    write or protective op, so every original op keeps its relative order and
+    its precedence: a write bind beneath a read root, or the nested
+    ``--ro-bind <worktree>/.git``, still mounts over the read bind.
+    """
+    argv = list(worker_argv)
+    end, _ops, _adapter = _bubblewrap_parts(argv)
+    binds = bubblewrap_read_binds(allow, worktree=worktree)
+    insert_at = end
+    index = 1
+    while index < end:
+        option = argv[index]
+        arity = _BWRAP_OPTION_ARITY[option]
+        if arity and not _bwrap_base_op(option, argv[index + 1 : index + 1 + arity]):
+            insert_at = index
+            break
+        index += 1 + arity
+    added = [value for root in binds for value in ("--ro-bind", root, root)]
+    return [*argv[:insert_at], *added, *argv[insert_at:]]
+
+
+def check_read_allowlist(
+    backend: str,
+    *,
+    read_roots: Sequence[str],
+    deny_read: Sequence[str],
+    landlock_abi: Callable[[], int] = _default_landlock_abi,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Launch gate: ``not_declared`` | ``enforced`` | ``owner_opt_out``.
+
+    Bubblewrap enforces ``read_roots`` (each allow root ``--ro-bind``, nothing
+    broader) but can never hide a file inside a bound root, so it also
+    declaring ``deny_read`` is refused.  Every other :func:`check_backend`
+    refusal becomes ``read_allowlist_unenforceable:<cause>:owner_opt_out=<env>=1``
+    unless the owner set ``READ_ALLOWLIST_OPT_OUT_ENV=1``.
+    """
+    if not read_roots and not deny_read:
+        return "not_declared"
+    try:
+        if backend == "bubblewrap" and read_roots:
+            if not deny_read:
+                return "enforced"
+            raise SandboxVisibilityError("deny_read_unsupported_backend", backend)
+        check_backend(
+            backend, read_roots=read_roots, deny_read=deny_read, landlock_abi=landlock_abi
+        )
+    except SandboxVisibilityError as exc:
+        env = os.environ if environ is None else environ
+        if str(env.get(READ_ALLOWLIST_OPT_OUT_ENV, "")).strip() == "1":
+            return "owner_opt_out"
+        raise SandboxVisibilityError(
+            "read_allowlist_unenforceable",
+            f"{exc}:owner_opt_out={READ_ALLOWLIST_OPT_OUT_ENV}=1",
+        ) from exc
+    return "enforced"
+
+
 def _link_receipt(unreachable: Sequence[str]) -> dict[str, Any]:
     """Receipt fields for directory links whose target no backend grant reaches."""
     return {
@@ -930,12 +1408,20 @@ def prepare_launch_visibility(
     worker_argv: Sequence[str],
     write_plan: Callable[[Any, Mapping[str, Any]], Any],
     workspace_prepare: Mapping[str, Any] | None = None,
+    read_allowlist_opt_out: bool = False,
+    launch_path: str | None = None,
 ) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
     """``(worker_argv, sandbox_visibility receipt, supervisor spec fields)``.
 
     The spec fields are empty except on AppContainer with denied files, where
     they carry ``deny_read_paths`` (resolved, each inside the worktree) and
     ``deny_read_roots`` (``[worktree]``, re-checked before an ACE is written).
+    ``read_allowlist_opt_out`` is honoured only while :func:`check_backend`
+    still refuses this backend (the owner opt-out of
+    :func:`check_read_allowlist`); an enforcing backend ignores it.  Bubblewrap
+    with ``read_roots`` binds only the card read roots read-only
+    (:func:`bubblewrap_read_argv`); its ``deny_read`` launches only under the
+    opt-out, recorded unenforced.  ``launch_path`` is the launch env's ``PATH``.
     """
     receipt: dict[str, Any] = {
         "schema_id": VISIBILITY_SCHEMA_ID,
@@ -953,13 +1439,69 @@ def prepare_launch_visibility(
     }
     if not read_roots and not deny_read:
         return list(worker_argv), receipt, {}
-    if backend == "landlock":
-        # The read layer leaves every path outside a split readable, so no
-        # outside link target is unreachable here (granted=None).
-        denied, unreachable = scan_deny_read(
-            [worktree, repo, *read_roots], deny_read, granted=None
+    if backend == "bubblewrap" and read_roots:
+        # NF-2026-01004: each allow root read-only at its own path, nothing broader.
+        if deny_read and not read_allowlist_opt_out:
+            raise SandboxVisibilityError("deny_read_unsupported_backend", backend)
+        allow, dropped = read_allow_set(
+            worktree=worktree,
+            repo=repo,
+            read_roots=read_roots,
+            worker_argv=worker_argv,
+            backend=backend,
+            launch_path=launch_path,
         )
-        rules = plan_read_layer(read_roots=read_roots, denied=denied)
+        argv = bubblewrap_read_argv(worker_argv, allow, worktree=worktree)
+        receipt.update(
+            read_roots_enforcement="bubblewrap_ro_bind",
+            deny_read_enforcement="owner_opt_out_unenforced" if deny_read else "none",
+            read_allowlist="bubblewrap_ro_bind",
+            read_allowlist_root_count=len(allow),
+            read_allowlist_dropped=[path[:_ECHO_CHARS] for path in dropped[:16]],
+        )
+        return argv, receipt, {}
+    if read_allowlist_opt_out:
+        try:
+            check_backend(
+                backend,
+                read_roots=read_roots,
+                deny_read=deny_read,
+                landlock_abi=_default_landlock_abi,
+            )
+        except SandboxVisibilityError:
+            unenforced = "owner_opt_out_unenforced"
+            receipt.update(
+                read_roots_enforcement=unenforced if read_roots else "none",
+                deny_read_enforcement=unenforced if deny_read else "none",
+                read_allowlist=unenforced,
+            )
+            return list(worker_argv), receipt, {}
+    if backend == "landlock":
+        allow: list[str] | None = None
+        if read_roots:
+            # NF-2026-01004: an allow-list layer; only the plan's roots are readable.
+            allow, dropped = read_allow_set(
+                worktree=worktree,
+                repo=repo,
+                read_roots=read_roots,
+                worker_argv=worker_argv,
+                launch_path=launch_path,
+            )
+            denied, unreachable = scan_deny_read(
+                [worktree, *read_roots], deny_read, granted=allow
+            )
+            receipt.update(
+                read_allowlist="landlock_allow_list",
+                read_allowlist_root_count=len(allow),
+                read_allowlist_dropped=[path[:_ECHO_CHARS] for path in dropped[:16]],
+            )
+        else:
+            # deny_read only: the layer leaves every path outside a split
+            # readable, so no outside link target is unreachable (granted=None).
+            denied, unreachable = scan_deny_read(
+                [worktree, repo, *read_roots], deny_read, granted=None
+            )
+        rules = plan_read_layer(read_roots=read_roots, denied=denied, allow_roots=allow)
         write_plan(Path(plan_path), plan_document(rules))
         receipt.update(
             read_roots_enforcement="landlock_read_layer" if read_roots else "none",

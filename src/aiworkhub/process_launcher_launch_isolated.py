@@ -560,11 +560,13 @@ def launch_isolated(
                 ) from exc
         sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
         # NF-2026-02238: read_roots on Landlock too, and enforced deny_read.
+        # NF-2026-01004: a read surface no backend enforces is refused as
+        # read_allowlist_unenforceable unless the owner opted out.
         from . import linux_read_roots, workspace_prepare
 
         try:
             deny_read = linux_read_roots.validate_deny_read(card.get("deny_read"))
-            linux_read_roots.check_backend(
+            read_allowlist = linux_read_roots.check_read_allowlist(
                 sandbox_backend, read_roots=read_roots, deny_read=deny_read
             )
         except ValueError as exc:
@@ -1171,6 +1173,9 @@ def launch_isolated(
                         worker_argv=worker_argv,
                         write_plan=write_json_0600,
                         workspace_prepare=prepare_receipt,
+                        read_allowlist_opt_out=read_allowlist == "owner_opt_out",
+                        # NF-2026-01004: a PATH-relative adapter resolves here.
+                        launch_path=launch_env.get("PATH"),
                     )
                 )
             except ValueError as exc:
