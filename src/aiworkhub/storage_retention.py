@@ -379,6 +379,11 @@ def _protected_attempt_ids(
     return protected, True, pinned_by, terminal_tasks, unfinished_cards
 
 
+def _is_combined_validation_id(worktree_id: str) -> bool:
+    """True for any combined-validation union name, live or not (by prefix)."""
+    return worktree_id.startswith(("union2_", "union_"))
+
+
 def _is_live_combined_validation(
     worktree_id: str, protected_ids: Mapping[str, str]
 ) -> bool:
@@ -1658,12 +1663,15 @@ def quarantine(
         else (set(), False)
     )
     if any(
-        item.get("ownership_source") == "request_ledger" for item in manifest["items"]
+        item.get("ownership_source") == "request_ledger"
+        or _is_combined_validation_id(str(item.get("id") or ""))
+        for item in manifest["items"]
     ):
-        _protected, task_lineage_verified, _pinned, terminal_tasks, unfinished_cards = (
+        fresh_protected, task_lineage_verified, _pinned, terminal_tasks, unfinished_cards = (
             _protected_attempt_ids(root)
         )
     else:
+        fresh_protected = {}
         task_lineage_verified, terminal_tasks, unfinished_cards = False, set(), set()
     for item in manifest["items"]:
         item_id = item["id"]
@@ -1693,6 +1701,19 @@ def quarantine(
         # the move asks the same predicate the preview used, against fresh lineage.
         if _is_unfinished_card_attempt(item, unfinished_cards):
             item["state"] = "skipped_card_unfinished"
+            _atomic_json(manifest_path, manifest)
+            continue
+        # A combined-validation union is owned by ANOTHER process (the
+        # acceptance validator) and is named by no ledger row of its own. Its
+        # source attempt may have re-entered review since the digest snapshot,
+        # so the move re-asks the live-union predicate against fresh lineage;
+        # when lineage cannot be read, a union is never moved (fail closed).
+        if _is_combined_validation_id(item_id) and (
+            not task_lineage_verified
+            or item_id in fresh_protected
+            or _is_live_combined_validation(item_id, fresh_protected)
+        ):
+            item["state"] = "skipped_live_combined_validation"
             _atomic_json(manifest_path, manifest)
             continue
         # A candidate need not be CLASS_REMOVABLE_SAFE: plan_worktree_reclaim()
