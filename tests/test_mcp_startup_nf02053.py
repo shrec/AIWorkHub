@@ -29,7 +29,10 @@ if str(SRC_ROOT) not in sys.path:
 # 2026-11-27: 61 -- NF-2026-00965 makes initialize execute
 # aiworkhub.stdio_fastmcp, the single owner of the protocol-version vocabulary
 # (its own imports were already in the set), so the ceiling grows by exactly one.
-STARTUP_AIWORKHUB_MODULE_CEILING = 61
+# Measured 2026-11-27 again: 62 -- NF-2026-00973 routes every stdio request
+# through aiworkhub.mcp_stateless (the 2026-07-28 dispatcher; its imports were
+# already in the set), so the ceiling grows by exactly one more.
+STARTUP_AIWORKHUB_MODULE_CEILING = 62
 CHILD_TIMEOUT_SECONDS = 600
 _PREFIX = "NF02053_PAYLOAD="
 
