@@ -177,12 +177,13 @@ inherit the manager's launch capability.
 - **semantic-edit-historical-cap-boundary**: historical capped a/b observation at 20k/200k ops shows a 29.329% reduction; this is a capped historical sample, not eligible as a live guarantee.
 - **context-bundle-v2-structural-only**: structural-only validation; live fleet remeasurement pending.
 
-## What's new in 0.13.15
+## What's new in 0.13.16
 
-- Linux: the callback-watcher command names the exact interpreter and `PYTHONPATH`, so it starts where the bundled runtime is not importable from the system Python.
-- The process-event ledger stops re-writing unchanged status rows and compacts old duplicate history (2.3 GB measured on a long-running host).
-- Accept: a red finalization neighbour test stops the card before review and names the failed tests; `accept_preview` reports a queued auto-review; the callback digest carries real finding counts.
-- Reject lessons reach AI Memory; worker `bodygrep` sees live-overlay files under a directory target.
+- NeedFix and Roadmap MCP tools now carry the `aiworkhub_` prefix (`aiworkhub_needfix_list`, ...); the old names stay callable as deprecated aliases until 0.14.0.
+- MCP stdio negotiates `protocolVersion` (up to `2025-11-25`); `tools/list` is sorted by name and carries cache hints and tool annotations on both stdio paths.
+- MCP `2026-07-28` (stateless) on both stdio servers: `server/discover`, a per-request protocol version instead of `initialize`, and the Tasks extension, so a worker launch is an MCP task that clients poll with `tasks/get` and stop with `tasks/cancel`; older clients keep the `initialize` path unchanged.
+- Process-event ledger lookups read a per-archive key index instead of scanning the whole rotated history (2.4 GB streamed continuously by the dashboard server before).
+- The quality gate fills `vscode-extension/` into sparse validation trees, so extension cards run `extension-regression`.
 - The full release history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation

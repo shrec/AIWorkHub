@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.13.16 — 2026-11-27
+
+### Fixed
+
+- Bundles runtime 0.13.16: NeedFix and Roadmap MCP tools are registered under `aiworkhub_`-prefixed names (old names stay callable as deprecated aliases until 0.14.0); both stdio servers negotiate the MCP `protocolVersion` up to `2025-11-25` and list tools sorted with cache hints and annotations; single-key process-ledger lookups read a per-archive key index instead of scanning the whole rotated history (the dashboard server had streamed 2.4 GB at about 1.2 cores); the quality gate fills `vscode-extension/` into sparse validation trees, so `extension-regression` runs on extension cards.
+- Bundles runtime 0.13.16 MCP `2026-07-28` support: both stdio servers answer stateless requests (`server/discover`, per-request protocol version, `resultType`), and with the Tasks extension a worker launch is an MCP task that clients poll with `tasks/get` and stop with `tasks/cancel`; `initialize`-era clients are unchanged.
+
 ## 0.13.15 — 2026-11-26
 
 ### Fixed
