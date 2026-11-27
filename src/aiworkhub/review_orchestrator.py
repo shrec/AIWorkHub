@@ -389,6 +389,76 @@ def _review_route_refusal(
     return ""
 
 
+WORKFORCE_ROUTE_ABSENT_PREFIX = "workforce_route_absent"
+
+
+def fold_reviewer_runner(runner: str) -> tuple[str, str]:
+    """``(canonical_runner, refusal)`` for one reviewer route's runner.
+
+    NF-2026-01009: a reviewer was auto-launched as ``claude_opus-5`` on a host
+    whose workforce spells that runner differently (or lacks it), and failed
+    only after it started. Every candidate runner is folded through the ONE
+    canonical runner fold (``runner_topic_policy.canonical_runner_id``) onto
+    the runner ids this host's launcher owns workforce rows for, so a variant
+    spelling becomes the launchable id byte-for-byte. A claude-family runner
+    that folds onto no row is exactly what the launcher refuses with
+    ``workforce_route_absent`` for a pinned model, so it is refused HERE,
+    typed, instead. Other runner families keep the launcher's own
+    adapter-level handling, as do adapter-named generic runners.
+    """
+    from . import process_launcher  # local import: process_launcher imports this module
+    from . import runner_topic_policy
+
+    rows = process_launcher._CANONICAL_WORKFORCE
+    owners = tuple(dict.fromkeys(owner for owner, _adapter in rows))
+    canonical = runner_topic_policy.canonical_runner_id(runner, owners)
+    if canonical is not None:
+        return canonical, ""
+    adapters = {adapter for _owner, adapter in rows}
+    if runner.startswith("claude_") and runner not in adapters:
+        return runner, f"{WORKFORCE_ROUTE_ABSENT_PREFIX}:runner={runner}"
+    return runner, ""
+
+
+BLIND_CARD_SKIP_REASON = "reviewer_skipped:blind_card"
+_BLIND_CARD_MARKERS = frozenset({"blind", "annotation"})
+# A marker value may name its shard but nothing else: ``blind_spots`` or
+# ``type_annotations`` describe code work and never mark a card blind.
+_BLIND_CARD_VALUE_TOKENS = _BLIND_CARD_MARKERS | {"shard"}
+_CARD_MARKER_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def _card_marker_tokens(value: Any) -> set[str]:
+    """Blind markers carried by values made ONLY of blind/annotation/shard tokens."""
+    values = [value] if isinstance(value, str) else (
+        list(value) if isinstance(value, (list, tuple, set, frozenset)) else []
+    )
+    tokens: set[str] = set()
+    for item in values[:64]:
+        if not isinstance(item, str):
+            continue
+        parts = {t for t in _CARD_MARKER_SPLIT.split(item.lower()[:200]) if t}
+        if parts <= _BLIND_CARD_VALUE_TOKENS:
+            tokens |= parts & _BLIND_CARD_MARKERS
+    return tokens
+
+
+def reviewer_blind_card_reason(card: Any) -> str:
+    """``BLIND_CARD_SKIP_REASON`` when no reviewer may read this card, else ``""``.
+
+    NF-2026-01009: a blind / annotation shard carries no code to review, and a
+    reviewer reading it breaks the blind. The card's ``work_kind`` (or
+    ``work_kinds``) and ``tags`` decide it: a value made only of the tokens
+    ``blind`` / ``annotation`` (optionally ``shard``) marks the card.
+    """
+    if not isinstance(card, Mapping):
+        return ""
+    tokens: set[str] = set()
+    for key in ("work_kind", "work_kinds", "tags"):
+        tokens |= _card_marker_tokens(card.get(key))
+    return BLIND_CARD_SKIP_REASON if tokens & _BLIND_CARD_MARKERS else ""
+
+
 def select_reviewer_route(
     repo: Path,
     reviewer_task_id: str,
@@ -462,10 +532,18 @@ def select_reviewer_route(
             "adapter_id": str(candidate.get("adapter_id") or ""),
             "model": str(candidate.get("model") or ""),
         }
+        # NF-2026-01009: fold the runner onto this host's one launchable
+        # spelling BEFORE identity/dedupe and the hard filters, so a variant
+        # spelling is never returned and an unroutable one is refused typed.
+        folded, absent = fold_reviewer_runner(route["runner"]) if route["runner"] else ("", "")
+        if folded:
+            route["runner"] = folded
         identity = _review_route_identity(route)
         if not all(identity) or identity in seen:
             return None
         seen.add(identity)
+        if absent:
+            return route, absent
         return route, _review_route_refusal(
             repo, route, identity, model_policy, excluded_routes, excluded_adapters,
         )
@@ -2916,6 +2994,12 @@ def recover_review_ready_targets(
         request_id = _card_request_id(card)
         if request_id:
             examined, examined_pos = request_id, origin
+        # NF-2026-01009: a blind / annotation shard is never seeded a reviewer.
+        blind = reviewer_blind_card_reason(card)
+        if blind:
+            skipped += 1
+            _recovery_reason(reasons, blind)
+            continue
         if not request_id:
             skipped += 1
             _recovery_reason(reasons, "missing_registration")
@@ -6224,6 +6308,11 @@ class ReviewOrchestrator:
         if not _target_status_review_ready(status):
             state = str(status.get("state") or "") if isinstance(status, Mapping) else ""
             return "target_not_review_ready:" + (state[:40] or "unknown")
+        # NF-2026-01009: a blind / annotation shard has no code to review and a
+        # reviewer reading it breaks the blind -- no automatic reviewer starts.
+        blind = reviewer_blind_card_reason(status.get("task_card"))
+        if blind:
+            return blind
         resolved = resolve_target_identity(status)
         if resolved["conflict"]:
             return "target_identity_conflict:" + str(resolved["conflict"])[:80]
