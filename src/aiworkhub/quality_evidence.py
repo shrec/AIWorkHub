@@ -186,6 +186,13 @@ _SOURCE_CODE_SUFFIXES = frozenset({
     ".java", ".js", ".jsx", ".kt", ".mjs", ".php", ".ps1", ".py", ".pyi",
     ".rb", ".rs", ".sh", ".swift", ".ts", ".tsx", ".zsh",
 })
+# Basename-stem words that mark a "token" file as a model-usage meter, not an
+# auth token. Only the basename is consulted (see derive_risk_signals): a
+# directory such as accounting/ or telemetry/ never excludes an auth token file.
+_TOKEN_USAGE_METER_WORDS = frozenset({
+    "usage", "meter", "meters", "metering", "count", "counter", "counters",
+    "counts", "budget", "budgets",
+})
 
 
 def normalize_behavioral_contract(
@@ -596,7 +603,22 @@ def derive_risk_signals(
         signals.add("concurrency")
     if path_has("migration", "schema", "sqlite", "database", "task_store.py", "storage.py"):
         signals.add("schema_migration")
-    if path_has("security", "crypto", "secret", "token", "credential", "auth", "sandbox", "permission"):
+    def is_token_usage_meter(path: str) -> bool:
+        # NF-2026-00601: only the BASENAME stem decides the meter exemption, so
+        # accounting/api_token.py or telemetry/refresh_token.py stay flagged.
+        stem = path.rsplit("/", 1)[-1].split(".", 1)[0]
+        words = [word for word in re.split(r"[^a-z0-9]+", stem) if word]
+        return any(word.startswith("token") for word in words) and bool(
+            _TOKEN_USAGE_METER_WORDS.intersection(words)
+        )
+
+    if path_has("security", "crypto", "secret", "credential", "auth", "sandbox", "permission") or any(
+        # NF-2026-00601: plain substring "token" (fails closed on fused names such
+        # as apitoken.py / accesstoken.ts / csrftoken.py); the only exemption is
+        # a basename that names a model-token usage meter (token_usage.py).
+        "token" in path and not is_token_usage_meter(path)
+        for path in production
+    ):
         signals.add("security_sensitive")
     if path_has("pyproject.toml", "package.json", "/release", ".github/workflows/"):
         signals.add("release")
@@ -1169,6 +1191,30 @@ def _check_payload(check: EvidenceCheck | Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+# NF-2026-00663: the second (launcher-receipt) finding normaliser derives every
+# key it emits from the reviewer boundary's own finding-key constants instead of
+# a hand-maintained vocabulary, so a key added there cannot be silently dropped
+# here (the root of NF-2026-00600). Keys this normaliser sets explicitly:
+_REVIEWER_FINDING_EXPLICIT_KEYS = frozenset(
+    {"id", "severity", "disposition", "actionable", "category", "summary", "evidence"}
+)
+# Free-text fields carried through verbatim when present.
+_REVIEWER_FINDING_STRUCTURED_TEXT_FIELDS = tuple(
+    sorted(
+        quality_reviewer.QUALITY_REVIEW_FINDING_REQUIRED_KEYS
+        - _REVIEWER_FINDING_EXPLICIT_KEYS
+    )
+)
+# Optional over-build remedy fields (evidence_reference is a mapping, handled apart).
+_REVIEWER_FINDING_REMEDY_FIELDS = tuple(
+    sorted(
+        quality_reviewer.QUALITY_REVIEW_FINDING_KEYS
+        - quality_reviewer.QUALITY_REVIEW_FINDING_REQUIRED_KEYS
+        - {"evidence_reference"}
+    )
+)
+
+
 def normalize_reviewer_reports(
     reports: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -1282,14 +1328,7 @@ def normalize_reviewer_reports(
                 malformed = True
                 continue
             normalized_finding["category"] = category
-            structured_text = (
-                "confidence",
-                "evidence_level",
-                "symbol",
-                "claim",
-                "reproduction",
-                "required_validation",
-            )
+            structured_text = _REVIEWER_FINDING_STRUCTURED_TEXT_FIELDS
             invalid_structured = False
             for field_name in structured_text:
                 if field_name not in finding:
@@ -1328,7 +1367,7 @@ def normalize_reviewer_reports(
             # enforced upstream at the reviewer boundary, so this boundary keeps
             # the accepted remedy verbatim without re-deriving diff scope.
             invalid_remedy = False
-            for remedy_field in ("replacement", "removable_surface"):
+            for remedy_field in _REVIEWER_FINDING_REMEDY_FIELDS:
                 if remedy_field not in finding:
                     continue
                 remedy_value = finding.get(remedy_field)
@@ -1992,15 +2031,20 @@ def fold_quality_verdict(
         lens_rows[lens]["independence"] = rung_record
 
     combined_rows: list[dict[str, Any]] = []
+    # NF-2026-00598: a blocking combined-tree check (declared invariants among
+    # them) must carry its own diagnostics into the verdict, not only its id,
+    # so an acceptance refusal names what failed and why.
+    combined_failures: list[dict[str, Any]] = []
+    combined_raw = list(combined_tree_checks)
     try:
-        combined_rows = [_check_payload(check) for check in combined_tree_checks]
+        combined_rows = [_check_payload(check) for check in combined_raw]
     except MalformedConfigError as exc:
         blockers.append("combined_tree_schema:" + str(exc)[:300])
     if profile.get("combined_tree_required"):
         if not combined_rows:
             blockers.append("combined_tree_evidence_missing")
         else:
-            for row in combined_rows:
+            for raw_check, row in zip(combined_raw, combined_rows):
                 if row["status"] == STATUS_PASSED:
                     continue
                 if row["status"] == STATUS_SKIPPED and _combined_tree_skip_exempt(
@@ -2009,6 +2053,18 @@ def fold_quality_verdict(
                 ):
                     continue
                 blockers.append(f"combined_tree:{row['check_id']}")
+                raw_error = (
+                    raw_check.error
+                    if isinstance(raw_check, EvidenceCheck)
+                    else raw_check.get("error")
+                )
+                combined_failures.append({
+                    "check_id": row["check_id"],
+                    "kind": row["kind"],
+                    "status": row["status"],
+                    "summary": str(row.get("summary") or ""),
+                    "error": str(raw_error or "")[:MAX_SUMMARY_CHARS],
+                })
 
     if profile.get("explicit_human_approval_required") and not human_approval:
         blockers.append("explicit_human_approval_missing")
@@ -2025,6 +2081,7 @@ def fold_quality_verdict(
         "mechanical_checks": normalized_checks,
         "reviewer_reports": normalized_reports,
         "combined_tree_checks": combined_rows,
+        "combined_tree_failures": combined_failures,
         "blocking_evidence": unique_blockers,
         "refine_required": bool(refine_required),
         # The achieved independence rung per required lens, so an accepted card
@@ -3873,6 +3930,9 @@ def run_completion_quality_gate(
         "config_error": config_error,
         "optional_gates": optional,
         "risk_profile": risk_profile,
+        # NF-2026-00468: when the recomputed tier exceeds the requested one,
+        # name the escalating signals and the paths they were derived from.
+        "risk_escalation": risk_escalation_provenance(risk_profile, affected),
         # Surfaced on the gate, not only buried in the verdict, because the
         # accept path acts on it: this is the record that says a blind lens
         # is owed one more read of its own sealed packet.
@@ -3891,6 +3951,43 @@ def run_completion_quality_gate(
             if config_status["status"] == "configured"
             and any(check.status != STATUS_SKIPPED for check in declared)
             else "builtin_and_task_contract_only"
+        ),
+    }
+
+
+def risk_escalation_provenance(
+    risk_profile: Mapping[str, Any],
+    changed_paths: Iterable[str],
+) -> dict[str, Any]:
+    """Name WHY a profile's effective tier exceeds its requested tier.
+
+    NF-2026-00468: accept_review re-derives the profile from the promoted
+    delta, and a sealed low-tier candidate could come back high with no record
+    of which observed signal floored it or which paths it was observed on. The
+    record names every signal whose floor lies above the requested tier, with
+    that floor, plus the bounded changed-path set the signals were derived from.
+    An unknown or missing tier is never reported as an escalation.
+    """
+
+    requested = str(risk_profile.get("requested_tier") or "")
+    effective = str(risk_profile.get("effective_tier") or "")
+    known = requested in _RISK_RANK and effective in _RISK_RANK
+    escalated = known and _RISK_RANK[effective] > _RISK_RANK[requested]
+    escalating: dict[str, str] = {}
+    if escalated:
+        for signal in risk_profile.get("signals") or ():
+            floor = _RISK_SIGNAL_FLOORS.get(str(signal))
+            if floor is not None and _RISK_RANK[floor] > _RISK_RANK[requested]:
+                escalating[str(signal)] = floor
+    return {
+        "escalated": bool(escalated),
+        "requested_tier": requested,
+        "effective_tier": effective,
+        "escalating_signals": dict(sorted(escalating.items())),
+        "changed_paths": (
+            sorted(dict.fromkeys(str(p) for p in changed_paths))[:MAX_AFFECTED_PATHS]
+            if escalated
+            else []
         ),
     }
 
@@ -3976,6 +4073,7 @@ def review_ready_risk_observation(
         "explicit_human_approval_required": bool(
             profile["explicit_human_approval_required"]
         ),
+        "risk_escalation": risk_escalation_provenance(profile, paths),
     })
     return observation
 
