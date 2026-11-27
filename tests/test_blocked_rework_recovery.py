@@ -1988,15 +1988,17 @@ def test_validation_replay_binds_exact_reviewer_transport_event(
     finally:
         conn.close()
 
-    original_read_bytes = Path.read_bytes
+    # The retained candidate is hashed through one no-follow descriptor open
+    # (_replay_candidate_sha256), so the read failure is injected there.
+    original_os_open = os.open
 
-    def fail_candidate_read(path: Path) -> bytes:
-        if path == candidate:
+    def fail_candidate_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if os.fspath(path) == os.fspath(candidate):
             raise OSError("candidate became unreadable")
-        return original_read_bytes(path)
+        return original_os_open(path, flags, *args, **kwargs)
 
     with monkeypatch.context() as context:
-        context.setattr(Path, "read_bytes", fail_candidate_read)
+        context.setattr(task_store.os, "open", fail_candidate_open)
         assert task_store.recover_blocked_rework(
             repo,
             task_id,

@@ -6962,6 +6962,69 @@ def _replay_path_has_symlink_parent(
     )
 
 
+# NF-2026-00943: a retained candidate is hashed under the DB writer lease, so
+# its read is bounded; anything larger is refused, never partially trusted.
+REPLAY_CANDIDATE_MAX_BYTES = 256 * 1024 * 1024
+_REPLAY_CANDIDATE_CHUNK_BYTES = 1024 * 1024
+
+
+def _replay_candidate_sha256(
+    candidate: Path, *, max_bytes: int = REPLAY_CANDIDATE_MAX_BYTES
+) -> tuple[str | None, str]:
+    """Hash a retained replay candidate through ONE no-follow open.
+
+    Returns ``(sha256_hex, "")`` or ``(None, reason)`` where ``reason`` is
+    ``read_failed``, ``not_regular_file`` (link, non-regular, multi-linked or
+    swapped between the lstat and the open) or ``bytes_invalid`` (larger than
+    ``max_bytes``).  The opened descriptor -- not the pathname -- is what gets
+    checked and streamed, so a swap after the check cannot redirect the read.
+    """
+
+    import stat as stat_module
+
+    try:
+        before = os.lstat(candidate)
+    except OSError:
+        return None, "read_failed"
+    if not stat_module.S_ISREG(before.st_mode):
+        return None, "not_regular_file"
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        fd = os.open(candidate, flags)
+    except OSError:
+        return None, "read_failed"
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat_module.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            return None, "not_regular_file"
+        if opened.st_size > max_bytes:
+            return None, "bytes_invalid"
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(fd, _REPLAY_CANDIDATE_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                return None, "bytes_invalid"
+            digest.update(chunk)
+        return digest.hexdigest(), ""
+    except OSError:
+        return None, "read_failed"
+    finally:
+        os.close(fd)
+
+
 def _replay_sealed_absent_refusal(
     resolved_workspace: Path, candidate: Path, shown: str
 ) -> str | None:
@@ -8760,18 +8823,18 @@ def recover_blocked_rework(
                                     "validation_only_replay_candidate_invalid:"
                                     f"not_regular_file:{shown}",
                                 )
-                            try:
-                                candidate_bytes = candidate.read_bytes()
-                            except OSError:
+                            # NF-2026-00943: one no-follow open, single-link
+                            # regular-file proof and a capped streamed hash.
+                            candidate_digest, digest_refusal = (
+                                _replay_candidate_sha256(candidate)
+                            )
+                            if candidate_digest is None:
                                 return (
                                     False,
                                     "validation_only_replay_candidate_invalid:"
-                                    f"read_failed:{shown}",
+                                    f"{digest_refusal}:{shown}",
                                 )
-                            if (
-                                hashlib.sha256(candidate_bytes).hexdigest()
-                                != expected_hash
-                            ):
+                            if candidate_digest != expected_hash:
                                 return (
                                     False,
                                     "validation_only_replay_hash_mismatch:"
@@ -9197,15 +9260,14 @@ def recover_blocked_rework(
                         "validation_only_replay_candidate_invalid:"
                         f"not_regular_file:{shown}",
                     )
-                try:
-                    candidate_bytes = candidate.read_bytes()
-                except OSError:
+                candidate_digest, digest_refusal = _replay_candidate_sha256(candidate)
+                if candidate_digest is None:
                     return (
                         False,
                         "validation_only_replay_candidate_invalid:"
-                        f"read_failed:{shown}",
+                        f"{digest_refusal}:{shown}",
                     )
-                if hashlib.sha256(candidate_bytes).hexdigest() != expected_hash:
+                if candidate_digest != expected_hash:
                     return (
                         False,
                         f"validation_only_replay_hash_mismatch:hash_mismatch:{shown}",

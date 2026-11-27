@@ -1289,10 +1289,12 @@ def test_identity_bound_replace_fails_closed_on_unsupported_platform(
     destination = tmp_path / "canonical"
     source.write_bytes(b"new")
     destination.write_bytes(b"prior")
-    # A host that is neither Linux nor macOS has no descriptor-bound namespace
+    # A host that is neither Linux, macOS nor Windows (NF-2026-00603 added the
+    # Windows handle-bound branch) has no descriptor-bound namespace
     # operation this module can guarantee, so publication must fail closed.
     monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
     monkeypatch.setattr(platform_io, "is_macos", lambda _name=None: False)
+    monkeypatch.setattr(platform_io, "is_windows", lambda _name=None: False)
 
     with pytest.raises(platform_io.IdentityBoundPublicationError) as raised:
         platform_io.identity_bound_durable_atomic_replace(source, destination)

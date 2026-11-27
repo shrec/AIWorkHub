@@ -3395,6 +3395,196 @@ def _link_verified_source_into_staging(
         )
 
 
+class _WindowsFileRenameInfo(ctypes.Structure):
+    """``FILE_RENAME_INFO`` (Flags variant) with its inline one-WCHAR name.
+
+    Declared at module scope with fixed-width fields (DWORD -> c_uint32,
+    HANDLE -> c_void_p) so the layout is built once and is importable on every
+    host; only :func:`_windows_identity_bound_replace` instantiates it.
+    """
+
+    _fields_ = [
+        ("Flags", ctypes.c_uint32),
+        ("RootDirectory", ctypes.c_void_p),
+        ("FileNameLength", ctypes.c_uint32),
+        ("FileName", ctypes.c_wchar * 1),
+    ]
+
+
+# FileRenameInformationEx: the Flags form of FILE_RENAME_INFORMATION, so
+# POSIX_SEMANTICS still replaces a destination another process holds open.
+_WINDOWS_FILE_RENAME_INFORMATION_EX = 65
+# STATUS_INVALID_INFO_CLASS / STATUS_INVALID_PARAMETER / STATUS_NOT_SUPPORTED:
+# the volume cannot do a handle-relative FileRenameInformationEx.
+_WINDOWS_RENAME_UNSUPPORTED_STATUSES = frozenset({0xC0000003, 0xC000000D, 0xC00000BB})
+
+
+def _windows_relative_rename_buffer(
+    directory_handle: Any, destination_abs: str
+) -> tuple[Any, int]:
+    """Build a rename record anchored on the held destination parent.
+
+    RootDirectory is ``directory_handle`` and FileName is only the basename,
+    so the kernel resolves the target relative to the held handle and never
+    re-walks the destination's ancestors by path.
+    """
+
+    name = os.path.basename(destination_abs)
+    if not name or name in {".", ".."}:
+        raise IdentityBoundPublicationError(
+            errno.EINVAL, "publication_destination_has_no_leaf_name"
+        )
+    encoded = name.encode("utf-16-le")
+    name_offset = _WindowsFileRenameInfo.FileName.offset
+    size = max(ctypes.sizeof(_WindowsFileRenameInfo), name_offset + len(encoded) + 2)
+    buffer = ctypes.create_string_buffer(size)
+    rename = _WindowsFileRenameInfo.from_buffer(buffer)
+    rename.Flags = 0x1 | 0x2  # REPLACE_IF_EXISTS | POSIX_SEMANTICS
+    rename.RootDirectory = directory_handle
+    rename.FileNameLength = len(encoded)
+    ctypes.memmove(ctypes.addressof(buffer) + name_offset, encoded, len(encoded))
+    return buffer, size
+
+
+def _windows_identity_bound_replace(source_path: str, destination_path: str) -> None:
+    """Windows branch of :func:`identity_bound_durable_atomic_replace`.
+
+    The source is opened once with FILE_FLAG_OPEN_REPARSE_POINT and shared for
+    read only -- no writer and no DELETE can join -- so the verified object
+    cannot be rewritten, renamed or swapped while held.  The destination parent
+    is held the same way (no FILE_SHARE_DELETE), so the commit is a rename OF
+    THE HELD SOURCE HANDLE into a parent that cannot be renamed, deleted or
+    swapped: the source is never re-resolved by name after verification.
+    The handle is opened for write so FlushFileBuffers can make the bytes and
+    the renamed entry durable (a read-only handle cannot be flushed on
+    Windows); a source carrying the read-only attribute is refused with EACCES.
+    """
+
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+    ]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll = ctypes.WinDLL("ntdll")  # type: ignore[attr-defined]
+    ntdll.NtSetInformationFile.restype = ctypes.c_long  # NTSTATUS
+    ntdll.NtSetInformationFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+    ]
+    invalid = wintypes.HANDLE(-1).value
+    open_reparse_point = 0x00200000
+    backup_semantics = 0x02000000
+
+    def _open(path: str, access: int, share: int, flags: int) -> Any:
+        handle = kernel32.CreateFileW(path, access, share, None, 3, flags, None)
+        if not handle or handle == invalid:
+            error = ctypes.get_last_error()  # type: ignore[attr-defined]
+            code = {2: errno.ENOENT, 3: errno.ENOENT, 32: errno.EBUSY}.get(
+                error, errno.EACCES
+            )
+            raise OSError(code, f"cannot open publication path (winerror {error})", path)
+        return handle
+
+    def _attributes(handle: Any, path: str) -> tuple[int, int]:
+        """Return ``(dwFileAttributes, nNumberOfLinks)`` of the held object."""
+
+        info = (wintypes.DWORD * 13)()  # BY_HANDLE_FILE_INFORMATION
+        if not kernel32.GetFileInformationByHandle(handle, info):
+            raise OSError(errno.EIO, "cannot read publication path attributes", path)
+        return int(info[0]), int(info[10])
+
+    source_abs = os.path.abspath(source_path)
+    destination_abs = os.path.abspath(destination_path)
+    handles: list[Any] = []
+    committed = False
+    try:
+        source_handle = _open(
+            source_abs,
+            0x80000000 | 0x40000000 | 0x00010000,  # GENERIC_READ|GENERIC_WRITE|DELETE
+            0x00000001,  # FILE_SHARE_READ only
+            open_reparse_point,
+        )
+        handles.append(source_handle)
+        source_attributes, source_links = _attributes(source_handle, source_abs)
+        if source_attributes & (
+            stat.FILE_ATTRIBUTE_REPARSE_POINT | stat.FILE_ATTRIBUTE_DIRECTORY
+        ):
+            raise IdentityBoundPublicationError(
+                errno.EINVAL, "publication_source_is_not_a_regular_file"
+            )
+        if source_links != 1:
+            # A second name would keep the published bytes reachable (and
+            # writable) outside the destination; same refusal as pinned_paths.
+            raise IdentityBoundPublicationError(
+                errno.EMLINK, "publication_source_has_multiple_links"
+            )
+        directory_handle = _open(
+            os.path.dirname(destination_abs),
+            0x0001 | 0x0020 | 0x0080,  # LIST_DIRECTORY|TRAVERSE|READ_ATTRIBUTES
+            0x00000001 | 0x00000002,  # FILE_SHARE_READ|FILE_SHARE_WRITE, never DELETE
+            backup_semantics | open_reparse_point,
+        )
+        handles.append(directory_handle)
+        if _attributes(directory_handle, destination_abs)[0] & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise IdentityBoundPublicationError(
+                errno.ELOOP, "publication_destination_parent_is_a_reparse_point"
+            )
+        if not kernel32.FlushFileBuffers(source_handle):
+            raise OSError(errno.EIO, "publication source flush failed", source_abs)
+
+        # The rename is anchored on the HELD parent handle: RootDirectory is
+        # directory_handle and FileName is only the destination basename, so
+        # no ancestor path is re-resolved after the open and a junction
+        # retargeted meanwhile cannot redirect the commit.  kernel32 refuses a
+        # non-NULL RootDirectory, so the call goes through ntdll directly.
+        buffer, size = _windows_relative_rename_buffer(directory_handle, destination_abs)
+        io_status = (ctypes.c_void_p * 2)()  # IO_STATUS_BLOCK
+        status = ntdll.NtSetInformationFile(
+            source_handle, io_status, buffer, size, _WINDOWS_FILE_RENAME_INFORMATION_EX
+        )
+        if status != 0:
+            status &= 0xFFFFFFFF
+            if status in _WINDOWS_RENAME_UNSUPPORTED_STATUSES:
+                raise IdentityBoundPublicationError(
+                    errno.ENOTSUP, "identity_bound_publication_not_supported"
+                )
+            code = {0xC0000043: errno.EBUSY, 0xC0000034: errno.ENOENT}.get(
+                status, errno.EACCES
+            )
+            raise OSError(
+                code, f"publication rename failed (ntstatus 0x{status:08X})", destination_abs
+            )
+        committed = True
+        if not kernel32.FlushFileBuffers(source_handle):
+            raise PublicationDurabilityError(
+                errno.EIO,
+                f"publication_committed_but_sync_failed:{destination_path}",
+                destination_path,
+            )
+    except OSError as exc:
+        if committed and not isinstance(exc, PublicationDurabilityError):
+            raise PublicationDurabilityError(
+                exc.errno,
+                f"publication_committed_but_sync_failed:{destination_path}",
+                destination_path,
+            ) from exc
+        raise
+    finally:
+        for handle in reversed(handles):
+            kernel32.CloseHandle(handle)
+
+
 def identity_bound_durable_atomic_replace(
     source: str | os.PathLike[str], destination: str | os.PathLike[str]
 ) -> None:
@@ -3410,12 +3600,17 @@ def identity_bound_durable_atomic_replace(
     Destination authority linearizes to the parent directory object opened at
     call start: the descriptor-relative commit follows that object across a
     concurrent rename instead of resolving a substituted public parent path.
+    Windows (NF-2026-00603) renames the held source handle itself into the held
+    destination directory; see :func:`_windows_identity_bound_replace`.
     Other platforms fail closed before changing the destination because this
     module cannot guarantee an equivalent descriptor-bound namespace operation.
     """
 
     source_path = os.fspath(source)
     destination_path = os.fspath(destination)
+    if is_windows():
+        _windows_identity_bound_replace(source_path, destination_path)
+        return
     if not (is_linux() or is_macos()):
         raise IdentityBoundPublicationError(
             errno.ENOTSUP, "identity_bound_publication_not_supported"
@@ -3998,6 +4193,15 @@ class ReparsePointRefused(OSError):
     """A path held by :func:`pinned_paths` is, or passes through, a link."""
 
 
+class HardLinkRefused(ReparsePointRefused):
+    """A file held by :func:`pinned_paths` has more than one name (NF-2026-00036).
+
+    A held handle stops a path from being renamed or swapped, but a second hard
+    link outside the held tree still reaches the same bytes, so a multi-linked
+    regular file is refused like a reparse point.
+    """
+
+
 @contextlib.contextmanager
 def pinned_paths(paths: "list[Path]") -> "Iterator[None]":
     """Hold ``paths`` -- ancestors first -- so that, until the block exits,
@@ -4019,8 +4223,11 @@ def pinned_paths(paths: "list[Path]") -> "Iterator[None]":
 
     if not is_windows():
         for path in paths:
-            if stat.S_ISLNK(os.lstat(path).st_mode):
+            path_stat = os.lstat(path)
+            if stat.S_ISLNK(path_stat.st_mode):
                 raise ReparsePointRefused(errno.ELOOP, "symlink refused", str(path))
+            if stat.S_ISREG(path_stat.st_mode) and path_stat.st_nlink > 1:
+                raise HardLinkRefused(errno.EMLINK, "hard-linked file refused", str(path))
         yield
         return
     from ctypes import wintypes
@@ -4056,6 +4263,10 @@ def pinned_paths(paths: "list[Path]") -> "Iterator[None]":
                 raise OSError(errno.EIO, "cannot read path attributes", str(path))
             if info[0] & stat.FILE_ATTRIBUTE_REPARSE_POINT:
                 raise ReparsePointRefused(errno.ELOOP, "reparse point refused", str(path))
+            # info[10] is nNumberOfLinks (NF-2026-00036): a second name for a
+            # held file lets a writer outside the held tree change its bytes.
+            if not info[0] & stat.FILE_ATTRIBUTE_DIRECTORY and info[10] > 1:
+                raise HardLinkRefused(errno.EMLINK, "hard-linked file refused", str(path))
         yield
     finally:
         for handle in reversed(handles):

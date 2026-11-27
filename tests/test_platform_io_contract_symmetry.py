@@ -279,14 +279,29 @@ def test_identity_bound_publication_fails_closed_on_unsupported_platform(
     destination = tmp_path / "destination"
     source.write_bytes(b"new")
     destination.write_bytes(b"prior")
-    # Linux and macOS are the two supported publication hosts; anything else has
-    # no descriptor-bound namespace guarantee and must fail closed.
+    # Linux, macOS and Windows (NF-2026-00603) are the supported publication
+    # hosts; anything else has no descriptor-bound namespace guarantee and must
+    # fail closed.
+    monkeypatch.setattr(platform_io, "is_windows", lambda _name=None: False)
     monkeypatch.setattr(platform_io, "is_linux", lambda _name=None: False)
     monkeypatch.setattr(platform_io, "is_macos", lambda _name=None: False)
 
     with pytest.raises(platform_io.IdentityBoundPublicationError):
         platform_io.identity_bound_durable_atomic_replace(source, destination)
 
+    assert source.read_bytes() == b"new"
+    assert destination.read_bytes() == b"prior"
+
+    # A Windows host takes the held-handle Windows branch, not the refusal.
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(platform_io, "is_windows", lambda _name=None: True)
+    monkeypatch.setattr(
+        platform_io,
+        "_windows_identity_bound_replace",
+        lambda src, dst: calls.append((src, dst)),
+    )
+    platform_io.identity_bound_durable_atomic_replace(source, destination)
+    assert calls == [(str(source), str(destination))]
     assert source.read_bytes() == b"new"
     assert destination.read_bytes() == b"prior"
 
