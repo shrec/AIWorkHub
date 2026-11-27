@@ -2746,7 +2746,15 @@ def _timeout_stream_tail(captured: bytes | str | None) -> str:
 # unchanged module, pytest collecting no tests, npm --prefix vscode-extension
 # ENOENT on its package.json); they are filled in from the canonical toolchain
 # root so the tree becomes canonical + candidate (NF-2026-00970 added vscode-extension).
-SPARSE_TOOLCHAIN_INPUT_ROOTS = ("scripts", "src", "tests", "vscode-extension")
+# NF-2026-00983 added docs/assets: vscode-extension/test/extension-static.test.js
+# asserts the README raster assets exist under repoRoot/docs/assets. Its other
+# repoRoot reads (src/aiworkhub/server.py, dashboard_static) and package-vsix.js
+# repositoryRoot reads (src/aiworkhub/_version.py, vscode-extension/package.json,
+# vscode-extension/extension.js) are already under src and vscode-extension; the
+# extension suite reads no other repo-root path.
+SPARSE_TOOLCHAIN_INPUT_ROOTS = (
+    "docs/assets", "scripts", "src", "tests", "vscode-extension",
+)
 _SPARSE_FILL_SKIPPED_DIRS = frozenset({"__pycache__"})
 SPARSE_FILL_GIT_TIMEOUT_SECONDS = 60
 # Variables git honours over ``-C``: inherited, they would list another index.
@@ -2780,7 +2788,7 @@ class SparseFillResult:
 
 
 def _tracked_sparse_inputs(source_root: Path) -> tuple[list[str], str]:
-    """Tracked scripts/src/tests/vscode-extension paths of the canonical root, or a named error.
+    """Tracked docs/assets/scripts/src/tests/vscode-extension canonical paths, or a named error.
 
     Only ``git ls-files`` decides what is canonical: untracked or ignored host
     files are never candidates, and a failed listing never falls back to a walk.
@@ -2889,7 +2897,7 @@ def _fill_sparse_toolchain_inputs(
     toolchain_root: Path | str | None,
     changed_paths: Iterable[str],
 ) -> SparseFillResult:
-    """Fill tracked canonical scripts/src/tests/vscode-extension files the sparse tree lacks.
+    """Fill tracked canonical docs/assets/scripts/src/tests/vscode-extension files a sparse tree lacks.
 
     Candidates are the canonical root's ``git ls-files`` entries under
     ``SPARSE_TOOLCHAIN_INPUT_ROOTS``; a listing failure fills nothing and names

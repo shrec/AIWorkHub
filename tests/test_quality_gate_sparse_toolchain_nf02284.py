@@ -454,3 +454,40 @@ def test_vscode_extension_files_are_filled_and_candidate_change_is_kept(
     assert (changed / "vscode-extension" / "test" / "x.test.js").read_text(
         encoding="utf-8",
     ) == "// candidate\n"
+
+
+@requires_git
+def test_docs_assets_raster_is_filled_for_checks_and_removed_afterwards(
+    tmp_path: Path,
+) -> None:
+    """NF-2026-00983: extension-static.test.js asserts repoRoot/docs/assets rasters.
+
+    A sparse tree lacking ``docs/assets`` failed "missing local raster asset".
+    The tracked raster is filled for the checks only; other ``docs`` files are
+    not fill roots, and cleanup removes the raster and the directories it made.
+    """
+
+    raster = "docs/assets/demo/diagram.png"
+    canonical = tmp_path / "canonical"
+    union = tmp_path / "union"
+    check = {"id": DECLARED_CHECK, "kind": "test",
+             "command": [sys.executable, "-c",
+                         "import sys; from pathlib import Path; "
+                         "p = Path(sys.argv[1]); "
+                         "sys.exit(0 if p.is_file() and p.stat().st_size > 1000 else 3)",
+                         raster]}
+    _declare(canonical, [check])
+    (canonical / "docs" / "assets" / "demo").mkdir(parents=True)
+    (canonical / raster).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 2048)
+    _write(canonical, "docs/GUIDE.md", "# not a fill root\n")
+    _sparse_union(union, [check])
+
+    gate = _gate(union, canonical)
+
+    row = _check(gate, DECLARED_CHECK)
+    assert row["status"] == "passed", row["summary"]
+    assert row["provenance"].endswith(":sparse_inputs_filled=1")
+    assert gate["passed"] is True, gate["blocking_checks"]
+    assert not (union / raster).exists()
+    assert not (union / "docs").exists()
+    assert not (union / "docs" / "GUIDE.md").exists()
