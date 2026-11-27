@@ -5397,6 +5397,32 @@ def accept_review(
             if correction_originals:
                 _restore_correction_originals(workspace, correction_originals)
             raise
+        # NF-2026-01008: the correction receipt is checked against the CORRECTED
+        # candidate about to be promoted -- the same predicate the post-promotion
+        # receipt applies -- BEFORE any canonical write, and every canonical path
+        # promotion may write is snapshotted so a later failure can roll it back.
+        from . import process_launcher_acceptance as _acceptance
+
+        try:
+            if correction_record is not None:
+                _acceptance.verify_manager_correction_candidate(
+                    correction_record, _changed_path_hashes(workspace, changed)
+                )
+            canonical_preimages = _acceptance.canonical_preimages(self.repo, changed)
+        except (OSError, WorkspaceError) as exc:
+            reason = str(exc)
+            refusal: dict[str, Any] = {
+                "ok": False,
+                "error": reason[:500],
+                "request_id": request_id,
+                "task_id": task_id,
+                "promoted_paths": [],
+            }
+            if reason.startswith(_acceptance.MANAGER_CORRECTION_RECEIPT_MISMATCH):
+                refusal["mismatch_field"] = reason.partition(":")[2]
+            return _reply_with_correction_restored(
+                workspace, correction_originals, refusal
+            )
         # Promote exactly the merged bytes validated in the combined tree (NF-2026-01381 part A).
         combined_tree = full_validation_snapshot.get("combined_tree") or {}
         in_flight.advance("promoting")
@@ -5409,6 +5435,8 @@ def accept_review(
                     workspace, changed, merged_hashes=combined_tree.get("merged_paths")
                 )
         except WorkspaceError as exc:
+            # NF-2026-01008: a mid-write failure leaves no canonical byte behind.
+            _acceptance.restore_canonical_preimages(self.repo, canonical_preimages)
             if correction_originals:
                 _restore_correction_originals(workspace, correction_originals)
             # NF-2026-01960: a pre-write promotion conflict answers with the
@@ -5427,128 +5455,179 @@ def accept_review(
                 "task_id": task_id,
             }
         except BaseException:
+            _acceptance.restore_canonical_preimages(self.repo, canonical_preimages)
             if correction_originals:
                 _restore_correction_originals(workspace, correction_originals)
             raise
 
-        in_flight.advance("recording")
-        # NF-2026-01518: the paths promotion three-way merged, exactly as the
-        # combined tree validated them; canonical now holds their MERGED bytes.
-        merged_paths = combined_tree.get("merged_paths") or {}
+        # NF-2026-01008 (rework a): from the first canonical write until the
+        # card is durably finalized, EVERY non-success exit restores canonical
+        # pre-images -- the typed refusals below return after restoring, and any
+        # other exception (a RuntimeError, KeyboardInterrupt, ...) restores in
+        # the outer handler and re-raises. Once task_engine.accept_review has
+        # landed the accept, canonical holds the accepted outcome and is kept.
         try:
-            accepted_outcome_receipt = _accepted_outcome_receipt(
-                self.repo,
-                task_id=task_id,
-                request_id=request_id,
-                claim_epoch=int(card.get("claim_epoch") or 0),
-                base_oid=str(workspace_meta.get("base_oid") or ""),
-                promoted_paths=promoted,
-                changed_path_hashes=accepted_path_hashes,
-                attempt_artifact_manifest=attempt_artifact_receipt,
-                # Named only when a correction landed, so an accept without one
-                # calls exactly the receipt builder it always called.
-                **(
-                    {"manager_correction": correction_record}
-                    if correction_record is not None
-                    else {}
-                ),
-                # Likewise named only when a merge landed: each merge consumed
-                # its path's accepted (sealed or corrected) bytes.
-                **(
-                    {
-                        "promotion_merge": {
-                            "paths": sorted(merged_paths),
-                            "candidate_path_hashes": {
-                                relative: accepted_path_hashes.get(relative)
-                                for relative in merged_paths
-                            },
-                            "merged_path_hashes": dict(merged_paths),
+            in_flight.advance("recording")
+            # NF-2026-01518: the paths promotion three-way merged, exactly as the
+            # combined tree validated them; canonical now holds their MERGED bytes.
+            merged_paths = combined_tree.get("merged_paths") or {}
+            try:
+                accepted_outcome_receipt = _accepted_outcome_receipt(
+                    self.repo,
+                    task_id=task_id,
+                    request_id=request_id,
+                    claim_epoch=int(card.get("claim_epoch") or 0),
+                    base_oid=str(workspace_meta.get("base_oid") or ""),
+                    promoted_paths=promoted,
+                    changed_path_hashes=accepted_path_hashes,
+                    attempt_artifact_manifest=attempt_artifact_receipt,
+                    # Named only when a correction landed, so an accept without one
+                    # calls exactly the receipt builder it always called.
+                    **(
+                        {"manager_correction": correction_record}
+                        if correction_record is not None
+                        else {}
+                    ),
+                    # Likewise named only when a merge landed: each merge consumed
+                    # its path's accepted (sealed or corrected) bytes.
+                    **(
+                        {
+                            "promotion_merge": {
+                                "paths": sorted(merged_paths),
+                                "candidate_path_hashes": {
+                                    relative: accepted_path_hashes.get(relative)
+                                    for relative in merged_paths
+                                },
+                                "merged_path_hashes": dict(merged_paths),
+                            }
                         }
-                    }
-                    if merged_paths
-                    else {}
+                        if merged_paths
+                        else {}
+                    ),
+                )
+                # NF-2026-02241: corrected paths admitted by an allowed_writes
+                # amendment were never sealed, so the receipt names them
+                # (``manager_correction.amended_paths``); without one it is unchanged.
+                if correction_record is not None and correction_record.get(
+                    "paths_outside_candidate"
+                ):
+                    from . import manager_card_amend
+
+                    accepted_outcome_receipt = manager_card_amend.receipt_with_amended_paths(
+                        accepted_outcome_receipt, correction_record
+                    )
+            except (OSError, TypeError, ValueError, WorkspaceError) as exc:
+                # NF-2026-01008: the accept is atomic. Every promoted canonical
+                # path goes back to its pre-image, so a failure here leaves the
+                # card in review with nothing half-accepted. The retained worktree
+                # must not keep CORRECTED bytes either, or the next review trips
+                # review_workspace_hash_mismatch (NF-2026-01518).
+                reason = str(exc)
+                receipt_mismatch = reason.startswith(
+                    _acceptance.MANAGER_CORRECTION_RECEIPT_MISMATCH
+                )
+                error_message = (
+                    reason if receipt_mismatch else f"accepted_outcome_receipt_failed:{exc}"
+                )
+                canonical_restore_failed = _acceptance.restore_canonical_preimages(
+                    self.repo, canonical_preimages
+                )
+                if correction_originals:
+                    failed_restores = _restore_correction_originals(
+                        workspace, correction_originals
+                    )
+                    if failed_restores:
+                        error_message += (
+                            ":correction_restore_failed:" + ",".join(failed_restores)[:200]
+                        )
+                receipt_failure: dict[str, Any] = {
+                    "ok": False,
+                    "error": error_message[:500],
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": sorted(canonical_restore_failed),
+                    "rolled_back_paths": sorted(
+                        set(promoted) - set(canonical_restore_failed)
+                    ),
+                }
+                if receipt_mismatch:
+                    receipt_failure["mismatch_field"] = reason.partition(":")[2]
+                if canonical_restore_failed:
+                    receipt_failure["canonical_restore_failed"] = sorted(
+                        canonical_restore_failed
+                    )[:20]
+                return receipt_failure
+
+            acceptance_evidence_record = self._canonical_outcome_evidence(
+                request_id,
+                attempt_artifact_receipt,
+                level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
+                verified_by=(
+                    str(manager_identity.get("provider") or "").strip()[:60]
+                    or "manager_unverified"
+                ),
+                message=(
+                    "Manager revalidated, promoted, and accepted the exact sealed candidate."
                 ),
             )
-            # NF-2026-02241: corrected paths admitted by an allowed_writes
-            # amendment were never sealed, so the receipt names them
-            # (``manager_correction.amended_paths``); without one it is unchanged.
-            if correction_record is not None and correction_record.get(
-                "paths_outside_candidate"
-            ):
-                from . import manager_card_amend
 
-                accepted_outcome_receipt = manager_card_amend.receipt_with_amended_paths(
-                    accepted_outcome_receipt, correction_record
+            accept_result = task_engine.accept_review(
+                self.repo,
+                task_id,
+                runner=runner,
+                topic=topic,
+                request_id=request_id,
+                evidence={
+                    "started_at": accept_started_at,
+                    "promoted_paths": promoted,
+                    "validation": validations,
+                    "required_outputs": required_output_records,
+                    "quality_gate": quality_gate,
+                    "source_evidence_record": terminal_evidence_record.to_dict(),
+                    "acceptance_evidence_record": acceptance_evidence_record,
+                    "attempt_artifact_manifest": attempt_artifact_receipt,
+                    # Named only when a drift in a frozen input the candidate never
+                    # changed was rebased in place, so an accept without one records
+                    # exactly what it always recorded (NF-2026-01543).
+                    **(
+                        {"stale_input_rebased": stale_input_rebased}
+                        if stale_input_rebased
+                        else {}
+                    ),
+                },
+                accepted_outcome_receipt=accepted_outcome_receipt,
+            )
+            if not accept_result.get("ok"):
+                # NF-2026-01008: the card was not finalized, so canonical must not
+                # keep the promoted bytes either -- roll every promoted path back.
+                finalize_restore_failed = _acceptance.restore_canonical_preimages(
+                    self.repo, canonical_preimages
                 )
-        except (OSError, TypeError, ValueError, WorkspaceError) as exc:
-            # Canonical keeps the promoted bytes (no rollback), but the retained
-            # worktree must not keep CORRECTED bytes, or the next review trips
-            # review_workspace_hash_mismatch (NF-2026-01518).
-            error_message = f"accepted_outcome_receipt_failed:{exc}"
+                if correction_originals:
+                    _restore_correction_originals(workspace, correction_originals)
+                finalize_failure: dict[str, Any] = {
+                    "ok": False,
+                    "error": (
+                        "promotion_finalize_failed:"
+                        + str(accept_result.get("stderr") or accept_result.get("stdout") or "")
+                    )[:500],
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": sorted(finalize_restore_failed),
+                    "rolled_back_paths": sorted(
+                        set(promoted) - set(finalize_restore_failed)
+                    ),
+                }
+                if finalize_restore_failed:
+                    finalize_failure["canonical_restore_failed"] = sorted(
+                        finalize_restore_failed
+                    )[:20]
+                return finalize_failure
+        except BaseException:
+            _acceptance.restore_canonical_preimages(self.repo, canonical_preimages)
             if correction_originals:
-                failed_restores = _restore_correction_originals(workspace, correction_originals)
-                if failed_restores:
-                    error_message += (
-                        ":correction_restore_failed:" + ",".join(failed_restores)[:200]
-                    )
-            return {
-                "ok": False,
-                "error": error_message,
-                "request_id": request_id,
-                "task_id": task_id,
-                "promoted_paths": promoted,
-            }
-
-        acceptance_evidence_record = self._canonical_outcome_evidence(
-            request_id,
-            attempt_artifact_receipt,
-            level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
-            verified_by=(
-                str(manager_identity.get("provider") or "").strip()[:60]
-                or "manager_unverified"
-            ),
-            message=(
-                "Manager revalidated, promoted, and accepted the exact sealed candidate."
-            ),
-        )
-
-        accept_result = task_engine.accept_review(
-            self.repo,
-            task_id,
-            runner=runner,
-            topic=topic,
-            request_id=request_id,
-            evidence={
-                "started_at": accept_started_at,
-                "promoted_paths": promoted,
-                "validation": validations,
-                "required_outputs": required_output_records,
-                "quality_gate": quality_gate,
-                "source_evidence_record": terminal_evidence_record.to_dict(),
-                "acceptance_evidence_record": acceptance_evidence_record,
-                "attempt_artifact_manifest": attempt_artifact_receipt,
-                # Named only when a drift in a frozen input the candidate never
-                # changed was rebased in place, so an accept without one records
-                # exactly what it always recorded (NF-2026-01543).
-                **(
-                    {"stale_input_rebased": stale_input_rebased}
-                    if stale_input_rebased
-                    else {}
-                ),
-            },
-            accepted_outcome_receipt=accepted_outcome_receipt,
-        )
-        if not accept_result.get("ok"):
-            return {
-                "ok": False,
-                "error": (
-                    "promotion_finalize_failed:"
-                    + str(accept_result.get("stderr") or accept_result.get("stdout") or "")
-                )[:500],
-                "request_id": request_id,
-                "task_id": task_id,
-                "promoted_paths": promoted,
-            }
+                _restore_correction_originals(workspace, correction_originals)
+            raise
 
         # NF-2026-02241: a correction's allowed_writes amendment lands on the
         # card only now, add-only, so a refused accept amends nothing.

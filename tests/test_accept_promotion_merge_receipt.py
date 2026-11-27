@@ -416,6 +416,11 @@ def test_receipt_failure_after_a_correction_restores_the_retained_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager = _nf01436._accept_env(tmp_path, monkeypatch)
+    canonical_target = manager.repo / TARGET
+    # Pre-accept canonical pre-image; None when the target does not exist yet.
+    original_canonical = (
+        canonical_target.read_bytes() if canonical_target.exists() else None
+    )
     workspace_path = Path(
         manager.cards[TASK_ID]["terminal_review"]["evidence"]["workspace"]["path"]
     )
@@ -431,9 +436,13 @@ def test_receipt_failure_after_a_correction_restores_the_retained_worktree(
     assert result["error"] == (
         "accepted_outcome_receipt_failed:post_promotion_candidate_mismatch"
     )
-    assert result["promoted_paths"] == [TARGET]
-    # No canonical rollback: canonical keeps the bytes promotion wrote ...
-    assert (manager.repo / TARGET).read_bytes() == _nf01436.CORRECTED.encode("utf-8")
+    assert result["promoted_paths"] == []
+    # Canonical IS rolled back (NF-2026-01008): the accept is atomic, so the
+    # bytes promotion wrote are restored to the pre-accept canonical pre-image ...
+    restored_canonical = (
+        canonical_target.read_bytes() if canonical_target.exists() else None
+    )
+    assert restored_canonical == original_canonical
     # ... but the retained worktree is back on the sealed candidate, so the next
     # review does not trip review_workspace_hash_mismatch.
     assert (workspace_path / TARGET).read_bytes() == _nf01436.CANDIDATE.encode("utf-8")

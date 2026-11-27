@@ -1418,3 +1418,315 @@ def test_promote_failure_still_restores_the_retained_worktree(
         _accept(manager, manager_correction=_correction_payload())
 
     assert (workspace_path / TARGET).read_text(encoding="utf-8") == CANDIDATE
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-01008: a correction receipt mismatch never leaves a half-accept.
+# ---------------------------------------------------------------------------
+_RECEIPT_MISMATCH = process_launcher_acceptance.MANAGER_CORRECTION_RECEIPT_MISMATCH
+
+
+def _canonical_tree_digest(repo: Path) -> str:
+    """One digest over every canonical repository file and its exact bytes.
+
+    The task store and the process log are the card's state, asserted
+    separately; everything else is the tree a promotion may write.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(repo.rglob("*")):
+        relative = path.relative_to(repo).as_posix()
+        if ".aiworkhub" in path.relative_to(repo).parts or relative == "process.log":
+            continue
+        if path.is_file():
+            digest.update(relative.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def _assert_still_in_review(manager: _StubManager) -> None:
+    card = task_store.get_task(manager.repo, TASK_ID)
+    assert card["status"] == "review"
+    assert not card.get("accepted_request_id")
+    assert "accepted_outcome_receipt" not in (card.get("accept_evidence") or {})
+
+
+def test_verify_manager_correction_candidate_names_the_mismatching_field() -> None:
+    record = {
+        "patch_sha256": hashlib.sha256(_patch().encode("utf-8")).hexdigest(),
+        "finding_ids": [FINDING_ID],
+        "paths": [TARGET],
+        "candidate_path_hashes": {TARGET: CANDIDATE_DIGEST},
+        "corrected_path_hashes": {TARGET: CORRECTED_DIGEST},
+        "reason": "dropped the duplicated test def",
+    }
+    # The corrected candidate holds the corrected bytes: nothing refuses.
+    process_launcher_acceptance.verify_manager_correction_candidate(
+        record, {TARGET: CORRECTED_DIGEST}
+    )
+    for candidate_hashes, mutated, field in (
+        ({TARGET: CANDIDATE_DIGEST}, {}, f"corrected_path_hashes:{TARGET}"),
+        ({TARGET: CORRECTED_DIGEST}, {"patch_sha256": "short"}, "patch_sha256"),
+        ({TARGET: CORRECTED_DIGEST}, {"finding_ids": []}, "finding_ids"),
+    ):
+        with pytest.raises(process_launcher_acceptance.WorkspaceError) as excinfo:
+            process_launcher_acceptance.verify_manager_correction_candidate(
+                {**record, **mutated}, candidate_hashes
+            )
+        assert str(excinfo.value) == f"{_RECEIPT_MISMATCH}:{field}"
+
+
+def test_receipt_mismatch_is_refused_before_any_canonical_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _accept_env(tmp_path, monkeypatch)
+    workspace_path = Path(
+        manager.cards[TASK_ID]["terminal_review"]["evidence"]["workspace"]["path"]
+    )
+    real_validate = process_launcher_accept_review.validate_manager_correction
+
+    def _tampered_validate(*args, **kwargs):
+        record, texts, reason = real_validate(*args, **kwargs)
+        assert record is not None, reason
+        # A record whose receipt cannot match: the patch digest is not a digest.
+        return {**record, "patch_sha256": "not-a-digest"}, texts, reason
+
+    monkeypatch.setattr(
+        process_launcher_accept_review, "validate_manager_correction", _tampered_validate
+    )
+    before = _canonical_tree_digest(manager.repo)
+
+    result = _accept(manager, manager_correction=_correction_payload())
+
+    assert result["ok"] is False
+    assert result["error"] == f"{_RECEIPT_MISMATCH}:patch_sha256"
+    assert result["mismatch_field"] == "patch_sha256"
+    assert result["promoted_paths"] == []
+    # Refused BEFORE promotion: promotion never ran and canonical is untouched.
+    assert manager.promoted == []
+    assert _canonical_tree_digest(manager.repo) == before
+    assert not (manager.repo / TARGET).exists()
+    assert (workspace_path / TARGET).read_text(encoding="utf-8") == CANDIDATE
+    _assert_still_in_review(manager)
+
+
+@pytest.mark.parametrize(
+    "preimage",
+    [
+        pytest.param(None, id="canonical_path_absent"),
+        pytest.param(b"# canonical pre-image\r\nkept = True\n", id="canonical_path_present"),
+    ],
+)
+def test_receipt_mismatch_after_promotion_restores_every_canonical_preimage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preimage: bytes | None
+) -> None:
+    manager = _accept_env(tmp_path, monkeypatch)
+    workspace_path = Path(
+        manager.cards[TASK_ID]["terminal_review"]["evidence"]["workspace"]["path"]
+    )
+    if preimage is not None:
+        (manager.repo / TARGET).parent.mkdir(parents=True, exist_ok=True)
+        (manager.repo / TARGET).write_bytes(preimage)
+    (manager.repo / "README.md").write_bytes(b"unrelated canonical bytes\n")
+    real_identity = process_launcher_acceptance._correction_identity
+    calls: list[int] = []
+
+    def _mismatch_after_the_patch_applies(*args, **kwargs):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            # The pre-promotion check sees a consistent receipt ...
+            return real_identity(*args, **kwargs)
+        # ... and the post-promotion receipt is injected to mismatch.
+        raise process_launcher_acceptance.WorkspaceError(
+            f"{_RECEIPT_MISMATCH}:corrected_path_hashes:{TARGET}"
+        )
+
+    monkeypatch.setattr(
+        process_launcher_acceptance, "_correction_identity", _mismatch_after_the_patch_applies
+    )
+    before = _canonical_tree_digest(manager.repo)
+
+    result = _accept(manager, manager_correction=_correction_payload())
+
+    assert len(calls) == 2
+    # Promotion really wrote the corrected bytes before the receipt refused ...
+    assert manager.promoted == [[TARGET]]
+    assert result["ok"] is False
+    assert result["error"] == f"{_RECEIPT_MISMATCH}:corrected_path_hashes:{TARGET}"
+    assert result["mismatch_field"] == f"corrected_path_hashes:{TARGET}"
+    assert result["rolled_back_paths"] == [TARGET]
+    assert result["promoted_paths"] == []
+    assert "canonical_restore_failed" not in result
+    # ... and every one of them is back to its pre-image, byte for byte.
+    assert _canonical_tree_digest(manager.repo) == before
+    if preimage is None:
+        assert not (manager.repo / TARGET).exists()
+    else:
+        assert (manager.repo / TARGET).read_bytes() == preimage
+    assert (workspace_path / TARGET).read_text(encoding="utf-8") == CANDIDATE
+    _assert_still_in_review(manager)
+
+
+def _canonical_dirs(repo: Path) -> list[str]:
+    """Every canonical directory outside the card state, as posix relatives."""
+    return sorted(
+        path.relative_to(repo).as_posix()
+        for path in repo.rglob("*")
+        if path.is_dir() and ".aiworkhub" not in path.relative_to(repo).parts
+    )
+
+
+def _inject_after_promotion(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> list[int]:
+    """Let the pre-promotion check pass, then raise ``exc`` post-promotion."""
+    real_identity = process_launcher_acceptance._correction_identity
+    calls: list[int] = []
+
+    def _identity(*args, **kwargs):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            return real_identity(*args, **kwargs)
+        raise exc
+
+    monkeypatch.setattr(process_launcher_acceptance, "_correction_identity", _identity)
+    return calls
+
+
+def test_untyped_exception_after_promotion_restores_canonical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Rework (a): a non-typed exception after the first canonical write still
+    # restores every pre-image before it propagates.
+    manager = _accept_env(tmp_path, monkeypatch)
+    (manager.repo / TARGET).parent.mkdir(parents=True, exist_ok=True)
+    (manager.repo / TARGET).write_bytes(b"# canonical pre-image\n")
+    calls = _inject_after_promotion(monkeypatch, RuntimeError("injected after promotion"))
+    before = _canonical_tree_digest(manager.repo)
+
+    with pytest.raises(RuntimeError, match="injected after promotion"):
+        _accept(manager, manager_correction=_correction_payload())
+
+    assert len(calls) == 2
+    assert manager.promoted == [[TARGET]]
+    assert _canonical_tree_digest(manager.repo) == before
+    assert (manager.repo / TARGET).read_bytes() == b"# canonical pre-image\n"
+    _assert_still_in_review(manager)
+
+
+def test_failed_correction_leaves_no_new_nested_dir_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Rework (b): promotion created src/demo/ for a new file; rollback removes
+    # the file AND every directory that promotion created for it.
+    manager = _accept_env(tmp_path, monkeypatch)
+    assert not (manager.repo / TARGET).parent.exists()
+    dirs_before = _canonical_dirs(manager.repo)
+    _inject_after_promotion(
+        monkeypatch,
+        process_launcher_acceptance.WorkspaceError(
+            f"{_RECEIPT_MISMATCH}:corrected_path_hashes:{TARGET}"
+        ),
+    )
+    before = _canonical_tree_digest(manager.repo)
+
+    result = _accept(manager, manager_correction=_correction_payload())
+
+    assert manager.promoted == [[TARGET]]
+    assert result["ok"] is False
+    assert result["rolled_back_paths"] == [TARGET]
+    assert _canonical_tree_digest(manager.repo) == before
+    assert _canonical_dirs(manager.repo) == dirs_before
+    assert not (manager.repo / TARGET).parent.exists()
+    _assert_still_in_review(manager)
+
+
+def test_restore_removes_empty_parents_but_never_the_repo_root(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "kept").mkdir(parents=True)
+    (repo / "kept" / "new.txt").write_bytes(b"promoted\n")
+
+    assert process_launcher_acceptance.restore_canonical_preimages(
+        repo, {"kept/new.txt": None}
+    ) == []
+
+    # Walking up stops at the repo root, which is never removed.
+    assert not (repo / "kept").exists()
+    assert repo.is_dir()
+
+
+@pytest.mark.parametrize(
+    "escaping",
+    [
+        pytest.param("../outside.txt", id="dotdot"),
+        pytest.param("sub/../../outside.txt", id="nested_dotdot"),
+        pytest.param("/outside.txt", id="posix_absolute"),
+        pytest.param("C:/outside.txt", id="drive_qualified"),
+        pytest.param("C:outside.txt", id="drive_relative"),
+    ],
+)
+def test_preimage_paths_must_stay_inside_the_repo(tmp_path: Path, escaping: str) -> None:
+    # Rework (c): both snapshot and restore refuse an escaping entry, and
+    # restore refuses before writing ANY entry, valid ones included.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside.txt"
+
+    with pytest.raises(process_launcher_acceptance.WorkspaceError):
+        process_launcher_acceptance.canonical_preimages(repo, [escaping])
+    with pytest.raises(process_launcher_acceptance.WorkspaceError):
+        process_launcher_acceptance.restore_canonical_preimages(
+            repo, {"inside.txt": b"inside\n", escaping: b"escaped\n"}
+        )
+
+    assert not outside.exists()
+    assert not (repo / "inside.txt").exists()
+    assert list(repo.iterdir()) == []
+
+
+def test_preimage_refuses_a_symlinked_parent_that_escapes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    try:
+        (repo / "linked").symlink_to(elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation not permitted: {exc}")
+
+    with pytest.raises(process_launcher_acceptance.WorkspaceError):
+        process_launcher_acceptance.restore_canonical_preimages(
+            repo, {"linked/escaped.txt": b"escaped\n"}
+        )
+
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_restore_replaces_a_leaf_symlink_and_never_writes_through_it(
+    tmp_path: Path,
+) -> None:
+    # Rework (d): a leaf swapped for a link to a file outside the repo is
+    # restored as a regular file; an absent pre-image unlinks only the link.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "leaf.txt").write_bytes(b"canonical pre-image\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside bytes\n")
+    preimages = process_launcher_acceptance.canonical_preimages(
+        repo, ["leaf.txt", "absent.txt"]
+    )
+    assert preimages == {"leaf.txt": b"canonical pre-image\n", "absent.txt": None}
+    (repo / "leaf.txt").unlink()
+    try:
+        (repo / "leaf.txt").symlink_to(outside)
+        (repo / "absent.txt").symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation not permitted: {exc}")
+
+    assert process_launcher_acceptance.restore_canonical_preimages(repo, preimages) == []
+
+    leaf = repo / "leaf.txt"
+    assert not leaf.is_symlink()
+    assert leaf.is_file()
+    assert leaf.read_bytes() == b"canonical pre-image\n"
+    assert not (repo / "absent.txt").is_symlink()
+    assert not (repo / "absent.txt").exists()
+    assert outside.read_bytes() == b"outside bytes\n"
