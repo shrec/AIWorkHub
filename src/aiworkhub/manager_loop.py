@@ -912,6 +912,8 @@ class ManagerOrchestrator:
         # NF-2026-02420: the session whose missing compaction bound was already looked up in
         # the store, so a chain that never compacted scans the store once, not every turn.
         self._bound_seeded: str | None = None
+        # NF-2026-00979: True while a successor's continue turn runs; see ``_rotate``.
+        self._continuing: bool = False
 
     @property
     def partial(self) -> dict[str, Any] | None:
@@ -1897,12 +1899,43 @@ class ManagerOrchestrator:
                 rotation["successor_error"] = _failure(exc)
                 failed = {"source": "successor_open", "error": rotation["successor_error"]}
                 self._record(closed, closed.turn_count, "error", failed)
+            else:
+                # NF-2026-00979: the successor's one automatic continue turn, worded from its handoff.
+                # A continue turn that rotates again opens its successor without another continue.
+                if self._continuing:
+                    rotation["continue"] = {"ok": False, "skipped": "nested_rotation"}
+                else:
+                    rotation["continue"] = self._continue_successor(reason, handoff, mechanical=mechanical)
+                # A nested rotation closed this successor and moved _session on: name the closed record.
+                nested = rotation["continue"].get("rotation")
+                rotation["successor"] = nested["session"] if nested else self._session
         # NF-2026-01873 / NF-2026-02318: the selection never keeps naming the closed record.
         # ``_open`` moved an explicit selection onto the successor; otherwise it is cleared,
         # so the next ensure opens a successor from the handoff instead.
         if self.store.read_selection() == closed.session_id:
             self.store.clear_selection()
         return rotation
+
+    def _continue_successor(self, reason: str, handoff: str, *, mechanical: bool) -> dict[str, Any]:
+        """Run the successor's one automatic continue turn, worded from the handoff it opened on.
+
+        A mechanical rotation's handoff is the event log's own summary, so the turn says so.
+        A failed continue is recorded on the successor and returned; the rotation stands either way.
+        """
+        source = "mechanical handoff" if mechanical else "handoff"
+        message = f"Continue after rotation for {reason}. The {source} follows:\n\n{handoff}"
+        # The flag marks a continue turn in flight: a rotation it causes must not chain another.
+        self._continuing = True
+        try:
+            return self._turn(message, "continue", "")
+        except Exception as exc:  # noqa: BLE001 - the successor is open; the failed continue is recorded
+            failed = {"source": "successor_continue", "error": _failure(exc)}
+            successor = self._session
+            if successor is not None:
+                self._record(successor, successor.turn_count, "error", failed)
+            return {"ok": False, "errors": [failed]}
+        finally:
+            self._continuing = False
 
     def _finish(
         self, session: ManagerSession, handoff: str, reason: str, *, mechanical: bool

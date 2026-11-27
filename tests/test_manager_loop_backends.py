@@ -1211,7 +1211,12 @@ def test_a_compacted_claude_turn_keeps_the_summary_out_of_the_reply_and_rotates(
     assert result["rotation_basis"] == "provider_compaction"
     assert result["rotation"] is not None
     assert result["rotation"]["session"].session_id == session.session_id
-    assert len(fake.argv_calls) == 2, "the compacted turn and its handoff ran one CLI turn each"
+    assert len(fake.argv_calls) == 3, "the compacted turn, its handoff and the successor's continue turn ran one CLI turn each"
+    continue_argv = fake.argv_calls[2]
+    # The successor's first turn carries its built brief, then the continue message.
+    prompt = continue_argv[continue_argv.index("-p") + 1]
+    assert prompt.count("Continue after rotation for provider_compaction. The ") == 1
+    assert not any("Continue after rotation" in argv[argv.index("-p") + 1] for argv in fake.argv_calls[:2])
     assert all(child.poll() is not None for child in fake.children), "no turn leaked a child"
 
 
