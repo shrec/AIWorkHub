@@ -72,4 +72,9 @@ Multicore by default:
 - Parallelism changes only how fast, never what is measured or produced; results stay identical to the sequential path.
 - Threads for IO-bound work that releases the GIL, processes for CPU-bound work, chosen from a measurement, not a rule of thumb.
 - A path left sequential after measurement is a valid outcome; the recorded measurement is what justifies it.
+Incremental by default:
+- A check, test run, scan or validation never re-verifies inputs that did not change; results are keyed by a content digest of their inputs and reused while the digest matches.
+- A cache miss, unknown input or unmapped path fails closed to the full check; incremental changes only how much is re-run, never what is proven.
+- A rerun after a failure resumes from the failed items plus what changed since, not from the start.
+- A full path kept after measurement is a valid outcome; the recorded measurement justifies it.
 Stop at manager review.

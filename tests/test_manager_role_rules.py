@@ -105,6 +105,69 @@ def test_multicore_principle_is_in_the_shared_canonical_not_claude_only() -> Non
     assert "Multicore by default:" not in instr.CLAUDE_MANAGER_PREAMBLE
 
 
+# NF-2026-00975 (owner rule 2026-11-27): the incremental-by-default principle
+# follows the NF-2026-00294 multicore pattern -- it rides the shared POLICY, so
+# every provider projection and the canonical document carry it. Each fragment
+# is a distinctive slice of one of the four rendered principle lines.
+INCREMENTAL_STATEMENTS = (
+    "Incremental by default:",
+    "A check, test run, scan or validation never re-verifies inputs that did not change",
+    "results are keyed by a content digest of their inputs and reused while the digest matches",
+    "A cache miss, unknown input or unmapped path fails closed to the full check",
+    "incremental changes only how much is re-run, never what is proven",
+    "A rerun after a failure resumes from the failed items plus what changed since, not from the start",
+    "A full path kept after measurement is a valid outcome",
+    "the recorded measurement justifies it",
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+# The four checked-in documents rendered from POLICY: three provider
+# projections plus the canonical policy document.
+_RENDERED_DOCUMENTS = (*instr.PROVIDERS, "docs/AIWORKHUB_TOOL_USE_POLICY.md")
+
+
+def _incremental_section(text: str) -> str:
+    start = text.index("Incremental by default:\n")
+    end = text.index(instr.POLICY.finish, start)
+    return text[start:end]
+
+
+def test_incremental_principle_present_in_every_provider_projection() -> None:
+    rendered = instr.render_all()
+    assert tuple(rendered) == instr.PROVIDERS
+    for provider, text in rendered.items():
+        for statement in INCREMENTAL_STATEMENTS:
+            assert statement in text, f"{provider!r} missing incremental statement: {statement!r}"
+
+
+def test_incremental_principle_is_in_the_shared_canonical_right_after_multicore() -> None:
+    canonical = instr.render_canonical()
+    for statement in INCREMENTAL_STATEMENTS:
+        assert statement in canonical, statement
+    multicore = canonical.index("Multicore by default:")
+    incremental = canonical.index("Incremental by default:")
+    finish = canonical.index(instr.POLICY.finish)
+    assert multicore < incremental < finish
+    # Nothing sits between the last multicore line and the incremental header.
+    last_multicore = f"- {instr.POLICY.multicore[-1]}\n"
+    assert canonical[:incremental].endswith(last_multicore)
+    assert "Incremental by default:" not in instr.CLAUDE_MANAGER_PREAMBLE
+
+
+def test_incremental_section_in_every_checked_in_document_matches_the_renderer() -> None:
+    """All four rendered documents carry the section byte-identical to the
+    renderer output, so a hand edit or a stale re-render cannot pass."""
+    expected = _incremental_section(instr.render_canonical())
+    for statement in INCREMENTAL_STATEMENTS:
+        assert statement in expected, statement
+    for relative in _RENDERED_DOCUMENTS:
+        text = (_REPO_ROOT / relative).read_bytes().decode("utf-8")
+        assert _incremental_section(text) == expected, relative
+    for provider in instr.PROVIDERS:
+        on_disk = (_REPO_ROOT / provider).read_bytes().decode("utf-8")
+        assert instr.render_projection(provider) in on_disk, provider
+
+
 def test_role_present_in_every_provider_projection() -> None:
     """Criterion 6: the role cannot silently regress to protocol-only.
 

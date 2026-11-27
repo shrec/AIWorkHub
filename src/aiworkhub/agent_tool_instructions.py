@@ -122,8 +122,17 @@ from . import runtime_adapters
 # for by a cap raise: measured canonical 7454 -> 7657, AGENTS.md 7552 -> 7755,
 # copilot 7574 -> 7777, CLAUDE.md 9256 -> 9459, keeping the same ~100 bytes of
 # headroom.
-CANONICAL_MAX_BYTES = 7760
-PROJECTION_MAX_BYTES = 9560
+#
+# NF-2026-00975 (owner rule 2026-11-27) adds the shared "Incremental by
+# default:" section right after the multicore one, following the NF-2026-00294
+# pattern: a header plus four new lines, every prior rule rendered verbatim,
+# nothing it could absorb says it already. Measured before -> after on this
+# tree: canonical 7703 -> 8247, AGENTS.md 7801 -> 8345, copilot 7823 -> 8367,
+# CLAUDE.md 9505 -> 10049 (+544 each). Both caps are raised by exactly that
+# measured +544 (7760 -> 8304, 9560 -> 10104), so the headroom stays the 57 /
+# 55 bytes it was before this change.
+CANONICAL_MAX_BYTES = 8304
+PROJECTION_MAX_BYTES = 10104
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 # Annotated with the Literal it is built from (a forward reference, resolved
@@ -222,6 +231,7 @@ class ToolPolicy:
     memory: tuple[str, ...]
     kb: tuple[str, ...]
     multicore: tuple[str, ...]
+    incremental: tuple[str, ...]
     finish: str
 
 
@@ -330,6 +340,14 @@ POLICY = ToolPolicy(
         "Parallelism changes only how fast, never what is measured or produced; results stay identical to the sequential path.",
         "Threads for IO-bound work that releases the GIL, processes for CPU-bound work, chosen from a measurement, not a rule of thumb.",
         "A path left sequential after measurement is a valid outcome; the recorded measurement is what justifies it.",
+    ),
+    # NF-2026-00975 (owner rule 2026-11-27): applies to AIWorkHub and every
+    # project written through it, alongside the multicore principle above.
+    incremental=(
+        "A check, test run, scan or validation never re-verifies inputs that did not change; results are keyed by a content digest of their inputs and reused while the digest matches.",
+        "A cache miss, unknown input or unmapped path fails closed to the full check; incremental changes only how much is re-run, never what is proven.",
+        "A rerun after a failure resumes from the failed items plus what changed since, not from the start.",
+        "A full path kept after measurement is a valid outcome; the recorded measurement justifies it.",
     ),
     finish="Stop at manager review.",
 )
@@ -741,6 +759,8 @@ def _lines(policy: ToolPolicy = POLICY) -> list[str]:
         *[f"- {item}" for item in policy.kb],
         "Multicore by default:",
         *[f"- {item}" for item in policy.multicore],
+        "Incremental by default:",
+        *[f"- {item}" for item in policy.incremental],
         policy.finish,
     ]
 
