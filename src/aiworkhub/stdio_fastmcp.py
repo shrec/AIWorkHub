@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import mcp_stateless
 from . import mcp_tool_metadata as _tool_metadata
 from .tool_recovery import (
     missing_required_refusal,
@@ -395,6 +396,33 @@ def _dispatch(
     input_schema_transform: Any = None,
 ) -> Any:
     params = _validate_rpc_params(method, params, request_id=request_id)
+    # NF-2026-00973: the 2026-07-28 stateless core, server/discover and the
+    # Tasks extension have one owner shared with server._stdio_dispatch.
+    return mcp_stateless.dispatch(
+        server_name=server_name,
+        method=method,
+        params=params,
+        legacy=lambda legacy_method, legacy_params: _legacy_dispatch(
+            server_name,
+            tools,
+            legacy_method,
+            legacy_params,
+            input_schema_transform=input_schema_transform,
+        ),
+        error_type=ProtocolError,
+        tool_available=lambda tool_name: tool_name in tools,
+    )
+
+
+def _legacy_dispatch(
+    server_name: str,
+    tools: dict[str, Any],
+    method: Any,
+    params: dict[str, Any],
+    *,
+    input_schema_transform: Any = None,
+) -> Any:
+    """The initialize-era dispatcher, unchanged for <=2025-11-25 clients."""
     if method == "initialize":
         return {
             "protocolVersion": negotiate_protocol_version(params.get("protocolVersion")),
@@ -492,7 +520,7 @@ def _run(server_name: str, tools: dict[str, Any], *, input_schema_transform: Any
             )
             _write({"jsonrpc": "2.0", "id": request_id, "result": result})
         except ProtocolError as exc:
-            _write({"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": exc.message}})
+            _write({"jsonrpc": "2.0", "id": request_id, "error": mcp_stateless.error_object(exc)})
         except Exception as exc:
             _stderr_event(
                 "request_failed",

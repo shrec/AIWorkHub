@@ -228,6 +228,7 @@ except ModuleNotFoundError:
     # and the tools/list envelope have one owner, stdio_fastmcp.
     from .stdio_fastmcp import negotiate_protocol_version
     from .stdio_fastmcp import tools_list_result as _stdio_tools_list_result
+    from . import mcp_stateless as _stdio_stateless
     _FALLBACK_MAX_LINE_BYTES = 8 * 1024 * 1024
     _FALLBACK_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -509,6 +510,30 @@ except ModuleNotFoundError:
         request_id: Any = None,
     ) -> Any:
         params = _validate_stdio_rpc_params(method, params, request_id=request_id)
+        # NF-2026-00973: the 2026-07-28 stateless core, server/discover and the
+        # Tasks extension have one owner shared with stdio_fastmcp._dispatch.
+        return _stdio_stateless.dispatch(
+            server_name=name,
+            method=method,
+            params=params,
+            legacy=lambda legacy_method, legacy_params: _stdio_legacy_dispatch(
+                name, tools, legacy_method, legacy_params, instructions
+            ),
+            error_type=_StdioProtocolError,
+            tool_available=lambda tool_name: (
+                tool_name in tools and mcp_tool_callable(tool_name, mcp_surface())
+            ),
+            instructions=instructions,
+        )
+
+    def _stdio_legacy_dispatch(
+        name: str,
+        tools: dict[str, Any],
+        method: Any,
+        params: dict[str, Any],
+        instructions: str = "",
+    ) -> Any:
+        """The initialize-era dispatcher, unchanged for <=2025-11-25 clients."""
         if method == "initialize":
             result = {
                 "protocolVersion": negotiate_protocol_version(params.get("protocolVersion")),
@@ -596,7 +621,7 @@ except ModuleNotFoundError:
                 except _StdioProtocolError as exc:
                     return {
                         "jsonrpc": "2.0", "id": msg_id,
-                        "error": {"code": exc.code, "message": exc.message},
+                        "error": _stdio_stateless.error_object(exc),
                     }
                 except Exception as exc:  # defensive: one request never kills the lane
                     _stdio_log(
