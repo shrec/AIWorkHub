@@ -14,7 +14,15 @@ hook can tell a live watcher from none (NF-2026-02110). The heartbeat is the
 watcher's only write and is best-effort: failing to write it never ends the
 watch.
 
-Exit codes: 0 callback pending, 3 timeout, 2 store error.
+With ``--follow`` (NF-2026-01020) the watcher does not exit on a pending batch:
+it emits one ``callback_pending`` JSON line per batch identity (the peek's
+``batch_id``, else the batch's canonical JSON) not yet emitted by this process,
+then keeps polling until ``--timeout``.  The same batch peeked on later polls is
+never re-emitted; the seen-set keeps only the last ``FOLLOW_SEEN_LIMIT`` ids.
+It still only peeks.
+
+Exit codes: 0 callback pending, 3 timeout, 2 store error.  With ``--follow``
+the process ends only on timeout (3) or a store error (2).
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ import os
 import sqlite3
 import sys
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -82,6 +91,16 @@ def _remove_heartbeat(path: Path | None) -> None:
 
 
 SEED_PEEK_INTERVAL_SECONDS = 30.0
+FOLLOW_SEEN_LIMIT = 1024
+
+
+def _batch_identity(batch: dict) -> str:
+    """The batch id the peek returned, else the batch's canonical JSON."""
+
+    batch_id = batch.get("batch_id")
+    if batch_id:
+        return f"batch_id:{batch_id}"
+    return "json:" + json.dumps(batch, sort_keys=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -91,6 +110,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--origin-thread-id", required=True)
     parser.add_argument("--timeout", type=float, default=3600.0)
     parser.add_argument("--poll-interval", type=float, default=2.0)
+    parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="stay alive and emit one JSON line per newly pending batch until --timeout",
+    )
     args = parser.parse_args(argv)
     poll_interval = max(0.05, args.poll_interval)
     deadline = time.monotonic() + max(0.0, args.timeout)
@@ -99,6 +123,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, RuntimeError, ValueError):
         heartbeat = None
     last_seed_at: float | None = None
+    # --follow only: identities already emitted, oldest first, capped at FOLLOW_SEEN_LIMIT.
+    seen: OrderedDict[str, None] = OrderedDict()
     try:
         db_path = callback_store.resolve_db_path(args.repo)
         while True:
@@ -120,8 +146,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # Seed scan ran this poll; throttle until SEED_PEEK_INTERVAL_SECONDS elapses.
                 last_seed_at = now
             if batch is not None:
-                _emit({"status": "callback_pending", **batch})
-                return EXIT_PENDING
+                if not args.follow:
+                    _emit({"status": "callback_pending", **batch})
+                    return EXIT_PENDING
+                identity = _batch_identity(batch)
+                if identity not in seen:
+                    _emit({"status": "callback_pending", **batch})
+                seen[identity] = None
+                seen.move_to_end(identity)
+                while len(seen) > FOLLOW_SEEN_LIMIT:
+                    seen.popitem(last=False)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _emit({"status": "timeout"})
