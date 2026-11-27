@@ -1761,26 +1761,79 @@ def _promotion_version_projections(
 _REACHABILITY_MAX_EDGE_ROWS = 200_000
 
 
+_MODULE_LEVEL_SYMBOL = "<module>"
+
+
+def _top_level_symbol_dumps(tree: ast.Module) -> dict[str, str]:
+    """Map each top-level function/class and ``Class.method`` to its AST dump.
+
+    Keys are qualified (``Class.method`` for methods, the bare name at top
+    level) and the LAST definition wins, exactly as Python binds a redefined
+    name, so a later redefinition/shadowing is never hidden by an earlier one.
+    Non-def/class top-level statements (imports, assignments, ``if __name__``
+    blocks) are folded into one synthetic ``<module>`` entry.
+    """
+
+    dumps: dict[str, str] = {}
+    module_level: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            dumps[node.name] = ast.dump(node)
+        elif isinstance(node, ast.ClassDef):
+            dumps[node.name] = ast.dump(node)
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    dumps[f"{node.name}.{sub.name}"] = ast.dump(sub)
+        else:
+            module_level.append(ast.dump(node))
+    if module_level:
+        dumps[_MODULE_LEVEL_SYMBOL] = "\n".join(module_level)
+    return dumps
+
+
+def _contained_base_file(base_root: Path, relative: str) -> Path | None:
+    """Return ``base_root / relative`` only when it stays inside ``base_root``."""
+
+    rel = str(relative).replace("\\", "/")
+    if not rel or Path(rel).is_absolute() or rel.startswith("/") or ".." in rel.split("/"):
+        return None
+    if re.match(r"^[A-Za-z]:", rel):
+        return None
+    try:
+        root = base_root.resolve()
+        target = (root / rel).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not target.is_relative_to(root):
+        return None
+    return target
+
+
 def _candidate_changed_symbols(
-    workspace_root: Path, changed_py: Iterable[str]
+    workspace_root: Path,
+    changed_py: Iterable[str],
+    base_root: Path | None = None,
+    base_reader: Callable[[str], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Enumerate the symbols the candidate defines in its changed Python files.
 
     This is symbol ENUMERATION over the candidate source (top-level functions,
     classes and their methods), not a call-graph analyser: the call/reference
     edges that decide reachability come from Source Graph.
+
+    NF-2026-00328: with a base (``base_reader`` -- text of the base file, or
+    ``None`` when the base has no such file -- else ``base_root``) the
+    candidate AST is diffed against the base file: a name absent from the base
+    is ``added``, a name whose AST differs is ``modified`` and an untouched
+    neighbour is omitted, so an added orphan is distinguishable from code the
+    candidate never changed.  A change confined to module-level statements is
+    reported as the synthetic ``<module>`` symbol.  A base file that does not
+    exist makes every symbol ``added``; an unreadable, unparsable or
+    out-of-root base (or no base at all) keeps the conservative ``modified``.
     """
 
     symbols: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
-
-    def _add(name: str, relative: str) -> None:
-        key = (relative, name)
-        if name and key not in seen:
-            seen.add(key)
-            symbols.append(
-                {"symbol": name, "file": relative, "change": quality_review.CHANGE_MODIFIED}
-            )
 
     for relative in changed_py:
         try:
@@ -1788,15 +1841,91 @@ def _candidate_changed_symbols(
             tree = ast.parse(source)
         except (OSError, UnicodeError, SyntaxError, ValueError):
             continue
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                _add(node.name, relative)
-            elif isinstance(node, ast.ClassDef):
-                _add(node.name, relative)
-                for sub in node.body:
-                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        _add(sub.name, relative)
+        base_dumps: dict[str, str] | None = None
+        if base_reader is not None:
+            try:
+                base_text = base_reader(relative)
+                base_dumps = (
+                    {} if base_text is None else _top_level_symbol_dumps(ast.parse(base_text))
+                )
+            except (OSError, UnicodeError, SyntaxError, ValueError):
+                base_dumps = None
+        elif base_root is not None:
+            base_file = _contained_base_file(base_root, relative)
+            if base_file is not None:
+                try:
+                    base_dumps = _top_level_symbol_dumps(
+                        ast.parse(base_file.read_text(encoding="utf-8"))
+                    )
+                except FileNotFoundError:
+                    base_dumps = {}
+                except (OSError, UnicodeError, SyntaxError, ValueError):
+                    base_dumps = None
+        for name, dump in _top_level_symbol_dumps(tree).items():
+            key = (relative, name)
+            if not name or key in seen:
+                continue
+            if base_dumps is None:
+                if name == _MODULE_LEVEL_SYMBOL:
+                    continue  # no base: per-symbol conservative labels suffice
+                change = quality_review.CHANGE_MODIFIED
+            elif name not in base_dumps:
+                change = (
+                    quality_review.CHANGE_MODIFIED
+                    if name == _MODULE_LEVEL_SYMBOL
+                    else quality_review.CHANGE_ADDED
+                )
+            elif base_dumps[name] != dump:
+                change = quality_review.CHANGE_MODIFIED
+            else:
+                continue  # untouched neighbour: not a change
+            seen.add(key)
+            symbols.append({"symbol": name, "file": relative, "change": change})
+        if base_dumps and _MODULE_LEVEL_SYMBOL in base_dumps:
+            key = (relative, _MODULE_LEVEL_SYMBOL)
+            if key not in seen and _MODULE_LEVEL_SYMBOL not in _top_level_symbol_dumps(tree):
+                seen.add(key)
+                symbols.append(
+                    {
+                        "symbol": _MODULE_LEVEL_SYMBOL,
+                        "file": relative,
+                        "change": quality_review.CHANGE_MODIFIED,
+                    }
+                )
     return symbols
+
+
+def _git_base_reader(workspace_root: Path, base_oid: str) -> Callable[[str], str | None]:
+    """Read a file's text at the pinned ``base_oid`` (``None`` when absent there)."""
+
+    def _read(relative: str) -> str | None:
+        rel = str(relative).replace("\\", "/")
+        if not rel or rel.startswith("/") or ".." in rel.split("/") or re.match(r"^[A-Za-z]:", rel):
+            raise ValueError("base_path_outside_root")
+        try:
+            listed = subprocess.run(
+                ["git", "-C", str(workspace_root), "ls-tree", "--name-only", base_oid, "--", rel],
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if listed.returncode != 0:
+                raise OSError(f"git_ls_tree_failed:{listed.returncode}")
+            if not listed.stdout.strip():
+                return None
+            shown = subprocess.run(
+                ["git", "-C", str(workspace_root), "show", f"{base_oid}:{rel}"],
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+        except subprocess.SubprocessError as exc:
+            raise OSError(f"git_base_read_failed:{type(exc).__name__}") from exc
+        if shown.returncode != 0:
+            raise OSError(f"git_show_failed:{shown.returncode}")
+        return shown.stdout.decode("utf-8")
+
+    return _read
 
 
 def _read_candidate_short_name_edges(
@@ -10038,6 +10167,27 @@ class ProcessManager:
             and str(terminal.get("substatus") or "") == "validation_failed"
         ):
             stored_hashes = {}
+        # NF-2026-00644: a writable candidate whose finalizer failed before it
+        # sealed any hashes carries no hash evidence by construction.  That is
+        # a recoverable finalizer outcome, not tampering, so the workspace is
+        # preserved for the finalize retry instead of being quarantined as
+        # ``review_workspace_hashes_missing``.  A partial/invalid hash map still
+        # takes the fail-closed path below.
+        if (
+            isinstance(terminal, dict)
+            and stored_hashes is None
+            and str(terminal.get("substatus") or "") == "finalize_failed"
+            # Only the writable, isolated worktree mode NF-2026-00644 names:
+            # both workspace records declare writes and the candidate lives
+            # outside the authority repo.  Every other mode still quarantines.
+            and bool(metadata_workspace.allowed_writes)
+            and bool(review_workspace.allowed_writes)
+            and review_workspace.path.resolve() != review_workspace.repo.resolve()
+            and not review_workspace.path.resolve().is_relative_to(
+                review_workspace.repo.resolve()
+            )
+        ):
+            return True, "review_workspace_finalize_failed_unhashed"
         if not isinstance(stored_hashes, dict):
             return False, "review_workspace_hashes_missing"
         if not stored_hashes and isinstance(changed_paths, list) and changed_paths:
@@ -12578,7 +12728,32 @@ class ProcessManager:
         ]
         if not changed_py:
             return None
-        changed_symbols = _candidate_changed_symbols(workspace_root, changed_py)
+        # NF-2026-00328: the authority repo is the base the candidate was
+        # seeded from; diffing against it separates added from modified.
+        # Prefer the pinned ``base_oid`` (the same baseline ``changed_paths``
+        # diffs against); fall back to ``workspace.repo`` only without one.
+        base_repo = getattr(workspace, "repo", None)
+        try:
+            base_root = Path(base_repo) if base_repo else None
+        except (TypeError, ValueError):
+            base_root = None
+        try:
+            if base_root is not None and base_root.resolve() == workspace_root.resolve():
+                base_root = None
+        except (OSError, RuntimeError, ValueError):
+            base_root = None
+        base_oid = getattr(workspace, "base_oid", None)
+        base_reader = (
+            # Read the pin from the authority repo, never the candidate's own .git.
+            _git_base_reader(base_root, str(base_oid))
+            if base_root is not None
+            and isinstance(base_oid, str)
+            and re.fullmatch(r"[0-9a-fA-F]{7,64}", base_oid)
+            else None
+        )
+        changed_symbols = _candidate_changed_symbols(
+            workspace_root, changed_py, base_root=base_root, base_reader=base_reader
+        )
         if not changed_symbols:
             return None
         try:
