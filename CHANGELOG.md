@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Changed
+
+- Shared POLICY: every rendered instruction projection (CLAUDE.md, AGENTS.md, `.github/copilot-instructions.md`, `docs/AIWORKHUB_TOOL_USE_POLICY.md` and the generated tool instructions) carries the "Incremental by default:" principle: a check, test run, scan or validation never re-verifies unchanged inputs, results are keyed by a content digest, a miss fails closed to the full check, and a rerun after a failure resumes from the failed items (NF-2026-00975).
+
+### Fixed
+
+- Release cut test selection: an unmapped changed path no longer forces the full suite; it widens the selection by the tests that name it, and fails closed to the full suite only when no test references it. A rerun of the same version resumes from the failed test nodes plus what changed since, through `.scratch/release/VERSION/resume.json` (`aiworkhub.release_cut.resume.v1`, keyed by HEAD); a recorded node pytest no longer collects (exit 4 serially, 5 under xdist) drops the resume entry and runs the normal selection, on the host and in WSL (NF-2026-00976).
+- Manager console rotation: the successor session runs one automatic continue turn worded from its handoff (a mechanical handoff says so), so the chat no longer stalls after a rotation; a continue turn that rotates again does not chain another continue, a failed continue is recorded on the successor, and callbacks keep waking the active session (NF-2026-00979).
+- Quality gate: a truncated failing-check summary keeps the lines that name the failure (`failed with exit code`, `not ok`, `✖`, `AssertionError`, `Error:`) with two lines of context ahead of the head/tail window, so a sandbox-only failure names its test instead of being cut away (NF-2026-00982).
+
 ## [0.13.16] - 2026-11-27
 
 ### Changed

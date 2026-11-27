@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Bundles runtime 0.13.17: the release cut widens an unmapped changed path by the tests that name it instead of running the full suite, and a rerun resumes from the failed test nodes; after a manager-console session rotation the successor runs one automatic continue turn from its handoff and callbacks keep waking the active session; a truncated failing-check summary keeps the lines that name the failure; every seat's instructions carry the "Incremental by default" principle.
+
 ## 0.13.16 — 2026-11-27
 
 ### Fixed
