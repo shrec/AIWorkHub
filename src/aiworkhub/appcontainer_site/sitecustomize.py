@@ -38,7 +38,12 @@ path from its drive root -- ``repository_state``'s symlink check -- refused
 every path.  When such a call is denied, the answer is the host's own
 ``lstat`` of that exact directory, which the lane passes in
 ``AIWORKHUB_APPCONTAINER_ANCESTORS`` (``windows_appcontainer.
-``ancestor_stat_facts``).  Only those directories, only on a denial.
+``ancestor_stat_facts``).  Only those directories, only on a denial.  A
+denied entry directly inside one of them reads as not found (ENOENT):
+pytest's rootdir search stats ``pyproject.toml`` / ``setup.cfg`` /
+``tox.ini`` in every ancestor, and since the Z: drive removal those ancestors
+are real directories the container may not look into, so to it their entries
+do not exist, as under the drive.
 
 Not a call but the environment: CreateProcess into the container replaced
 TEMP and TMP with the adapter-shared ``...\\AC\\Temp`` and kept TMPDIR
@@ -48,6 +53,7 @@ own scratch.
 """
 
 import ctypes
+import errno
 import json
 import ntpath
 import os
@@ -148,14 +154,20 @@ def _brokered(real, facts):
     def call(path, *args, **kwargs):
         try:
             return real(path, *args, **kwargs)
-        except PermissionError:
+        except PermissionError as denied:
             try:
                 key = ntpath.normcase(ntpath.abspath(os.fspath(path)))
             except TypeError:
                 key = None
-            if key not in facts or args or kwargs.get("dir_fd") is not None:
+            if key is None or args or kwargs.get("dir_fd") is not None:
                 raise
-            return facts[key]
+            if key in facts:
+                return facts[key]
+            if ntpath.dirname(key) not in facts:
+                raise
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), path
+            ) from denied
 
     return call
 
