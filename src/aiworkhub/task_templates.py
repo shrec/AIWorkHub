@@ -2369,9 +2369,153 @@ def classify_task_card(
             f"custom_escape_invalid:custom_template_escape expected "
             f"{AUDITED_CUSTOM_ESCAPE!r}, got {escape!r}"
         )
+    auto_selected = _auto_select_caller_validation(
+        card_view, minimality_contract=minimality_contract
+    )
+    if auto_selected is not None:
+        return auto_selected
     message = (
         f"template_unclassified:no registered template matched; closest "
         f"{closest_template}: {closest_field} differs; or pass "
         f"custom_template_escape='audited_custom_unclassified'"
     )
     raise TaskTemplateError(message[:512])
+
+
+# Suffixes that keep a card on the Python classification path: a card touching
+# any of them never auto-selects the language-neutral template (NF-2026-01015).
+_PYTHON_SOURCE_SUFFIXES: tuple[str, ...] = (".py", ".pyi")
+# Normalized validation heads (basename, lowercase, ``.exe`` stripped) that keep
+# a card on the Python classification path: a non-Python placeholder write with
+# Python-driven validation is a Python card and still fails closed. Python test
+# runners/launchers (uv, poetry, tox, nox, coverage, py.test) count as Python.
+_PYTHON_VALIDATION_HEADS: frozenset[str] = frozenset(
+    {
+        "python",
+        "python3",
+        "pythonw",
+        "py",
+        "pytest",
+        "py.test",
+        "uv",
+        "poetry",
+        "tox",
+        "nox",
+        "coverage",
+        "{python}",
+        COMMAND_PYTHON,
+    }
+)
+_PYTHON_VERSIONED_HEAD_RE = re.compile(r"pythonw?[0-9]+(?:\.[0-9]+)*")
+_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+AUTO_CALLER_VALIDATION_REASON = "auto_selected_custom_validation_non_python_card"
+
+
+def _normalized_command_head(token: str) -> str:
+    """Basename of an argv token, lowercased with any ``.exe`` suffix removed.
+
+    Both ``/`` and ``\\`` separate path components so POSIX and Windows
+    spellings normalize identically on every host.
+    """
+    return token.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+
+
+def _is_python_validation_command(command: str) -> bool:
+    """Whether a validation command is driven by a Python interpreter/pytest.
+
+    Leading ``env`` (any path spelling, e.g. ``/usr/bin/env``) and
+    ``NAME=value`` assignments are skipped; the head is then normalized by
+    ``_normalized_command_head``. An unparseable or empty command is treated
+    as Python (fail closed).
+    """
+    try:
+        tokens = split_command_argv(command)
+    except (TaskTemplateError, ValueError):
+        return True
+    index = 0
+    while index < len(tokens) and (
+        _normalized_command_head(tokens[index]) == "env"
+        or _ENV_ASSIGNMENT_RE.fullmatch(tokens[index])
+    ):
+        index += 1
+    # An env option (-i, -u NAME, -S "...") hides the real head: fail closed.
+    if index >= len(tokens) or tokens[index].startswith("-"):
+        return True
+    head = _normalized_command_head(tokens[index])
+    return head in _PYTHON_VALIDATION_HEADS or bool(
+        _PYTHON_VERSIONED_HEAD_RE.fullmatch(head)
+    )
+
+
+def _auto_select_caller_validation(
+    card_view: Mapping[str, Any], *, minimality_contract: str | None
+) -> dict[str, Any] | None:
+    """Classify an unmatched non-Python card to ``custom_validation``.
+
+    NF-2026-01015: a hosted C++/CMake (or any other non-Python) card matches
+    no built-in template only because it declares no ``read_first`` and no
+    ``validation_roles``; it previously needed the audited escape on every
+    card. Only a writable card with non-empty required_outputs and
+    caller-declared validation that passes ``validate_custom_validation_roles``
+    (checked here; a failure means "do not auto-select", never a new refusal
+    code), whose allowed_writes and required_outputs contain no Python file
+    and whose every validation head is non-Python (cmake/ctest/make/cargo/
+    npm/...) qualifies. Only a raw card that declares neither read_first nor
+    validation_roles is auto-selected; the template's own read_first and
+    validation_roles are then stored. Returns ``None`` (caller raises
+    ``template_unclassified``) whenever any condition does not hold.
+    """
+    writes = list(card_view.get("allowed_writes") or [])
+    outputs = list(card_view.get("required_outputs") or [])
+    commands = list(card_view.get("validation") or [])
+    read_only = card_view.get("read_only")
+    if (
+        read_only is not False
+        or not outputs
+        or not commands
+        or card_view.get("read_first")
+        or card_view.get("validation_roles")
+    ):
+        return None
+    if any(path.endswith(_PYTHON_SOURCE_SUFFIXES) for path in (*writes, *outputs)):
+        return None
+    if any(
+        not isinstance(command, str) or _is_python_validation_command(command)
+        for command in commands
+    ):
+        return None
+    try:
+        validate_custom_validation_roles(commands, None)
+        expanded = expand_template(
+            CALLER_VALIDATION_TEMPLATE_NAME,
+            **_card_scoped_inputs(CALLER_VALIDATION_TEMPLATE_NAME, card_view),
+        )
+    except TaskTemplateError:
+        return None
+    if (
+        expanded["allowed_writes"] != writes
+        or expanded["required_outputs"] != outputs
+        or expanded["validation"] != commands
+        or expanded["read_only"] is not False
+        or expanded["work_kind"] != card_view.get("work_kind")
+        or (
+            minimality_contract is not None
+            and minimality_contract != expanded.get("minimality_contract")
+        )
+    ):
+        return None
+    stored = dict(card_view)
+    stored["read_first"] = list(expanded["read_first"])
+    stored["validation_roles"] = list(expanded["validation_roles"])
+    for field in (
+        "template_id",
+        "template_full_id",
+        "registry_version",
+        "definition_digest",
+        "minimality_contract",
+    ):
+        if field in expanded:
+            stored[field] = expanded[field]
+    return template_provenance_payload(
+        stored, classification_reason=AUTO_CALLER_VALIDATION_REASON
+    )
