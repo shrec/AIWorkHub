@@ -163,7 +163,10 @@ LANGUAGE_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "sql": (".sql",),
     "json": (".json", ".jsonc", ".json5", ".geojson", ".jsonl", ".ndjson"),
     "yaml": (".yaml", ".yml"),
-    "toml": (".toml",),
+    "toml": (
+        ".toml", ".ini", ".cfg", ".conf", ".service", ".socket", ".timer", ".mount",
+        ".path", ".target", ".rules", ".network", ".netdev", ".link", ".desktop",
+    ),
     "xml": (
         ".xml", ".xsd", ".xsl", ".xslt", ".svg", ".vcxproj", ".filters", ".props",
         ".targets", ".csproj", ".vbproj", ".fsproj",

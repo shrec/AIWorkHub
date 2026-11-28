@@ -61,7 +61,31 @@ LANGUAGE_SPECS: tuple[LanguageSpec, ...] = (
         (".json", ".jsonc", ".json5", ".geojson", ".jsonl", ".ndjson"),
     ),
     LanguageSpec("yaml", "YAML", (".yaml", ".yml")),
-    LanguageSpec("toml", "TOML", (".toml",)),
+    # Id stays "toml" so existing ``disabled_languages`` entries keep working;
+    # the family also carries INI and systemd/udev/networkd unit text that
+    # Linux projects keep core logic in (NF-2026-01019). No secret-bearing
+    # suffix such as ``.env`` belongs here.
+    LanguageSpec(
+        "toml",
+        "TOML / INI / systemd config",
+        (
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".conf",
+            ".service",
+            ".socket",
+            ".timer",
+            ".mount",
+            ".path",
+            ".target",
+            ".rules",
+            ".network",
+            ".netdev",
+            ".link",
+            ".desktop",
+        ),
+    ),
     LanguageSpec(
         "xml",
         "XML",
