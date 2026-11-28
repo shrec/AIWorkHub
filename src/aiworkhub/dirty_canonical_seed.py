@@ -51,22 +51,113 @@ def _as_text(value: bytes | str | None) -> str:
     return value or ""
 
 
+def _normalised(data: bytes) -> bytes:
+    return data.replace(b"\r\n", b"\n")
+
+
+def _line_ending_only(
+    worktree: Path, modified: list[str], run: Callable[..., Any]
+) -> set[str]:
+    """Listed-modified paths whose seed equals the base blob modulo CRLF.
+
+    NF-2026-01029: ``git status`` reports a size-changed tracked file as
+    modified without comparing content, and the NF-2026-01168 restat cannot
+    clear a CRLF-committed blob, an ambient ``core.autocrlf`` mismatch or a
+    non-ASCII path.  The base blob is read directly (one ``git ls-files`` and
+    one ``git cat-file --batch`` for any number of paths) and compared with
+    the seeded bytes after CRLF -> LF on both sides, independent of any Git
+    config.  Any probe failure returns no path, so every listed path stays
+    dirty: an unknown state never reads as clean.
+    """
+    # ponytail: an owner edit that only changes line endings is not dirty;
+    # a byte-exact comparison would lift this ceiling.
+    if not modified:
+        return set()
+    from .worker_workspace import GitCommandTimeout
+
+    try:
+        listed = run(
+            ["git", "--no-optional-locks", "ls-files", "-s", "-z"],
+            cwd=worktree,
+            phase="workspace_provision",
+            text=False,
+        )
+        if listed.returncode != 0 or not isinstance(listed.stdout, bytes):
+            return set()
+        wanted = set(modified)
+        oids: dict[str, str] = {}
+        for record in _as_text(listed.stdout).split("\0"):
+            meta, separator, listed_path = record.partition("\t")
+            entry = meta.split()
+            if (
+                separator
+                and listed_path in wanted
+                and len(entry) == 3
+                and entry[0] in {"100644", "100755"}
+                and entry[2] == "0"
+            ):
+                oids[listed_path] = entry[1]
+        ordered = [relative for relative in modified if relative in oids]
+        if not ordered:
+            return set()
+        batch = run(
+            ["git", "--no-optional-locks", "cat-file", "--batch"],
+            cwd=worktree,
+            phase="workspace_provision",
+            input_text="".join(f"{oids[path]}\n" for path in ordered).encode("ascii"),
+            text=False,
+        )
+        if batch.returncode != 0 or not isinstance(batch.stdout, bytes):
+            return set()
+        out: bytes = batch.stdout
+        equal: set[str] = set()
+        offset = 0
+        for relative in ordered:
+            newline = out.find(b"\n", offset)
+            if newline < 0:
+                return set()
+            header = out[offset:newline].split()
+            if (
+                len(header) != 3
+                or header[0] != oids[relative].encode("ascii")
+                or header[1] != b"blob"
+            ):
+                return set()
+            size = int(header[2])
+            start = newline + 1
+            blob = out[start : start + size]
+            if len(blob) != size:
+                return set()
+            offset = start + size + 1
+            seeded = worktree / relative
+            if seeded.is_symlink() or not seeded.is_file():
+                continue
+            if _normalised(seeded.read_bytes()) == _normalised(blob):
+                equal.add(relative)
+        return equal
+    except (GitCommandTimeout, OSError, ValueError, UnicodeError):
+        return set()
+
+
 def dirty_seeded_paths(
     worktree: Path, seeded: Iterable[str], run: Callable[..., Any]
 ) -> tuple[str, ...]:
-    """Seeded paths whose seeded bytes differ from the worktree's base commit.
+    """Seeded paths whose seeded bytes carry a real change against the base.
 
     Runs inside the just-seeded worktree, whose index still equals the base
     commit, so a listed path is exactly one whose live canonical copy carried
-    an uncommitted change (modified, staged or untracked) at seed time.  Git's
-    own content normalisation applies, so a line-ending-only stat difference
-    (NF-2026-01168) is not dirty.  A failed probe refuses provisioning: an
-    unknown dirty state must never read as clean.
+    an uncommitted change (modified, staged or untracked) at seed time.  A
+    tracked path Git lists as modified is dropped when its seed equals the
+    base blob modulo line endings (NF-2026-01168, NF-2026-01029), whatever the
+    ambient Git config.  A failed status probe refuses provisioning and a
+    failed blob probe keeps the path dirty: an unknown dirty state must never
+    read as clean.
     """
     from .worker_workspace import WorkspaceError, _relative_repo_path
 
     wanted = sorted(dict.fromkeys(str(relative) for relative in seeded))
     dirty: set[str] = set()
+    modified: list[str] = []
     for chunk in _chunks(wanted):
         result = run(
             [
@@ -83,8 +174,16 @@ def dirty_seeded_paths(
             raise WorkspaceError(f"dirty_canonical_seed_probe_failed:{stderr[:300]}")
         for entry in _as_text(result.stdout).split("\0"):
             if len(entry) > 3:
-                dirty.add(_relative_repo_path(entry[3:]))
-    return tuple(sorted(dirty & set(wanted)))
+                relative = _relative_repo_path(entry[3:])
+                dirty.add(relative)
+                status = entry[:2]
+                if status in {" M", "M ", "MM"}:
+                    modified.append(relative)
+    listed = dirty & set(wanted)
+    listed -= _line_ending_only(
+        worktree, sorted(set(modified) & listed), run
+    )
+    return tuple(sorted(listed))
 
 
 def refuse_dirty_at_seed(workspace: Any, paths: Iterable[str]) -> None:
