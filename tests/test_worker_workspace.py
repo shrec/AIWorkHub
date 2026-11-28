@@ -724,6 +724,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace_ignore_seed.py",
         # ...and its native build-driver tree seed (NF-2026-02079).
         "worker_workspace_native_seed.py",
+        # ...and its AIWorkHub extension repository-asset seed (NF-2026-01011).
+        "worker_workspace_extension_seed.py",
         # ...and its validation stall watchdog (NF-2026-02269).
         "validation_stall.py",
         # ...and its bubblewrap interpreter identity binds (NF-2026-02327).
@@ -1762,6 +1764,80 @@ def test_npm_prefix_validation_seeds_immutable_support_and_runs_from_candidate(
         worker_workspace.cleanup_workspace(
             repo, extension_workspace.path, extension_workspace.home
         )
+
+
+def test_node_test_rows_seed_aiworkhub_extension_repository_assets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    # NF-2026-01011: extension cards can only declare ``node --test`` rows, yet
+    # the quality gate runs the whole AIWorkHub extension suite, whose static
+    # checks assert repository-root assets.  Those must be seeded without any
+    # ``npm --prefix`` row, and only for the AIWorkHub extension package.
+    asset_rows = (
+        "README.md",
+        "scripts/aiworkhub-app-server-mux",
+        "scripts/aiworkhub-app-server-mux.cmd",
+        "docs/assets/aiworkhub-block-diagram.png",
+        "docs/assets/aiworkhub-source-graph-architecture.png",
+        "docs/assets/demo/aiworkhub-task-review-loop.gif",
+        "docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png",
+    )
+    for relative in asset_rows:
+        fixture = repo / relative
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_bytes(b"\x89PNG-raster-fixture\r\n" + relative.encode("utf-8"))
+    vscode = repo / "vscode-extension"
+    (vscode / "test").mkdir(parents=True)
+    package_json = vscode / "package.json"
+    package_json.write_bytes(
+        json.dumps({"name": "aiworkhub", "version": "1.0.0"}).encode("utf-8")
+    )
+    (vscode / "test" / "x.test.js").write_bytes(b"console.log('x-ok');\n")
+    assert (
+        _git(repo, "add", "README.md", "scripts", "docs", "vscode-extension").returncode
+        == 0
+    )
+    assert _git(repo, "commit", "-qm", "aiworkhub extension assets").returncode == 0
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV,
+        str(tmp_path / "node-test-extension-worktrees"),
+    )
+    card = {
+        "allowed_writes": ["out/result.txt"],
+        "read_first": ["read/input.txt"],
+        "validation": ["node --test vscode-extension/test/x.test.js"],
+    }
+    workspace = worker_workspace.create_workspace(
+        repo, "node-test-extension-assets", card, "glm_vscode_lm"
+    )
+    try:
+        for relative in asset_rows:
+            candidate = workspace.path / relative
+            assert candidate.is_file(), relative
+            assert not candidate.is_symlink()
+            assert candidate.read_bytes() == (repo / relative).read_bytes()
+        assert worker_workspace.changed_paths(workspace) == []
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+    # Negative guard: a package with any other name receives nothing extra.
+    package_json.write_bytes(
+        json.dumps({"name": "other-extension", "version": "1.0.0"}).encode("utf-8")
+    )
+    assert _git(repo, "add", "vscode-extension/package.json").returncode == 0
+    assert _git(repo, "commit", "-qm", "rename extension package").returncode == 0
+    other = worker_workspace.create_workspace(
+        repo, "node-test-other-extension", card, "glm_vscode_lm"
+    )
+    try:
+        assert (other.path / "vscode-extension/test/x.test.js").is_file()
+        assert not (other.path / "docs").exists()
+        assert not (other.path / "scripts").exists()
+        assert not (other.path / "README.md").exists()
+    finally:
+        worker_workspace.cleanup_workspace(repo, other.path, other.home)
 
 
 def test_npm_prefix_validation_fails_closed_for_unbound_dependency_tree(

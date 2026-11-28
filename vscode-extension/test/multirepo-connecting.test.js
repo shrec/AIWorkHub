@@ -206,14 +206,26 @@ async function snapshotFor(host) {
   // NF-2026-02287: dashboard snapshots come from the dashboard-only process;
   // the MCP child (spawns) keeps only routing/dispatcher duties.
   const dashboardSpawns = [];
+  // NF-2026-01011: the extension binds every child to
+  // canonicalRepositoryRoot(root) (realpathSync.native), so AIWORKHUB_REPO_ROOT
+  // is the canonical path. Under the full suite the temp root can be an alias
+  // (symlinked TMPDIR, Windows 8.3 short name), so key the per-repo behavior
+  // queues by the same canonical form or repo B's scripted death is skipped.
+  const canonicalRoot = (root) => {
+    try {
+      return fs.realpathSync.native(root);
+    } catch (_err) {
+      return root;
+    }
+  };
   const behaviors = new Map([
-    [repoB, ["die-before-initialize", "live"]],
+    [canonicalRoot(repoB), ["die-before-initialize", "live"]],
   ]);
   const dashboardBehaviors = new Map([
-    [repoA, ["slow-snapshot"]],
+    [canonicalRoot(repoA), ["slow-snapshot"]],
     // Repo B's first dashboard process dies; the dashboard must still reach
     // Live through the respawned one.
-    [repoB, ["die-on-first-request", "live"]],
+    [canonicalRoot(repoB), ["die-on-first-request", "live"]],
   ]);
   const originalSpawn = childProcess.spawn;
   childProcess.spawn = (cmd, args, options) => {
@@ -227,13 +239,14 @@ async function snapshotFor(host) {
       windowId: options.env.AIWORKHUB_WINDOW_ID,
       toolCalls: [],
     };
+    const behaviorKey = canonicalRoot(spawnRecord.repoRoot);
     if (isDashboardReaderSpawn(args)) {
       dashboardSpawns.push(spawnRecord);
-      const dashboardQueue = dashboardBehaviors.get(spawnRecord.repoRoot) || [];
+      const dashboardQueue = dashboardBehaviors.get(behaviorKey) || [];
       return new FakeDashboardChild(spawnRecord, dashboardQueue.shift() || "live");
     }
     spawns.push(spawnRecord);
-    const queue = behaviors.get(spawnRecord.repoRoot) || [];
+    const queue = behaviors.get(behaviorKey) || [];
     return new FakeChild(spawnRecord, queue.shift() || "live");
   };
   // NF-2026-01648: a real pipe-stdio child livelocks libuv inside the AppContainer sandbox.
@@ -306,6 +319,11 @@ async function snapshotFor(host) {
     assert.strictEqual(snapA.payload.repo_id, "repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     assert.strictEqual(snapB.payload.repo_id, "repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     const dashboardFor = (repoId) => dashboardSpawns.filter((spawn) => spawn.repoId === repoId);
+    // Bounded poll for the reconnect's second repo B dashboard spawn: the
+    // assertion below stays exact; this only removes scheduling sensitivity.
+    for (let waited = 0; waited < 2000 && dashboardFor("repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").length < 2; waited += 10) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     const dashboardA = dashboardFor("repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     const dashboardB = dashboardFor("repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     assert.ok(dashboardA.length >= 1 && dashboardB.length === 2, JSON.stringify(dashboardSpawns.map((s) => s.repoId)));

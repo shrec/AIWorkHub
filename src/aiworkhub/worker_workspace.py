@@ -2162,22 +2162,8 @@ def _npm_validation_support(repo: Path, commands: Iterable[str]) -> tuple[str, .
         # immutable support rather than broadening worker write authority.
         if package.get("name") == "aiworkhub" and prefix == "vscode-extension":
             rows.update(_regular_support_files(repo, "src/aiworkhub"))
-            for relative in (
-                "README.md",
-                "scripts/aiworkhub-app-server-mux",
-                "scripts/aiworkhub-app-server-mux.cmd",
-                # extension-static.test.js asserts these committed raster
-                # fixtures exist at the repository root; keep the closure
-                # exact so unrelated repositories receive nothing extra.
-                "docs/assets/aiworkhub-block-diagram.png",
-                "docs/assets/aiworkhub-source-graph-architecture.png",
-                "docs/assets/demo/aiworkhub-task-review-loop.gif",
-                "docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png",
-            ):
-                candidate = repo / relative
-                if candidate.is_symlink() or not candidate.is_file():
-                    raise WorkspaceError(f"validation_npm_support_missing:{relative}")
-                rows.add(relative)
+            from .worker_workspace_extension_seed import aiworkhub_extension_repository_support
+            rows.update(aiworkhub_extension_repository_support(repo))  # NF-2026-01011
     return tuple(sorted(rows))
 
 
@@ -4241,6 +4227,22 @@ def _declared_workspace_seed_closure(
         for relative in _npm_validation_support(source_root, validation_rows)
         if relative not in live_seeded
     )
+    # The quality gate runs the AIWorkHub extension suite even when the card's
+    # own rows are ``node --test`` (cards cannot bind ``npm --prefix``), so the
+    # repository-root assets that suite asserts on are seeded for any card that
+    # touches the AIWorkHub extension, without a dependency-tree check.
+    from .worker_workspace_extension_seed import (  # NF-2026-01011
+        aiworkhub_extension_repository_support,
+        is_aiworkhub_extension_package,
+    )
+    if any(
+        relative.startswith("vscode-extension/")
+        for relative in (*live_seeded, *support_seeded)
+    ) and is_aiworkhub_extension_package(source_root):
+        extension_support = aiworkhub_extension_repository_support(source_root)
+        npm_support_seeded = tuple(
+            sorted(set(npm_support_seeded) | (extension_support - set(live_seeded)))
+        )
     from .worker_workspace_native_seed import native_build_support  # NF-2026-02079
     native_seeded = set(native_build_support(source_root, validation_rows)) - set(live_seeded)
     support_seeded = tuple(sorted(set(support_seeded) | set(npm_support_seeded) | native_seeded))
