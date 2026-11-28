@@ -7463,7 +7463,10 @@ def retained_terminal_rework_predecessor(
     changed_hashes = evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
     authority = evidence.get("python_candidate_authority") if isinstance(evidence, dict) else None
     workspace_authority = workspace.get("python_candidate_authority") if isinstance(workspace, dict) else None
-    authority_hashes: dict[str, str] = {}
+    # NF-2026-01024: changed_path_hashes records a deleted path as None, so
+    # an authority row authenticated as "deleted" (and carrying no bytes)
+    # counts as path -> None too; any other shape still refuses below.
+    authority_hashes: dict[str, str | None] = {}
     authority_sources = (
         authority.get("sources") if isinstance(authority, dict) else None
     )
@@ -7484,9 +7487,11 @@ def retained_terminal_rework_predecessor(
             if (
                 not isinstance(path, str)
                 or not path
-                or state not in {"added", "modified"}
-                or not isinstance(digest, str)
                 or path in authority_hashes
+                or not (
+                    (state in {"added", "modified"} and isinstance(digest, str))
+                    or (state == "deleted" and digest is None)
+                )
             ):
                 authority_hashes = {}
                 break
@@ -7626,7 +7631,16 @@ def retained_terminal_rework_predecessor(
     for path in changed_paths:
         # An authenticated delta already bound every sealed path to its
         # exact hash; only a retained worktree is read here.
-        if sealed_delta is None:
+        if sealed_delta is None and changed_hashes.get(path) is None:
+            # NF-2026-01024: a None hash passed authority_hashes only as an
+            # authority-authenticated deletion, so the retained worktree must
+            # hold nothing at that path and no link above it.
+            deleted_candidate = resolved_workspace.joinpath(*path.split("/"))
+            if _workspace_has_link_component(
+                resolved_workspace, deleted_candidate.parent
+            ) or os.path.lexists(deleted_candidate):
+                return None, "retained_terminal_candidate_bytes_invalid"
+        elif sealed_delta is None:
             candidate = resolved_workspace.joinpath(*path.split("/"))
             expected_hash = changed_hashes.get(path)
             try:
