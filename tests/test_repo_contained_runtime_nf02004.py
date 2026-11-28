@@ -47,9 +47,8 @@ _SITES: dict[tuple[object, str], frozenset[str]] = {
     # (1) the AppContainer validation lane temp: no outside spelling at all.
     (ww, "provision_validation_exec_scratch"): frozenset(),
     (runtime_temp, "pytest_basetemp_argv"): frozenset(),
-    # (2) sandbox drive leases.
-    (wac, "_SandboxDriveLeases.place_for"): frozenset(),
-    (wac, "_SandboxDriveLeases.repository_directory"): frozenset(),
+    # (2) the removed sandbox drive's leftover-lease cleanup.
+    (wac, "reclaim_sandbox_drive_leases"): frozenset(),
     # (3) app_server_mux: ~/.aiworkhub is its machine-wide sideband (B925);
     # the temp branch is reached only without a home AND without a repo.
     (app_server_mux, "_default_sideband_dir"): frozenset({
@@ -197,42 +196,6 @@ def test_repo_owned_dir_refuses_drive_qualified_and_escaping_parts(
     with pytest.raises(runtime_temp.RuntimeTempError, match="component_invalid"):
         runtime_temp.repo_runtime_dir(repo, part)
     assert runtime_temp.repo_runtime_dir(repo, "ok").parent == repo / ".aiworkhub" / "runtime"
-
-
-# ── site 2: sandbox drive leases ────────────────────────────────────────────
-
-
-def test_drive_leases_live_beside_the_repository_sandbox_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(wac, "resolve_local_appdata", lambda: "")
-    repo = (tmp_path / "repo").resolve()
-    sandbox_root = repo / ".aiworkhub" / "runtime" / "worktrees"
-    sandbox_root.mkdir(parents=True)
-
-    built: list[tuple[Path, tuple[str, ...]]] = []
-    real_runtime_dir = runtime_temp.repo_runtime_dir
-
-    def _spy(repo_arg: Path, *parts: str) -> Path:
-        built.append((Path(repo_arg), parts))
-        return real_runtime_dir(repo_arg, *parts)
-
-    monkeypatch.setattr(runtime_temp, "repo_runtime_dir", _spy)
-    store = wac._SandboxDriveLeases.for_current_user()
-    store.place_for(str(sandbox_root))
-
-    assert store.directory == repo / ".aiworkhub" / "runtime" / "sandbox-drive-leases"
-    # Built through the shared repo-runtime authority, not a hand-joined path.
-    assert built == [(repo, ("sandbox-drive-leases",))]
-    assert not wac._sandbox_root_of(str(store.directory))
-    # An explicitly placed store never moves.
-    explicit = wac._SandboxDriveLeases(tmp_path / "explicit")
-    explicit.place_for(str(sandbox_root))
-    assert explicit.directory == tmp_path / "explicit"
-    # No repository known (no such sandbox root): the NO_REPO fallback stays.
-    fallback = wac._SandboxDriveLeases.for_current_user()
-    fallback.place_for(str(tmp_path / "missing" / ".aiworkhub" / "runtime" / "worktrees"))
-    assert fallback.directory is None
 
 
 # ── site 3: app_server_mux temp ─────────────────────────────────────────────

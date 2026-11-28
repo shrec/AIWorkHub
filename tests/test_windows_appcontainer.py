@@ -43,16 +43,6 @@ from aiworkhub.windows_appcontainer import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _pin_private_logon_session(monkeypatch):
-    """NF-2026-01154: ``sandbox_drive`` now refuses outside a private logon
-    session. These fakes exercise the drive mechanics, so pin the probe to a
-    private NewCredentials session; production code keeps the real probe.
-    Fakes may pin this; there is no test-only bypass in production."""
-
-    monkeypatch.setattr(wac, "in_private_logon_session", lambda: True)
-
-
 # ---------------------------------------------------------------------------
 # Mocked Windows boundary
 # ---------------------------------------------------------------------------
@@ -153,25 +143,6 @@ class FakeWin32Api:
     def dacl_protected(self, path):
         self.dacl_queries.append(path)
         return os.path.normcase(path) in self.protected_paths
-
-    sandbox_letter = "Q:"
-
-    def sandbox_drive(self, real_root):
-        self.events.append(f"sandbox_drive:{real_root}")
-        if self.fail_at == "sandbox_drive":
-            raise _Win32Failure(
-                self.fail_error, "sandbox_drive", "sandbox_drive_unavailable: forced"
-            )
-        return self.sandbox_letter
-
-    def release_sandbox_drive(self, drive, real_root):
-        self.events.append(f"release_sandbox_drive:{drive}:{real_root}")
-        if self.fail_at == "release_sandbox_drive":
-            raise _Win32Failure(
-                self.fail_error,
-                "release_sandbox_drive",
-                "sandbox_drive_unavailable: forced",
-            )
 
     def build_security_capabilities(self, identity, capability_sids):
         self._maybe_fail("build_security_capabilities")
@@ -2680,8 +2651,8 @@ def test_the_sandbox_root_traverse_survives_a_sibling_close(tmp_path):
     }
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows drive spelling")
-def test_launch_shows_the_child_the_sandbox_root_as_a_drive(tmp_path):
+def test_launch_passes_the_child_real_paths(tmp_path):
+    """NF-2026-01023: no drive letter -- cwd, argv and env stay real."""
     root, request = _sandbox(tmp_path)
     worktree = request / "worktree"
     home = request / "home"
@@ -2690,8 +2661,7 @@ def test_launch_shows_the_child_the_sandbox_root_as_a_drive(tmp_path):
     state.mkdir(parents=True)
     env = {
         "HOME": str(home),
-        "XDG_STATE_HOME": str(state).upper(),
-        "PATH": os.pathsep.join([str(worktree / "bin"), r"C:\Windows\System32"]),
+        "XDG_STATE_HOME": str(state),
         "PLAIN": "value",
     }
     argv = [
@@ -2713,25 +2683,14 @@ def test_launch_shows_the_child_the_sandbox_root_as_a_drive(tmp_path):
     )
     launch.close()
 
-    assert fake.events[0] == f"sandbox_drive:{_key(root)}"
+    assert not any("sandbox_drive" in event for event in fake.events)
     spec = fake.spec
-    assert spec.working_directory == r"Q:\req\worktree"
-    assert spec.executable == r"Q:\req\worktree\tool.exe"
-    assert spec.command_line == build_command_line(
-        [
-            r"Q:\req\worktree\tool.exe",
-            r"--cwd=Q:\req\worktree",
-            r"Q:\req\home\note.txt",
-            "--flag",
-            "value with space",
-        ]
-    )
-    assert launch.command_line == spec.command_line
-    assert spec.environment["HOME"] == r"Q:\req\home"
-    assert spec.environment["XDG_STATE_HOME"] == r"Q:\REQ\HOME\STATE"
-    assert spec.environment["PATH"].split(os.pathsep)[0] == r"Q:\req\worktree\bin"
+    assert spec.working_directory == str(worktree)
+    assert spec.executable == str(worktree / "tool.exe")
+    assert spec.command_line == build_command_line(argv)
+    assert spec.environment["HOME"] == str(home)
+    assert spec.environment["XDG_STATE_HOME"] == str(state)
     assert spec.environment["PLAIN"] == "value"
-    # The host writes ACLs on the real paths.
     assert f"grant:modify:{worktree}" in fake.events
     assert f"grant:traverse:{root}" in fake.events
 
@@ -2742,100 +2701,12 @@ def test_a_launch_outside_any_sandbox_is_not_translated(tmp_path):
         make_request(working_directory=str(tmp_path), environment={"HOME": str(tmp_path)}),
         api=fake,
     ).close()
-    assert not any(event.startswith("sandbox_drive:") for event in fake.events)
-    assert not any(event.startswith("release_sandbox_drive:") for event in fake.events)
     assert fake.spec.working_directory == str(tmp_path)
     assert fake.spec.environment["HOME"] == str(tmp_path)
 
 
-def test_a_sandbox_drive_failure_fails_closed_before_any_grant(tmp_path):
+def test_a_pre_launch_value_error_unwinds_every_grant(tmp_path, monkeypatch):
     _root, request = _sandbox(tmp_path)
-    worktree = request / "worktree"
-    worktree.mkdir()
-    fake = FakeWin32Api(fail_at="sandbox_drive", fail_error=5)
-
-    with pytest.raises(AppContainerError) as excinfo:
-        launch_appcontainer(
-            make_request(
-                working_directory=str(worktree),
-                filesystem_grants=request_scoped_grants({}, str(worktree)),
-            ),
-            api=fake,
-        )
-
-    assert excinfo.value.reason is AppContainerReason.FILESYSTEM_GRANT_FAILED
-    assert excinfo.value.operation == "sandbox_drive"
-    assert excinfo.value.detail.startswith("sandbox_drive_unavailable:")
-    assert _grant_events(fake) == []
-    assert fake.identity is None
-    assert "create_process" not in fake.events
-
-
-def test_launch_close_releases_the_sandbox_drive_exactly_once(tmp_path):
-    root, request = _sandbox(tmp_path)
-    worktree = request / "worktree"
-    worktree.mkdir()
-    fake = FakeWin32Api()
-
-    launch = launch_appcontainer(
-        make_request(
-            working_directory=str(worktree),
-            filesystem_grants=request_scoped_grants({}, str(worktree)),
-        ),
-        api=fake,
-    )
-    assert fake.events[0] == f"sandbox_drive:{_key(root)}"
-    assert not any(event.startswith("release_sandbox_drive:") for event in fake.events)
-
-    launch.close()
-    release_events = [e for e in fake.events if e.startswith("release_sandbox_drive:")]
-    assert release_events == [f"release_sandbox_drive:{fake.sandbox_letter}:{_key(root)}"]
-
-    launch.close()
-    assert [e for e in fake.events if e.startswith("release_sandbox_drive:")] == release_events
-
-
-def test_a_launch_failure_after_sandbox_drive_releases_it(tmp_path):
-    root, request = _sandbox(tmp_path)
-    worktree = request / "worktree"
-    worktree.mkdir()
-    fake = FakeWin32Api(fail_at="create_job_object", fail_error=5)
-
-    with pytest.raises(AppContainerError):
-        launch_appcontainer(
-            make_request(
-                working_directory=str(worktree),
-                filesystem_grants=request_scoped_grants({}, str(worktree)),
-            ),
-            api=fake,
-        )
-
-    assert fake.events[0] == f"sandbox_drive:{_key(root)}"
-    assert f"release_sandbox_drive:{fake.sandbox_letter}:{_key(root)}" in fake.events
-
-
-def test_launch_close_survives_a_release_sandbox_drive_failure(tmp_path):
-    root, request = _sandbox(tmp_path)
-    worktree = request / "worktree"
-    worktree.mkdir()
-    fake = FakeWin32Api(fail_at="release_sandbox_drive", fail_error=5)
-
-    launch = launch_appcontainer(
-        make_request(
-            working_directory=str(worktree),
-            filesystem_grants=request_scoped_grants({}, str(worktree)),
-        ),
-        api=fake,
-    )
-
-    launch.close()
-
-    assert launch.closed
-    assert launch.cleanup_evidence()["sandbox_drive_release_failures"] == [5]
-
-
-def test_a_pre_launch_value_error_after_sandbox_drive_releases_it(tmp_path, monkeypatch):
-    root, request = _sandbox(tmp_path)
     worktree = request / "worktree"
     worktree.mkdir()
     fake = FakeWin32Api()
@@ -2854,190 +2725,8 @@ def test_a_pre_launch_value_error_after_sandbox_drive_releases_it(tmp_path, monk
             api=fake,
         )
 
-    assert fake.events[0] == f"sandbox_drive:{_key(root)}"
-    assert fake.events.count(
-        f"release_sandbox_drive:{fake.sandbox_letter}:{_key(root)}"
-    ) == 1
-
-
-def test_close_keeps_the_drive_while_the_job_close_fails_then_releases_once(tmp_path):
-    root, request = _sandbox(tmp_path)
-    worktree = request / "worktree"
-    worktree.mkdir()
-    fake = FakeWin32Api(fail_at="close_job", fail_error=5)
-
-    launch = launch_appcontainer(
-        make_request(
-            working_directory=str(worktree),
-            filesystem_grants=request_scoped_grants({}, str(worktree)),
-        ),
-        api=fake,
-    )
-
-    with pytest.raises(Exception):
-        launch.close()
-    assert not any(event.startswith("release_sandbox_drive:") for event in fake.events)
-
-    fake.fail_at = None
-    launch.close()
-    assert (
-        sum(1 for event in fake.events if event.startswith("release_sandbox_drive:"))
-        == 1
-    )
-
-
-_ROOT = r"d:\repo\.aiworkhub\runtime\worktrees"
-
-
-def test_sandbox_drive_reuses_the_letter_that_already_names_the_root():
-    devices = {"Z:": r"\??\C:\other", "Q:": r"\??\D:\Repo\.aiworkhub\runtime\worktrees"}
-    everything = (1 << 26) - 1
-    assert wac._choose_sandbox_drive(
-        _ROOT, everything, lambda drive: devices.get(drive, "")
-    ) == ("Q:", False)
-
-
-def test_sandbox_drive_picks_the_highest_letter_nobody_uses():
-    devices = {"Z:": r"\??\C:\other"}
-    y_is_a_disk = 1 << (ord("Y") - ord("A"))
-    assert wac._choose_sandbox_drive(
-        _ROOT, y_is_a_disk, lambda drive: devices.get(drive, "")
-    ) == ("X:", True)
-    assert wac._choose_sandbox_drive(_ROOT, (1 << 26) - 1, lambda _d: "") == ("", True)
-
-
-class _FakeDosKernel:
-    """kernel32's mutex and DOS-device calls, recorded.
-
-    Models DefineDosDeviceW as a per-letter stack, like the real OS: a plain
-    define (no removal flag) pushes, and a define carrying
-    DDD_REMOVE_DEFINITION (0x2) pops the exact target. QueryDosDeviceW models
-    the real multi-sz contract -- it reports the whole stack, top first, and
-    honours the caller's buffer size, failing with ERROR_INSUFFICIENT_BUFFER
-    (122) when the stack does not fit.
-    """
-
-    def __init__(self, define_ok=True):
-        self.devices = {}
-        self.define_ok = define_ok
-        self.last_error = 0
-        self.calls = []
-
-    def CreateMutexW(self, _attributes, _owner, name):
-        self.calls.append(("mutex", name))
-        return 77
-
-    def WaitForSingleObject(self, handle, wait_ms):
-        self.calls.append(("wait", handle, wait_ms))
-        return 0
-
-    def ReleaseMutex(self, handle):
-        self.calls.append(("release", handle))
-        return 1
-
-    def CloseHandle(self, handle):
-        self.calls.append(("close", handle))
-        return 1
-
-    def GetLogicalDrives(self):
-        return 0
-
-    def QueryDosDeviceW(self, name, buffer, size):
-        stack = self.devices.get(name) or []
-        if not stack:
-            return 0
-        blob = "\0".join(reversed(stack)) + "\0\0"
-        if len(blob) > size:
-            self.last_error = 122
-            return 0
-        buffer[: len(blob)] = blob
-        return len(blob)
-
-    def DefineDosDeviceW(self, flags, name, target):
-        self.calls.append(("define", flags, name, target))
-        if not self.define_ok:
-            return False
-        wanted = "\\??\\" + target
-        if flags & 0x2:
-            stack = self.devices.get(name) or []
-            if wanted in stack:
-                stack.remove(wanted)
-            self.devices[name] = stack
-        else:
-            self.devices.setdefault(name, []).append(wanted)
-        return self.define_ok
-
-
-def test_ctypes_sandbox_drive_pushes_and_release_pops():
-    kernel = _FakeDosKernel()
-    api = make_ctypes_api(kernel)
-
-    assert api.sandbox_drive(_ROOT) == "Z:"
-    assert api.sandbox_drive(_ROOT) == "Z:"
-    assert len(kernel.devices["Z:"]) == 2
-
-    defines = [call for call in kernel.calls if call[0] == "define"]
-    assert defines == [("define", 0x8, "Z:", _ROOT), ("define", 0x8, "Z:", _ROOT)]
-    assert kernel.calls[0] == ("mutex", "Local\\AIWorkHub.SandboxDrive")
-
-    api.release_sandbox_drive("Z:", _ROOT)
-    assert len(kernel.devices["Z:"]) == 1
-    api.release_sandbox_drive("Z:", _ROOT)
-    assert kernel.devices["Z:"] == []
-
-    removes = [call for call in kernel.calls if call[0] == "define" and call[1] & 0x2]
-    assert removes == [
-        ("define", 0x8 | 0x2 | 0x4, "Z:", _ROOT),
-        ("define", 0x8 | 0x2 | 0x4, "Z:", _ROOT),
-    ]
-    assert kernel.calls.count(("release", 77)) == 4
-    assert kernel.calls.count(("close", 77)) == 4
-
-
-def test_ctypes_sandbox_drive_failure_is_structured():
-    kernel = _FakeDosKernel(define_ok=False)
-    api = make_ctypes_api(kernel)
-    with pytest.raises(_Win32Failure) as excinfo:
-        api.sandbox_drive(_ROOT)
-    assert excinfo.value.operation == "sandbox_drive"
-    assert excinfo.value.detail.startswith("sandbox_drive_unavailable:")
-    assert ("release", 77) in kernel.calls
-    assert ("close", 77) in kernel.calls
-
-
-def test_ctypes_sandbox_drive_survives_a_deep_stack_on_one_letter(monkeypatch):
-    long_root = _ROOT + "\\" + "x" * 200
-    kernel = _FakeDosKernel()
-    api = make_ctypes_api(kernel)
-    monkeypatch.setattr(wac.ctypes, "get_last_error", lambda: kernel.last_error, raising=False)
-
-    drives = [api.sandbox_drive(long_root) for _ in range(25)]
-    assert drives == ["Z:"] * 25
-    assert len(kernel.devices["Z:"]) == 25
-
-    for _ in range(25):
-        api.release_sandbox_drive("Z:", long_root)
-    assert kernel.devices["Z:"] == []
-
-
-def test_ctypes_sandbox_drive_verify_mismatch_pops_its_own_push():
-    class _MismatchKernel(_FakeDosKernel):
-        def QueryDosDeviceW(self, name, buffer, size):
-            result = super().QueryDosDeviceW(name, buffer, size)
-            if result:
-                buffer.value = "\\??\\z:\\not-the-real-root"
-            return result
-
-    kernel = _MismatchKernel()
-    api = make_ctypes_api(kernel)
-
-    with pytest.raises(_Win32Failure) as excinfo:
-        api.sandbox_drive(_ROOT)
-
-    assert excinfo.value.operation == "sandbox_drive"
-    assert kernel.devices["Z:"] == []
-    removes = [call for call in kernel.calls if call[0] == "define" and call[1] & 0x2]
-    assert removes == [("define", 0x8 | 0x2 | 0x4, "Z:", _ROOT)]
+    assert "create_process" not in fake.events
+    assert _grant_events(fake) == []
 
 
 @pytest.mark.skipif(os.name != "nt", reason="C:\\Users DACL grant is a Windows failure")
@@ -4419,34 +4108,6 @@ def test_the_shim_final_path_matches_the_host_when_the_volume_lookup_is_denied(
 
 
 @windows_only
-@requires_host_win32_privileges
-def test_the_shim_final_path_keeps_the_sandbox_drive_spelling(tmp_path, monkeypatch):
-    """NF-2026-01027: under a sandbox root's per-session drive the rebuilt name
-    is that drive's spelling, not the root's real directories below it."""
-    site = _appcontainer_site()
-    (tmp_path / "Dir").mkdir()
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    buffer = ctypes.create_unicode_buffer(1024)
-    drive = next(
-        letter + ":"
-        for letter in wac._SANDBOX_DRIVE_LETTERS
-        if not kernel32.QueryDosDeviceW(letter + ":", buffer, len(buffer))
-    )
-    target = os.path.normcase(os.path.realpath(tmp_path))
-    assert kernel32.DefineDosDeviceW(0, drive, target)
-
-    def _denied(path):
-        raise PermissionError(5, "Access is denied", path)
-
-    try:
-        monkeypatch.setattr(site, "_getfinalpathname_host", _denied)
-        assert site._getfinalpathname(drive + "\\dir") == "\\\\?\\" + drive + "\\Dir"
-        assert site._getfinalpathname(drive + "\\") == "\\\\?\\" + drive + "\\"
-    finally:
-        kernel32.DefineDosDeviceW(2 | 4, drive, target)
-
-
-@windows_only
 def test_the_shim_final_path_never_names_a_different_file(tmp_path, monkeypatch):
     """The rebuilt path is returned only if it is the very same file; otherwise
     the container's original error stands."""
@@ -4681,9 +4342,8 @@ _PRIVILEGED_LANE_SKIP_TEST_NAMES = {
     "test_worker_pipe_accept_gives_up_at_its_timeout",
     "test_worker_pipe_shutdown_releases_a_waiting_accept",
     "test_the_shim_mkdir_0o700_inherits_the_parent_dacl",
-    # NF-2026-01039: a real junction and a real DefineDosDeviceW drive.
+    # NF-2026-01039: a real junction.
     "test_a_junction_out_of_the_sandbox_is_refused",
-    "test_the_shim_final_path_keeps_the_sandbox_drive_spelling",
     # NF-2026-01484: the real token profile and known folders.
     "test_sensitive_roots_roaming_never_resolves_inside_an_isolated_home",
     # NF-2026-01503: a real multi-instance named pipe for the loopback relay,
@@ -4988,8 +4648,11 @@ def test_validation_helper_temp_grant_plan_spawns_under_the_winerror_267_limit()
 
 
 @windows_only
-def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypatch):
-    """A too-long scratch is not granted, and neither is any path outside it."""
+def test_helper_temp_plan_launches_unchanged_when_no_short_private_temp_fits(
+    monkeypatch,
+):
+    """A too-long scratch is neither granted nor rewritten: the child gets its
+    real temp, and only a nested helper that cannot start fails, on its own."""
 
     long = os.path.abspath(os.path.join(os.sep, "Users", "owner", "Temp")) + ("n" * 160)
     monkeypatch.setattr(wac.os, "name", "nt")
@@ -5004,10 +4667,7 @@ def test_helper_temp_plan_fails_closed_when_no_short_private_temp_fits(monkeypat
         wac._VALIDATION_SCRATCH_ENV: long,
     }
     request = make_request(environment=env, filesystem_grants=(), working_directory=long)
-    with pytest.raises(AppContainerError) as excinfo:
-        wac.bind_validation_helper_temp(request, username="owner")
-    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
-    assert "no shorter private temp" in excinfo.value.detail
+    assert wac.bind_validation_helper_temp(request, username="owner") == (request, None)
     assert tuple(request.filesystem_grants) == ()
 
 
@@ -5025,20 +4685,19 @@ def _refuse_helper_temp(_anchor, _user):
     raise AssertionError("no helper temp may be created")
 
 
-@windows_only
-def test_helper_temp_plan_measures_a_same_anchor_temp_on_the_drive_spelling(
+def test_helper_temp_plan_measures_a_same_anchor_temp_on_its_real_path(
     monkeypatch,
 ):
-    """NF-2026-01796: the child sees ``<drive>:\\req\\tmp``, which fits."""
+    """NF-2026-01023: no drive letter shortens the child's view; the real,
+    too-long scratch is what the length check measures."""
 
     from aiworkhub.validation_runner import temp_root_blocks_nested_lsp_helper
 
     anchor, scratch = _deep_sandbox_scratch()
     assert temp_root_blocks_nested_lsp_helper(scratch, "owner")
-    assert not temp_root_blocks_nested_lsp_helper("Z:\\req\\tmp", "owner")
     monkeypatch.setattr(wac.os, "name", "nt")
     monkeypatch.setattr(wac, "_request_traversal_anchor", lambda _value: anchor)
-    monkeypatch.setattr(wac, "_create_short_helper_temp", _refuse_helper_temp)
+    monkeypatch.setattr(wac, "_create_short_helper_temp", lambda _anchor, _user: None)
     env = {
         "TMPDIR": scratch,
         "TEMP": scratch,
@@ -5050,10 +4709,7 @@ def test_helper_temp_plan_measures_a_same_anchor_temp_on_the_drive_spelling(
         filesystem_grants=(),
         working_directory=os.path.join(anchor, "worktree"),
     )
-    rewritten, disposable = wac.bind_validation_helper_temp(request, username="owner")
-    assert disposable is None
-    assert rewritten.environment["TEMP"] == scratch
-    assert tuple(rewritten.filesystem_grants) == ()
+    assert wac.bind_validation_helper_temp(request, username="owner") == (request, None)
 
 
 def test_helper_temp_plan_measures_a_temp_outside_the_workspace_anchor_on_its_real_path(
@@ -5081,10 +4737,7 @@ def test_helper_temp_plan_measures_a_temp_outside_the_workspace_anchor_on_its_re
         filesystem_grants=(),
         working_directory=os.path.join(other, "worktree"),
     )
-    with pytest.raises(AppContainerError) as excinfo:
-        wac.bind_validation_helper_temp(request, username="owner")
-    assert excinfo.value.reason is AppContainerReason.INVALID_REQUEST
-    assert "no shorter private temp" in excinfo.value.detail
+    assert wac.bind_validation_helper_temp(request, username="owner") == (request, None)
 
 
 @windows_only
@@ -5109,9 +4762,7 @@ def test_helper_temp_plan_measures_a_prefix_sibling_of_the_anchor_on_its_real_pa
         filesystem_grants=(),
         working_directory=os.path.join(anchor, "worktree"),
     )
-    with pytest.raises(AppContainerError) as excinfo:
-        wac.bind_validation_helper_temp(request, username="owner")
-    assert "no shorter private temp" in excinfo.value.detail
+    assert wac.bind_validation_helper_temp(request, username="owner") == (request, None)
 
 
 def test_appcontainer_shell_drops_git_bash_and_uses_powershell(monkeypatch):
