@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 import aiworkhub.windows_appcontainer as wac
 from aiworkhub.windows_appcontainer import (
     AppContainerRequest,
@@ -278,6 +280,7 @@ def test_a_production_launch_defines_no_drive_and_passes_the_real_worktree(
         assert key.startswith(runtime + os.sep)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="DOS device leases exist only on Windows")
 def test_lease_cleanup_pops_only_exact_targets_under_the_worktrees_root(tmp_path):
     repo = tmp_path / "repo"
     runtime = repo / ".aiworkhub" / "runtime"
@@ -338,6 +341,7 @@ def test_lease_cleanup_pops_only_exact_targets_under_the_worktrees_root(tmp_path
     assert len(kernel.calls) == 2
 
 
+@pytest.mark.skipif(os.name != "nt", reason="DOS device leases exist only on Windows")
 def test_lease_cleanup_keeps_the_directory_when_a_pop_fails(tmp_path):
     repo = tmp_path / "repo"
     runtime = repo / ".aiworkhub" / "runtime"
