@@ -4560,6 +4560,8 @@ def aiworkhub_task_amend_pending(
     validation_roles: list[str] | None = None,
     runner: str | None = None,
     cancel_live_launch: bool = False,
+    objective: str | None = None,
+    required_outputs: list[str] | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: amend a pending card that no request was ever launched for.
 
@@ -4589,6 +4591,17 @@ def aiworkhub_task_amend_pending(
     ``cancelled_launch`` recorded, the amendment runs in the same call and the
     reply carries ``cancelled_request_id``. An archived card stays refused.
 
+    ``objective`` / ``required_outputs`` (NF-2026-01022) fix a typo in the
+    contract itself without archive + re-create under a new id: both REPLACE
+    the card's value, the card id and NF links stay unchanged, and the change
+    is recorded in the card history. They are accepted ONLY on a pending card
+    that was never launched (no launch_request_id, started_at, reject/
+    supersede/cancel record or request-bearing history entry); any launch
+    history refuses with ``task_amend_pending_refused:amend_contract_after_launch``.
+    Every required_outputs entry must be an exact entry of the card's
+    allowed_writes (including this call's additions), else
+    ``task_amend_pending_refused:required_output_outside_allowed_writes:<path>``.
+
     Args:
         task_id: Id of the pending, never-launched card to amend.
         allowed_writes: Repo-relative paths or globs to ADD to allowed_writes; omit to leave them.
@@ -4597,6 +4610,8 @@ def aiworkhub_task_amend_pending(
         validation_roles: One role per validation command; only with validation. Omit for generic roles.
         runner: Replacement runner (folded like task_create); refused as runner_reserved:<r> for the manager identity or runner_route_absent:<r> without a workforce route. Reply carries runner_before/runner_after.
         cancel_live_launch: True to cancel a claimed/live launch to a terminal state and return the card to pending before amending; default false keeps every refusal unchanged.
+        objective: Replacement objective (task_create's bound); only on a never-launched card, else amend_contract_after_launch. Omit to keep it.
+        required_outputs: Replacement required_outputs list, each an exact allowed_writes entry; only on a never-launched card, else amend_contract_after_launch. Omit to keep it.
     """
     result = manager_card_amend.amend_pending(
         task_id,
@@ -4606,6 +4621,8 @@ def aiworkhub_task_amend_pending(
         validation_roles=validation_roles,
         runner=runner,
         cancel_live_launch=bool(cancel_live_launch),
+        objective=objective,
+        required_outputs=required_outputs,
     )
     if isinstance(result, dict) and result.get("ok"):
         # Best effort: the amendment already committed, so an unreadable

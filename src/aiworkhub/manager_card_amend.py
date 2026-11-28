@@ -29,6 +29,7 @@ import os
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -316,6 +317,130 @@ def _cancel_live_launch_for_amend(
     return None, request_id
 
 
+AMEND_CONTRACT_AFTER_LAUNCH = "amend_contract_after_launch"
+# Card keys whose presence is launch evidence even after the launch went
+# terminal: the launch itself, and the reject / supersede / cancel-for-amend
+# records that only a launched request can leave behind.
+_LAUNCH_EVIDENCE_KEYS = (
+    "launch_request_id",
+    "rejection_disposition",
+    "rework_predecessor",
+    task_store.CANCELLED_LAUNCH_KEY,
+)
+
+
+def contract_launch_history(row: Mapping[str, Any], card: Mapping[str, Any]) -> bool:
+    """True when this card was EVER launched (NF-2026-01022).
+
+    Stricter than ``task_store.unlaunched_pending_refusal``, which reads only
+    a still-live launch: a worker may already have read the objective and
+    required_outputs of a card back to pending after a reject, so its contract
+    text stays fixed. Evidence is a ``started_at``, any ``_LAUNCH_EVIDENCE_KEYS``
+    value, or a history entry naming a request id; absent evidence alone means
+    never launched.
+    """
+    if str(row.get("started_at") or card.get("started_at") or "").strip():
+        return True
+    if any(card.get(key) for key in _LAUNCH_EVIDENCE_KEYS):
+        return True
+    history = card.get("history")
+    for entry in history if isinstance(history, list) else []:
+        if isinstance(entry, Mapping) and str(entry.get("request_id") or "").strip():
+            return True
+    return False
+
+
+def required_output_outside_scope(allowed_writes: Any, outputs: list[str]) -> str:
+    """The first ``outputs`` entry not an exact ``allowed_writes`` entry, else ``""``.
+
+    Exact (normalized) membership, the rule ``task_templates.expand_template``
+    applies to mandatory changed outputs: a glob write scope does not make a
+    required output of a path it merely matches.
+    """
+    entries = allowed_writes if isinstance(allowed_writes, list) else []
+    scope = {task_store._normalize_write_path(str(entry or "")) for entry in entries}
+    for path in outputs:
+        if task_store._normalize_write_path(path) not in scope:
+            return path
+    return ""
+
+
+def _amend_pending_contract(
+    root: str | Path,
+    task_id: str,
+    *,
+    actor: str,
+    objective: str | None,
+    required_outputs: list[str] | None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Replace objective/required_outputs of a never-launched pending card.
+
+    One immediate transaction: eligibility (never launched, then
+    ``unlaunched_pending_refusal``) and the required_outputs scope are
+    re-decided on the row read inside it, and the write is the store's own
+    ``card_json`` compare-and-swap, so a launch that claims the card first
+    makes this refuse. Returns ``(ok, reason, detail)`` like
+    ``task_store.amend_pending_card``.
+    """
+    _readiness, db_path = task_store._require_ready(root)
+    with task_store._write_connection(db_path) as conn:
+        task_store._begin_immediate(conn)
+        row, preimage, card, refusal = task_store._load_card_for_update(conn, task_id)
+        if refusal or row is None or card is None:
+            return False, refusal or "task_not_found", {}
+        row_map = dict(row)
+        if contract_launch_history(row_map, card):
+            return False, AMEND_CONTRACT_AFTER_LAUNCH, {}
+        refusal = task_store.unlaunched_pending_refusal(row_map, card)
+        if refusal:
+            return False, refusal, {}
+        fields: list[str] = []
+        change: dict[str, Any] = {}
+        if objective is not None:
+            before = str(card.get("objective") or "")
+            if objective != before:
+                card["objective"] = objective
+                fields.append("objective")
+                change.update(objective_before=before, objective_after=objective)
+        if required_outputs is not None:
+            outside = required_output_outside_scope(card.get("allowed_writes"), required_outputs)
+            if outside:
+                return False, f"required_output_outside_allowed_writes:{outside[:240]}", {}
+            before_outputs = [str(path) for path in (card.get("required_outputs") or [])]
+            if required_outputs != before_outputs:
+                card["required_outputs"] = list(required_outputs)
+                fields.append("required_outputs")
+                change.update(
+                    required_outputs_before=before_outputs,
+                    required_outputs_after=list(required_outputs),
+                )
+        if not fields:
+            return True, "unchanged", {"fields": []}
+        now = datetime.now(timezone.utc).isoformat()
+        history = card.get("history")
+        history_list = list(history) if isinstance(history, list) else []
+        history_list.append(
+            {"event": task_store.CARD_AMENDED_PENDING_EVENT, "actor": actor, "at": now,
+             "fields": fields, **change}
+        )
+        card["history"] = history_list
+        if "objective" in fields:
+            # Same transaction as the compare-and-swap below: a lost CAS rolls
+            # the column back with it.
+            conn.execute("UPDATE tasks SET objective=? WHERE task_id=?", (objective, task_id))
+        if not task_store._commit_card_update(
+            conn, task_id, preimage=preimage, card=card,
+            event=task_store.CARD_AMENDED_PENDING_EVENT, actor=actor,
+            payload={"fields": fields, **change}, now=now,
+        ):
+            return False, "card_changed", {}
+        return True, "amended", {
+            "fields": fields,
+            **change,
+            "card_content_sha256": task_store.card_content_identity(card),
+        }
+
+
 def amend_pending(
     task_id: str,
     *,
@@ -325,6 +450,8 @@ def amend_pending(
     validation_roles: list[str] | None = None,
     runner: str | None = None,
     cancel_live_launch: bool = False,
+    objective: str | None = None,
+    required_outputs: list[str] | None = None,
 ) -> dict[str, Any]:
     """Amend one pending card with no live launch: add-only paths, replacement validation.
 
@@ -356,6 +483,18 @@ def amend_pending(
     amendment runs; every reply after the cancel carries
     ``cancelled_request_id``. An archived card is still ``card_archived``.
     False (the default) keeps every refusal exactly as before.
+
+    ``objective`` and ``required_outputs`` (NF-2026-01022) REPLACE the card's
+    contract text, but only on a card that was NEVER launched
+    (``contract_launch_history``): any launch evidence refuses with
+    ``task_amend_pending_refused:amend_contract_after_launch`` -- also with
+    ``cancel_live_launch``, since a cancel is itself launch history. The
+    objective obeys task_create's bound; every required_outputs entry must be
+    an exact entry of the card's allowed_writes after this call's own
+    additions, else ``...:required_output_outside_allowed_writes:<path>``.
+    They are written in their own compare-and-swap after the store's
+    amendment of the other fields; a refusal there after that amendment
+    landed names ``applied_fields``. The card id and its links are untouched.
     """
     from . import core, quality_evidence, task_templates
 
@@ -374,14 +513,45 @@ def amend_pending(
     reads = [str(value) for value in (read_first or [])]
     commands = [str(value) for value in (validation or [])]
     requested_runner = str(runner or "").strip()
+    new_objective: str | None = None
+    if objective is not None:
+        try:
+            new_objective = task_templates._bounded_text(
+                objective, "objective", task_templates.MAX_OBJECTIVE_LENGTH
+            )
+        except task_templates.TaskTemplateError as exc:
+            return _refusal(str(exc), task_id=task_id)
+    new_outputs: list[str] | None = None
+    if required_outputs is not None:
+        try:
+            listed = core.bounded_strings(
+                list(required_outputs) if isinstance(required_outputs, (list, tuple))
+                else required_outputs,
+                "required_outputs",
+                required=True,
+            )
+        except ValueError as exc:
+            return _refusal(str(exc), task_id=task_id)
+        seen: set[str] = set()
+        new_outputs = []
+        for path in listed:
+            key = task_store._normalize_write_path(path)
+            if key not in seen:
+                seen.add(key)
+                new_outputs.append(path)
+    contract_requested = new_objective is not None or new_outputs is not None
     if validation_roles is not None and not commands:
         return _refusal("validation_roles_require_validation")
-    if not (writes or reads or commands or requested_runner):
+    if not (writes or reads or commands or requested_runner or contract_requested):
         return _refusal("task_amend_pending_empty")
     root = core.repo_root()
     card = task_store.get_task(root, task_id)
     if not isinstance(card, dict):
         return _refusal("task_amend_pending_refused:task_not_found", task_id=task_id)
+    if contract_requested and contract_launch_history(card, card):
+        return _refusal(
+            f"task_amend_pending_refused:{AMEND_CONTRACT_AFTER_LAUNCH}", task_id=task_id
+        )
     refusal = task_store.unlaunched_pending_refusal(card, card)
     cancel_first = bool(
         refusal and cancel_live_launch and refusal in task_store.CANCEL_FOR_AMEND_REFUSALS
@@ -399,6 +569,15 @@ def amend_pending(
         path_error = core._validate_allowed_writes_amendment_paths(card, writes)
         if path_error is not None:
             return path_error
+    if new_outputs is not None:
+        scope = list(card.get("allowed_writes") or []) + writes
+        outside = required_output_outside_scope(scope, new_outputs)
+        if outside:
+            return _refusal(
+                "task_amend_pending_refused:required_output_outside_allowed_writes:"
+                f"{outside[:240]}",
+                task_id=task_id,
+            )
     validated_reads: list[str] = []
     if reads:
         validated_reads, read_error = core._validate_read_first_amendment_paths(reads)
@@ -429,7 +608,8 @@ def amend_pending(
     if cancel_first:
         # Every input above is valid for this card, so the cancel cannot be
         # wasted on an amendment that would be refused anyway; the reloaded
-        # pending card is re-gated by the flag-off call.
+        # pending card is re-gated by the flag-off call. A contract amendment
+        # never reaches here: launch evidence refused it above.
         cancel_error, cancelled_request_id = _cancel_live_launch_for_amend(root, task_id, card)
         if cancel_error is not None:
             return cancel_error
@@ -444,18 +624,36 @@ def amend_pending(
         result["cancelled_request_id"] = cancelled_request_id
         return result
     actor = core._verified_manager_actor()
-    ok, reason, detail = task_store.amend_pending_card(
-        root,
-        task_id,
-        actor=actor,
-        allowed_writes=writes,
-        read_first=validated_reads,
-        validation=commands or None,
-        validation_roles=roles,
-        runner=folded_runner or None,
-    )
-    if not ok:
-        return _refusal(f"task_amend_pending_refused:{reason}", task_id=task_id)
+    detail: dict[str, Any] = {"fields": []}
+    reason = "unchanged"
+    if writes or reads or commands or requested_runner:
+        ok, reason, detail = task_store.amend_pending_card(
+            root,
+            task_id,
+            actor=actor,
+            allowed_writes=writes,
+            read_first=validated_reads,
+            validation=commands or None,
+            validation_roles=roles,
+            runner=folded_runner or None,
+        )
+        if not ok:
+            return _refusal(f"task_amend_pending_refused:{reason}", task_id=task_id)
+    if contract_requested:
+        ok, contract_reason, contract_detail = _amend_pending_contract(
+            root, task_id, actor=actor, objective=new_objective, required_outputs=new_outputs
+        )
+        if not ok:
+            return _refusal(
+                f"task_amend_pending_refused:{contract_reason}",
+                task_id=task_id,
+                applied_fields=list(detail.get("fields") or []),
+            )
+        contract_fields = list(contract_detail.pop("fields", []) or [])
+        detail = {**detail, **contract_detail}
+        detail["fields"] = list(detail.get("fields") or []) + contract_fields
+        if contract_reason == "amended":
+            reason = "amended"
     reply = {
         "ok": True,
         "returncode": 0,
