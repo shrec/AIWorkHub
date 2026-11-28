@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 import sysconfig
 import tempfile
@@ -842,6 +843,7 @@ def verify_review_packet_candidate(
     repo: Path,
     *,
     max_packet_bytes: int = 256 * 1024,
+    candidate_root: Path | None = None,
 ) -> dict[str, Any]:
     """Verify an on-disk review packet and its exact candidate file bytes.
 
@@ -884,7 +886,13 @@ def verify_review_packet_candidate(
         for evidence_row in source_evidence:
             if isinstance(evidence_row, Mapping):
                 source_by_path[str(evidence_row.get("path") or "")] = evidence_row
-    resolved_repo = repo.resolve()
+    # NF-2026-00794: an older ``review_ready`` candidate is verified against
+    # the sealed candidate artifact (the promoted snapshot the packet was
+    # built from) when the caller supplies it, never against a live worktree
+    # that has since moved on.  The same containment, symlink and per-byte
+    # digest checks apply to that root, so a drifted or tampered snapshot
+    # still fails closed with the same stable codes.
+    resolved_repo = (repo if candidate_root is None else candidate_root).resolve()
     verified_paths: list[dict[str, str | None]] = []
     for row in rows:
         if not isinstance(row, Mapping):
@@ -929,6 +937,135 @@ def verify_review_packet_candidate(
         "target_task_id": target_task_id,
         "changed_paths": verified_paths,
     }
+
+
+# NF-2026-00794: the sealed candidate snapshot of one reviewed request lives
+# beside its coordinator-written packet, named by the packet's own
+# ``target.request_id``.  It holds exactly the bytes the packet's per-file
+# sha256 rows authenticate, so an old ``review_ready`` candidate keeps
+# verifying after the live worker worktree has moved on.
+SEALED_CANDIDATE_DIR_PREFIX = "sealed_candidate_"
+_SEALED_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def sealed_review_candidate_root(packet_path: Path, request_id: str) -> Path:
+    """Return the request-scoped sealed snapshot directory for one packet."""
+
+    if not _SEALED_REQUEST_ID_RE.fullmatch(str(request_id or "")):
+        raise ReviewerEvidenceError("quality_review_packet_target_invalid")
+    return packet_path.parent.resolve() / f"{SEALED_CANDIDATE_DIR_PREFIX}{request_id}"
+
+
+def _review_packet_request_id(packet_path: Path, *, max_packet_bytes: int) -> str:
+    try:
+        if packet_path.is_symlink() or not packet_path.is_file():
+            raise ReviewerEvidenceError("quality_review_packet_invalid")
+        if packet_path.stat().st_size > max_packet_bytes:
+            raise ReviewerEvidenceError("quality_review_packet_too_large")
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    except ReviewerEvidenceError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewerEvidenceError("quality_review_packet_unreadable") from exc
+    target = packet.get("target") if isinstance(packet, dict) else None
+    request_id = str((target or {}).get("request_id") or "") if isinstance(target, dict) else ""
+    if not request_id:
+        raise ReviewerEvidenceError("quality_review_packet_target_invalid")
+    return request_id
+
+
+def seal_review_packet_candidate(
+    packet_path: Path,
+    source_root: Path,
+    *,
+    max_packet_bytes: int = 256 * 1024,
+) -> Path:
+    """Seal the packet-authenticated candidate bytes from ``source_root``.
+
+    Every byte is verified against the packet before it is copied, and again
+    as it is copied, into a private staging directory that is then renamed
+    into place, so a partially written or drifted snapshot is never visible.
+    An existing seal is returned untouched (the caller re-verifies it).
+    """
+
+    verified = verify_review_packet_candidate(
+        packet_path, source_root, max_packet_bytes=max_packet_bytes
+    )
+    sealed = sealed_review_candidate_root(packet_path, verified["target_request_id"])
+    if sealed.is_symlink():
+        raise ReviewerEvidenceError("quality_review_candidate_snapshot_invalid")
+    if sealed.is_dir():
+        return sealed
+    source = source_root.resolve()
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{sealed.name}.", suffix=".tmp", dir=sealed.parent)
+    )
+    published = False
+    try:
+        for row in verified["changed_paths"]:
+            expected = row["sha256"]
+            if expected is None:
+                continue
+            relative = str(row["path"])
+            data = (source / relative).read_bytes()
+            if hashlib.sha256(data).hexdigest() != expected:
+                raise ReviewerEvidenceError("quality_review_candidate_hash_mismatch")
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        try:
+            os.rename(staging, sealed)
+        except OSError:
+            # A concurrent prewarm/read sealed the same request first.
+            if sealed.is_symlink() or not sealed.is_dir():
+                raise
+        else:
+            published = True
+    finally:
+        if not published:
+            shutil.rmtree(staging, ignore_errors=True)
+    return sealed
+
+
+def verify_review_packet_sealed_candidate(
+    packet_path: Path,
+    live_root: Path,
+    *,
+    max_packet_bytes: int = 256 * 1024,
+) -> dict[str, Any]:
+    """Verify a packet against the sealed snapshot of its exact request.
+
+    The production entry point (prewarm and ``quality_review_packet_read``).
+    The snapshot for ``target.request_id`` is used when it exists; otherwise
+    it is sealed now from ``live_root``, which succeeds only while the live
+    bytes still match the packet (i.e. at launch).  A request with no seal
+    whose live tree has moved on fails closed with the live drift code.  When
+    the runtime directory cannot hold a seal, the just-verified live bytes are
+    used and the result names that (``candidate_root_source``).
+    """
+
+    request_id = _review_packet_request_id(packet_path, max_packet_bytes=max_packet_bytes)
+    sealed = sealed_review_candidate_root(packet_path, request_id)
+    source = "sealed_snapshot"
+    if sealed.is_symlink():
+        raise ReviewerEvidenceError("quality_review_candidate_snapshot_invalid")
+    if not sealed.is_dir():
+        try:
+            sealed = seal_review_packet_candidate(
+                packet_path, live_root, max_packet_bytes=max_packet_bytes
+            )
+        except OSError:
+            source = "live_unsealed"
+    verified = verify_review_packet_candidate(
+        packet_path,
+        live_root,
+        max_packet_bytes=max_packet_bytes,
+        candidate_root=sealed if source == "sealed_snapshot" else live_root,
+    )
+    if verified["target_request_id"] != request_id:
+        raise ReviewerEvidenceError("quality_review_packet_changed_during_read")
+    verified["candidate_root_source"] = source
+    return verified
 
 
 def verify_reviewer_receipt(
@@ -1616,6 +1753,15 @@ def normalize_packet_findings(
         if isinstance(row, Mapping)
     }
     permitted_checks.discard("")
+    failed_checks = {
+        str(row.get("check_id") or "")
+        for section in ("mechanical_checks", "combined_tree_checks")
+        for row in packet.get(section) or []
+        if isinstance(row, Mapping)
+        and str(row.get("status") or "").strip().lower() in _FAILED_CHECK_STATUSES
+    }
+    failed_checks.discard("")
+    measured_checks = _measured_failed_checks(packet)
     permitted_symbols = {
         str(row.get("qualified_name") or "")
         for row in scope.get("target_symbols") or []
@@ -1629,6 +1775,7 @@ def normalize_packet_findings(
     }
     changed_paths.discard("")
     changed_source_lines = _candidate_changed_source_lines(candidate)
+    baseline_deleted_lines = _candidate_baseline_deleted_lines(candidate)
     authorized_repo_replacements = _authorized_overbuild_replacements(
         scope,
         changed_paths=changed_paths,
@@ -1682,6 +1829,7 @@ def normalize_packet_findings(
             permitted_paths=permitted_paths,
             permitted_checks=permitted_checks,
             allow_test_target=True,
+            baseline_deleted_lines=baseline_deleted_lines,
         )
         explicit_path = str(finding.get("path") or "")
         explicit_check = str(finding.get("check_id") or "")
@@ -1772,6 +1920,17 @@ def normalize_packet_findings(
             raise ReviewerEvidenceError(
                 f"review_finding_{index}_exact_evidence_required"
             )
+        if actionable and severity in BLOCKING_FINDING_SEVERITIES:
+            _validate_blocking_lens_evidence(
+                lens=lens,
+                index=index,
+                summary=summary,
+                claim=str(finding.get("claim") or ""),
+                evidence=evidence,
+                evidence_reference=evidence_reference,
+                failed_checks=failed_checks,
+                measured_checks=measured_checks,
+            )
         replacement = str(finding.get("replacement") or "").strip()[:MAX_TEXT_CHARS]
         removable_surface = str(
             finding.get("removable_surface") or ""
@@ -1788,6 +1947,7 @@ def normalize_packet_findings(
                 changed_paths=changed_paths,
                 changed_source_lines=changed_source_lines,
                 symbol_resolver=symbol_resolver,
+                baseline_deleted_lines=baseline_deleted_lines,
             )
         derived_level = (
             EvidenceLevel.STATIC_EVIDENCE
@@ -1894,6 +2054,7 @@ def _validate_evidence_reference(
     permitted_paths: set[str],
     permitted_checks: set[str],
     allow_test_target: bool,
+    baseline_deleted_lines: Mapping[str, list[tuple[int, int]]] | None = None,
 ) -> dict[str, Any] | None:
     """Revalidate one supervisor-shaped reference against packet authority."""
 
@@ -1902,6 +2063,37 @@ def _validate_evidence_reference(
     if not isinstance(raw, Mapping):
         raise ReviewerEvidenceError(f"review_finding_{index}_evidence_reference_invalid")
     kind = raw.get("kind")
+    if kind == "baseline":
+        # NF-2026-00934: admissible only inside a baseline span the sealed
+        # delta itself removed or replaced -- never an arbitrary old line.
+        if set(raw) != {"kind", "path", "line_start", "line_end"}:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_evidence_reference_invalid"
+            )
+        path = raw.get("path")
+        line_start = raw.get("line_start")
+        line_end = raw.get("line_end")
+        if not isinstance(path, str) or path not in permitted_paths:
+            raise ReviewerEvidenceError(f"review_finding_{index}_path_out_of_scope")
+        spans = (baseline_deleted_lines or {}).get(path) or []
+        if (
+            not isinstance(line_start, int)
+            or isinstance(line_start, bool)
+            or not isinstance(line_end, int)
+            or isinstance(line_end, bool)
+            or line_start < 1
+            or line_end < line_start
+            or not any(lo <= line_start and line_end <= hi for lo, hi in spans)
+        ):
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_baseline_reference_unbound"
+            )
+        return {
+            "kind": "baseline",
+            "path": path,
+            "line_start": line_start,
+            "line_end": line_end,
+        }
     if kind == "source":
         allowed = {"kind", "path", "line_start", "line_end"}
         if set(raw) != allowed:
@@ -1978,7 +2170,12 @@ def _validate_evidence_text_agrees_with_reference(
     claimed = _evidence_text_reference(
         evidence, permitted_paths=permitted_paths, permitted_checks=permitted_checks
     )
-    if claimed is not None and claimed != evidence_reference:
+    expected = dict(evidence_reference)
+    if expected.get("kind") == "baseline":
+        # Free text can only spell ``path:line``; for a baseline reference
+        # that spelling must name the same baseline coordinates.
+        expected["kind"] = "source"
+    if claimed is not None and claimed != expected:
         raise ReviewerEvidenceError(
             f"review_finding_{index}_evidence_reference_conflict"
         )
@@ -2063,6 +2260,179 @@ def _candidate_changed_source_lines(
             ):
                 spans.setdefault(path, []).append((start, end))
     return spans
+
+
+def _candidate_baseline_deleted_lines(
+    candidate: Mapping[str, Any],
+) -> dict[str, list[tuple[int, int]]]:
+    """Return the BASELINE line spans the sealed delta removed or replaced.
+
+    NF-2026-00934: a finding about deleted code cannot cite candidate lines --
+    the text is gone -- so it binds to the baseline coordinates the packet's
+    own ``delete``/``replace`` segments authenticate.  A segment without a
+    positive baseline span (``bounded_int`` maps an absent coordinate to 0)
+    contributes nothing, so an unsealed baseline line is never admissible.
+    """
+
+    spans: dict[str, list[tuple[int, int]]] = {}
+    for row in candidate.get("source_evidence") or []:
+        if not isinstance(row, Mapping):
+            continue
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        for segment in row.get("segments") or []:
+            if not isinstance(segment, Mapping):
+                continue
+            if segment.get("kind") not in {"delete", "replace"}:
+                continue
+            start = segment.get("baseline_start_line")
+            end = segment.get("baseline_end_line")
+            if (
+                isinstance(start, int)
+                and not isinstance(start, bool)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+                and start >= 1
+                and end >= start
+            ):
+                spans.setdefault(path, []).append((start, end))
+    return spans
+
+
+BLOCKING_FINDING_SEVERITIES = frozenset({"critical", "high"})
+
+# NF-2026-00935: the anchor a BLOCKING finding needs depends on its lens, not
+# only on the JSON shape.  A security blocker must name the vulnerable code
+# path itself (a source or authenticated baseline line); a mechanical check id
+# alone does not locate a path.  Correctness and code quality also accept a
+# failing check, which is an observed input/state the coordinator ran.
+_LENS_BLOCKING_EVIDENCE_KINDS: dict[str, frozenset[str]] = {
+    "correctness": frozenset({"source", "baseline", "check"}),
+    "security": frozenset({"source", "baseline"}),
+    "code_quality": frozenset({"source", "baseline", "check"}),
+}
+# Only a check the coordinator observed FAILING is an anchor: a passed or
+# skipped check proves no defect, so naming it never admits a blocker.
+_FAILED_CHECK_STATUSES = frozenset({"failed", "fail", "error"})
+_PERFORMANCE_CLAIM_RE = re.compile(
+    r"\b(?:perf(?:ormance)?|slow(?:er|ness|down)?|latency|throughput|"
+    r"quadratic|hot[ -]?path)\b",
+    re.IGNORECASE,
+)
+_MEASURED_METRIC_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:ns|us|ms|s|sec|seconds|minutes|kib|kb|mib|mb|gib|gb|"
+    r"bytes?|x|%|calls|queries|rows|iterations|ops)(?![A-Za-z])"
+    r"|\bO\([^)]*\)",
+    re.IGNORECASE,
+)
+# The performance gate binds only the lens that owns performance review.
+# Lenses are correctness / security / code_quality and no category is
+# "performance", so code_quality is that owner; a correctness or security
+# blocker that merely mentions "slow" or "latency" is not a performance claim.
+_PERFORMANCE_GATED_LENSES = frozenset({"code_quality"})
+
+
+def _validate_blocking_lens_evidence(
+    *,
+    lens: str,
+    index: int,
+    summary: str,
+    claim: str,
+    evidence: str,
+    evidence_reference: Mapping[str, Any] | None,
+    failed_checks: set[str] | frozenset[str] = frozenset(),
+    measured_checks: set[str] | frozenset[str] = frozenset(),
+) -> None:
+    """Refuse a blocking finding whose anchor is inadmissible for its lens.
+
+    A check anchor counts only when that check's packet status is failed.
+    A performance claim under a performance-owning lens
+    (``_PERFORMANCE_GATED_LENSES``) blocks only on a measurement: a
+    reference to a failed check that is a test or benchmark AND whose own
+    evidence/output carries a measured metric (``measured_checks``), or a
+    number with a unit / a complexity bound in the finding's evidence text.
+    Any other failed check proves a defect, not a measured slowdown.  An
+    unknown lens is refused, never defaulted.
+    """
+
+    allowed = _LENS_BLOCKING_EVIDENCE_KINDS.get(lens)
+    if allowed is None:
+        raise ReviewerEvidenceError(f"review_finding_{index}_blocking_lens_unknown")
+    kind = None if evidence_reference is None else evidence_reference.get("kind")
+    if kind not in allowed:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_{lens}_blocking_anchor_required"
+        )
+    check_id = str((evidence_reference or {}).get("check_id") or "")
+    if kind == "check" and check_id not in failed_checks:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_blocking_check_not_failed"
+        )
+    if lens not in _PERFORMANCE_GATED_LENSES:
+        return
+    if not _PERFORMANCE_CLAIM_RE.search(f"{summary}\n{claim}"):
+        return
+    # A check anchor is admitted only by its own measured output; metric-looking
+    # finding text never substitutes for a check that measured nothing.
+    measured = (
+        check_id in measured_checks
+        if kind == "check"
+        else bool(_MEASURED_METRIC_RE.search(evidence))
+    )
+    if not measured:
+        raise ReviewerEvidenceError(
+            f"review_finding_{index}_performance_metric_required"
+        )
+
+
+# Exact tokens only: a substring search would classify "latest",
+# "attestation" or "perfunctory_lint" as measuring checks.
+_MEASURING_CHECK_TOKENS = frozenset(
+    {"test", "tests", "pytest", "bench", "benchmark", "perf", "performance"}
+)
+_CHECK_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _is_measuring_check(kind: str, check_id: str) -> bool:
+    """True when the check's kind or id has an exact test/benchmark token."""
+
+    tokens = _CHECK_TOKEN_SPLIT_RE.split(f"{kind} {check_id}".lower())
+    return not _MEASURING_CHECK_TOKENS.isdisjoint(tokens)
+
+
+_CHECK_MEASUREMENT_FIELDS = (
+    "evidence", "output", "summary", "detail", "stdout_tail", "stderr_tail",
+)
+
+
+def _measured_failed_checks(packet: Mapping[str, Any]) -> set[str]:
+    """Failed test/benchmark checks whose own output carries a measured metric.
+
+    NF-2026-00935: only these may anchor a blocking performance claim.  The
+    check's ``kind`` or ``check_id`` must name a test or benchmark, and one of
+    its evidence/output fields must match ``_MEASURED_METRIC_RE``.
+    """
+
+    measured: set[str] = set()
+    for section in ("mechanical_checks", "combined_tree_checks"):
+        for row in packet.get(section) or []:
+            if not isinstance(row, Mapping):
+                continue
+            check_id = str(row.get("check_id") or "")
+            if not check_id:
+                continue
+            if str(row.get("status") or "").strip().lower() not in _FAILED_CHECK_STATUSES:
+                continue
+            if not _is_measuring_check(str(row.get("kind") or ""), check_id):
+                continue
+            if any(
+                isinstance(row.get(field), str)
+                and _MEASURED_METRIC_RE.search(str(row.get(field))[:MAX_VALIDATION_OUTPUT_TAIL_CHARS])
+                for field in _CHECK_MEASUREMENT_FIELDS
+            ):
+                measured.add(check_id)
+    return measured
 
 
 def _line_proves_preexisting_source(
@@ -2829,6 +3199,7 @@ def _validate_overbuild_finding(
     changed_paths: set[str],
     changed_source_lines: Mapping[str, list[tuple[int, int]]],
     symbol_resolver: SymbolResolver | None = None,
+    baseline_deleted_lines: Mapping[str, list[tuple[int, int]]] | None = None,
 ) -> None:
     if disposition != "defect":
         raise ReviewerEvidenceError(
@@ -2838,7 +3209,8 @@ def _validate_overbuild_finding(
         raise ReviewerEvidenceError(
             f"review_finding_{index}_overbuild_exact_evidence_required"
         )
-    if evidence_reference.get("kind") != "source":
+    kind = evidence_reference.get("kind")
+    if kind not in {"source", "baseline"}:
         raise ReviewerEvidenceError(
             f"review_finding_{index}_overbuild_source_evidence_required"
         )
@@ -2849,7 +3221,13 @@ def _validate_overbuild_finding(
         )
     start = evidence_reference.get("line_start")
     end = evidence_reference.get("line_end")
-    spans = changed_source_lines.get(path) or []
+    # NF-2026-00934: a deletion finding cites the BASELINE lines the delta
+    # removed (authenticated against the sealed segment coordinates), because
+    # the deleted text has no candidate coordinate at all.
+    span_source = (
+        changed_source_lines if kind == "source" else (baseline_deleted_lines or {})
+    )
+    spans = span_source.get(path) or []
     if (
         not isinstance(start, int)
         or isinstance(start, bool)

@@ -998,6 +998,25 @@ def _with_source_graph_db(source_graph_module: Any, db_path: Path):
         yield
 
 
+def _quality_review_candidate_root(repo: Path) -> Path:
+    """Resolve the launched candidate worktree a review packet is SEALED from.
+
+    NF-2026-00794: this root is only the seal source.  Verification itself runs
+    against the request-scoped sealed snapshot of the packet's exact
+    ``target.request_id`` (:func:`quality_reviewer.verify_review_packet_sealed_candidate`),
+    so an old ``review_ready`` candidate still verifies after this live tree
+    has moved on.  An unresolvable root fails closed with a named refusal.
+    """
+
+    try:
+        root = Path(repo).resolve(strict=True)
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise WorkerToolError("quality_review_candidate_root_unresolved") from exc
+    if not root.is_dir():
+        raise WorkerToolError("quality_review_candidate_root_unresolved")
+    return root
+
+
 def _verify_quality_review_packet_binding(
     packet_path: Path,
     repo: Path,
@@ -1009,17 +1028,18 @@ def _verify_quality_review_packet_binding(
     reviewer Source Graph reads from and ``changed_paths`` is the verified
     ``[{"path": ..., "sha256": ...}]`` list.  The exact packet/candidate-byte
     verification lives in
-    :func:`quality_reviewer.verify_review_packet_candidate` and is consumed
-    here by both the prewarm (build) path and the runtime (query-only) path,
-    so the two can never disagree about which bytes were authorized.
+    :func:`quality_reviewer.verify_review_packet_sealed_candidate` and is
+    consumed here by both the prewarm (build) path and the runtime (query-only)
+    path, so the two can never disagree about which bytes were authorized.
     """
 
     from . import quality_reviewer
 
+    live_root = _quality_review_candidate_root(repo)
     try:
-        verified = quality_reviewer.verify_review_packet_candidate(
+        verified = quality_reviewer.verify_review_packet_sealed_candidate(
             packet_path,
-            repo,
+            live_root,
             max_packet_bytes=MAX_QUALITY_REVIEW_PACKET_BYTES,
         )
     except quality_reviewer.ReviewerEvidenceError as exc:
@@ -8714,15 +8734,19 @@ def quality_review_packet_read(
         if path.stat().st_size > MAX_QUALITY_REVIEW_PACKET_BYTES:
             return _violation(ctx, tool, "quality_review_packet_too_large")
         before = path.read_bytes()
-        verified = quality_reviewer.verify_review_packet_candidate(
+        # NF-2026-00794: bound to the sealed snapshot of the packet's exact
+        # request, never to a live worktree that has since moved on.
+        verified = quality_reviewer.verify_review_packet_sealed_candidate(
             path,
-            ctx.repo,
+            _quality_review_candidate_root(ctx.repo),
             max_packet_bytes=MAX_QUALITY_REVIEW_PACKET_BYTES,
         )
         after = path.read_bytes()
         if before != after:
             return _violation(ctx, tool, "quality_review_packet_changed_during_read")
         packet = json.loads(after.decode("utf-8"))
+    except WorkerToolError as exc:
+        return _violation(ctx, tool, str(exc))
     except quality_reviewer.ReviewerEvidenceError as exc:
         return _violation(ctx, tool, str(exc))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):

@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from . import skill_registry
+from .roadmap_store import connect_store_db, connect_store_readonly
 from .skill_registry import SkillRecord, SkillRegistry
 from .sqlite_readonly import connect_readonly
 
@@ -160,12 +161,7 @@ def _db_path(repo_root: str | Path) -> Path:
 
 def _connect(repo_root: str | Path) -> sqlite3.Connection:
     """Open the canonical skills database read-write, creating it if absent."""
-    path = _db_path(repo_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_store_db(_db_path(repo_root))
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -521,7 +517,9 @@ def _bounded_page(
     path = _db_path(repo_root)
     if not path.exists():
         return []
-    conn = connect_readonly(path)
+    # NF-2026-00514: the loader's read is bound to the file identity it
+    # authenticated; a link or a replaced store raises instead of loading.
+    conn = connect_store_readonly(repo_root, path)
     conn.row_factory = sqlite3.Row
     try:
         return list(

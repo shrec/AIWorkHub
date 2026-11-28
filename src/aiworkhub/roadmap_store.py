@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from . import sqlite_readonly
+from . import platform_io, sqlite_readonly
 
 SCHEMA_ID = "aiworkhub.roadmap_store.v1"
 ROADMAP_DB_REL = (".aiworkhub", "tasking", "roadmap.sqlite")
@@ -72,13 +74,180 @@ def _db_path(repo_root: str | Path) -> Path:
     return Path(repo_root).joinpath(*ROADMAP_DB_REL)
 
 
-def _connect(repo_root: str | Path) -> sqlite3.Connection:
-    path = _db_path(repo_root)
+def connect_store_db(path: Path) -> sqlite3.Connection:
+    """Open one repository-native store database read-write (NF-2026-00685).
+
+    The ONE owner of the connection shape every repository store uses -- WAL
+    journal, a 30 s busy timeout, autocommit (``isolation_level=None``, so a
+    store's own ``BEGIN IMMEDIATE`` bounds each write transaction) and
+    ``sqlite3.Row`` rows.  ``roadmap_store``, ``skill_registry_store`` and
+    ``tool_recipes_store`` all route through it, so the three cannot drift.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+class StorePathAuthenticationError(Exception):
+    """A store path was a link/reparse point, not a regular file, or was replaced."""
+
+
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _store_path_identity(repo_root: Path, path: Path) -> tuple[int, int]:
+    """Return ``(st_dev, st_ino)`` of ``path`` after refusing every indirection.
+
+    Each component from ``repo_root`` down is ``lstat``-ed, never followed: a
+    symlink, a Windows junction/reparse point, or a non-regular final file is
+    refused with :class:`StorePathAuthenticationError`.
+    """
+
+    try:
+        relative = path.relative_to(repo_root)
+    except ValueError as exc:
+        raise StorePathAuthenticationError(
+            f"store_path_outside_repository:{path}"
+        ) from exc
+    current = repo_root
+    info: os.stat_result | None = None
+    for part in relative.parts:
+        current = current / part
+        info = os.lstat(current)
+        if stat.S_ISLNK(info.st_mode) or (
+            getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise StorePathAuthenticationError(f"store_path_indirection:{current}")
+    if info is None or not stat.S_ISREG(info.st_mode):
+        raise StorePathAuthenticationError(f"store_path_not_regular_file:{path}")
+    if info.st_nlink > 1:
+        raise StorePathAuthenticationError(f"store_path_hardlinked:{path}")
+    return (info.st_dev, info.st_ino)
+
+
+def _open_descriptor_identities() -> dict[int, tuple[int, int]] | None:
+    """POSIX: ``{fd: (st_dev, st_ino)}`` of every open regular-file descriptor.
+
+    Only ``os.fstat`` touches the descriptors -- nothing is opened or closed on
+    a store file, so no SQLite POSIX lock is released (NF-2026-02130).  ``None``
+    when the platform exposes no descriptor listing (fail closed by caller).
+    Keyed by descriptor so a caller can diff two snapshots and consider only
+    the descriptors opened in between.
+    """
+
+    for listing in ("/proc/self/fd", "/dev/fd"):
+        try:
+            names = os.listdir(listing)
+        except OSError:
+            continue
+        identities: dict[int, tuple[int, int]] = {}
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                info = os.fstat(int(name))
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                identities[int(name)] = (info.st_dev, info.st_ino)
+        return identities
+    return None
+
+
+def _connect_readonly_windows(
+    root: Path, target: Path, before: tuple[int, int]
+) -> sqlite3.Connection:
+    """Windows: authenticate a HELD handle, then let SQLite open the same file.
+
+    ``os.open`` on Windows shares READ|WRITE but never DELETE, so while this
+    descriptor is held the store cannot be renamed, replaced or deleted.  Its
+    identity is checked on the handle itself (``os.fstat``), and the handle is
+    kept until ``connect_readonly`` has returned and SQLite has done its first
+    read, so the file SQLite reads is the authenticated one -- no check-then-
+    open window.  Closing this handle never drops another handle's lock.
+    """
+
+    descriptor = os.open(
+        target,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != before:
+            raise StorePathAuthenticationError(f"store_path_replaced:{target}")
+        conn = sqlite_readonly.connect_readonly(target)
+        try:
+            try:
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+            except sqlite3.Error:
+                # A corrupt or non-SQLite file surfaces on the caller's own
+                # first query, as connect_readonly documents (NF-2026-02136).
+                pass
+            if _store_path_identity(root, target) != before:
+                raise StorePathAuthenticationError(f"store_path_replaced:{target}")
+        except BaseException:
+            conn.close()
+            raise
+    finally:
+        os.close(descriptor)
+    return conn
+
+
+def connect_store_readonly(repo_root: str | Path, path: Path) -> sqlite3.Connection:
+    """Open a store read-only, bound to the file identity it authenticated.
+
+    NF-2026-00514: the loaders used to hand a bare path to
+    ``connect_readonly``, which resolves (follows) links, so a store file or
+    directory swapped for a link was read as if it were the repository's own.
+    The path is ``lstat``-authenticated (no symlink/reparse point, regular
+    file, ``st_nlink == 1``) before the open and again after it, and the
+    identity is additionally bound to an OPENED descriptor with ``os.fstat``.
+    On Windows a held, delete-denying handle is authenticated first and kept
+    across SQLite's open (:func:`_connect_readonly_windows`).  On POSIX no
+    descriptor is opened outside SQLite -- closing one would drop this
+    process's fcntl locks (NF-2026-02130) -- so the descriptor table is
+    snapshotted before and after SQLite's open and the authenticated inode
+    must be among the descriptors that open ADDED; an unrelated descriptor
+    the process already held can neither accept nor refuse it.  A missing
+    file raises :class:`FileNotFoundError`.
+    """
+
+    root = Path(repo_root).absolute()
+    target = Path(path).absolute()
+    before = _store_path_identity(root, target)
+    if platform_io.is_windows():
+        return _connect_readonly_windows(root, target, before)
+    descriptors_before = _open_descriptor_identities()
+    if descriptors_before is None:
+        raise StorePathAuthenticationError(
+            f"store_descriptor_identity_unavailable:{target}"
+        )
+    conn = sqlite_readonly.connect_readonly(target)
+    try:
+        descriptors_after = _open_descriptor_identities()
+        if descriptors_after is None:
+            raise StorePathAuthenticationError(
+                f"store_descriptor_identity_unavailable:{target}"
+            )
+        opened = {
+            identity
+            for fd, identity in descriptors_after.items()
+            if descriptors_before.get(fd) != identity
+        }
+        after = _store_path_identity(root, target)
+        if after != before or before not in opened:
+            raise StorePathAuthenticationError(f"store_path_replaced:{target}")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _connect(repo_root: str | Path) -> sqlite3.Connection:
+    return connect_store_db(_db_path(repo_root))
 
 
 _SCHEMA_SQL = """

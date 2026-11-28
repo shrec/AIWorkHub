@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import Any
 
 from . import tool_recipes
+from .roadmap_store import connect_store_db, connect_store_readonly
 from .sqlite_readonly import connect_readonly
 from .tool_recipes import InvocationReceipt, Recipe, RecipeRegistry
 
@@ -156,12 +157,7 @@ def _db_path(repo_root: str | Path) -> Path:
 
 def _connect(repo_root: str | Path) -> sqlite3.Connection:
     """Open the canonical recipe database read-write, creating it if absent."""
-    path = _db_path(repo_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_store_db(_db_path(repo_root))
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -341,8 +337,11 @@ def list_recipes(
     # connection, which touches the file, so a corrupt or non-database file can
     # fail here rather than at the first SELECT. Both are the same fact -- there
     # is nothing readable at this path -- so both degrade to an empty result.
+    # NF-2026-00514: StorePathAuthenticationError (a link or a replaced store)
+    # is deliberately NOT caught here -- an unauthenticated store is refused,
+    # never reported as an empty registry.
     try:
-        conn = connect_readonly(path)
+        conn = connect_store_readonly(repo_root, path)
     except (sqlite3.Error, OSError, ValueError):
         return []
     conn.row_factory = sqlite3.Row
