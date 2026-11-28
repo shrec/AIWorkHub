@@ -1153,11 +1153,6 @@
         "count": 1
       },
       {
-        "path": "src/aiworkhub/roadmap_store.py",
-        "pattern": "copied_helper",
-        "count": 1
-      },
-      {
         "path": "src/aiworkhub/route_identity.py",
         "pattern": "copied_helper",
         "count": 2
@@ -1179,11 +1174,6 @@
       },
       {
         "path": "src/aiworkhub/skill_registry_store.py",
-        "pattern": "copied_helper",
-        "count": 1
-      },
-      {
-        "path": "src/aiworkhub/skill_registry_store.py",
         "pattern": "parallel_implementation",
         "count": 1
       },
@@ -1195,7 +1185,7 @@
       {
         "path": "src/aiworkhub/source_graph.py",
         "pattern": "parallel_implementation",
-        "count": 8
+        "count": 4
       },
       {
         "path": "src/aiworkhub/source_graph_ast.py",
@@ -1259,11 +1249,6 @@
       },
       {
         "path": "src/aiworkhub/tool_recipes_store.py",
-        "pattern": "copied_helper",
-        "count": 1
-      },
-      {
-        "path": "src/aiworkhub/tool_recipes_store.py",
         "pattern": "parallel_implementation",
         "count": 1
       },
@@ -1296,8 +1281,8 @@
     "measurement": {
       "reference_commit": "a86934dbfcca6389595c5e0fa5cbbf74e9537fb4",
       "reference_total": 119,
-      "current_total": 109,
-      "accepted_predecessor_delta": -10
+      "current_total": 102,
+      "accepted_predecessor_delta": -17
     }
   }
 }

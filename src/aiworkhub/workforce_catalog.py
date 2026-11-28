@@ -29,7 +29,6 @@ from . import (
     model_settings,
     provider_route_contracts,
     repo_policy,
-    reviewer_launch_refusal,
     runner_topic_policy,
     runtime_adapters,
     task_store,
@@ -100,10 +99,34 @@ _ROUTE_SUCCESS_STATES = frozenset(
 # accepts on ``codex_cli``/``gpt-5.4`` (NF-2026-00655).  A launch-class start
 # failure (NF-2026-02086) is the sandbox's own equivalent: it cannot run the
 # adapter at all, so the route stays skipped until a later start succeeds.
-_ROUTE_LONG_COOLDOWN_KINDS = frozenset(
-    {"model_not_found", reviewer_launch_refusal.LAUNCH_FAILURE_CLASS}
-)
-_ROUTE_SINGLE_FAILURE_KINDS = frozenset({"auth", "quota"}) | _ROUTE_LONG_COOLDOWN_KINDS
+#
+# Both sets are built on first use so ``reviewer_launch_refusal`` (the owner of
+# the launch-class name) is not executed by a bare ``import aiworkhub.server``
+# (NF-2026-01988 module budget).  The module-level names stay readable through
+# ``__getattr__`` below.
+def _route_long_cooldown_kinds() -> frozenset[str]:
+    from . import reviewer_launch_refusal
+
+    return frozenset({"model_not_found", reviewer_launch_refusal.LAUNCH_FAILURE_CLASS})
+
+
+def _route_single_failure_kinds() -> frozenset[str]:
+    return frozenset({"auth", "quota"}) | _route_long_cooldown_kinds()
+
+
+_LAZY_ROUTE_KIND_SETS = {
+    "_ROUTE_LONG_COOLDOWN_KINDS": _route_long_cooldown_kinds,
+    "_ROUTE_SINGLE_FAILURE_KINDS": _route_single_failure_kinds,
+}
+
+
+def __getattr__(name: str) -> Any:
+    factory = _LAZY_ROUTE_KIND_SETS.get(name)
+    if factory is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return factory()
+
+
 # NF-2026-01674: the kinds an AUTOMATIC reroute may act on -- a named subset of
 # ``_ROUTE_SINGLE_FAILURE_KINDS``.  A refused balance or a dead credential
 # belongs to the route, so moving the card to another route is the repair.
@@ -773,6 +796,8 @@ def _route_failure_kind(process: Mapping[str, Any]) -> str:
     # other unauthenticated transport signals fall to the transient threshold.
     state = str(process.get("state") or "").strip().casefold()
     error = str(process.get("error") or "").strip().casefold()
+    from . import reviewer_launch_refusal  # Lazy: keeps ``import aiworkhub.server`` cheap.
+
     if reviewer_launch_refusal.launch_class_signal(process, {}, error):
         return reviewer_launch_refusal.LAUNCH_FAILURE_CLASS
     if state in {"launch_failed", "timed_out"}:
@@ -853,6 +878,8 @@ def _route_circuit(
     shared MCP control plane.
     """
 
+    long_cooldown_kinds = _route_long_cooldown_kinds()
+    single_failure_kinds = _route_single_failure_kinds()
     observed: list[tuple[float, Mapping[str, Any]]] = []
     for process in matched:
         epoch = _process_event_epoch(process)
@@ -898,14 +925,14 @@ def _route_circuit(
                 latest_reset_epoch is None or reset_epoch > latest_reset_epoch
             ):
                 latest_reset_epoch = reset_epoch
-            if kind in _ROUTE_SINGLE_FAILURE_KINDS:
+            if kind in single_failure_kinds:
                 break
             continue
         if state in _ROUTE_SUCCESS_STATES:
             break
 
     threshold = (
-        1 if latest_kind in _ROUTE_SINGLE_FAILURE_KINDS
+        1 if latest_kind in single_failure_kinds
         else ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
     )
     # Harness-behaviour failures are counted apart from the shared run so they
@@ -916,7 +943,7 @@ def _route_circuit(
     # ``open_now`` measures it below.
     shared_cooldown = (
         ROUTE_CIRCUIT_LOOKBACK_SECONDS
-        if latest_kind in _ROUTE_LONG_COOLDOWN_KINDS
+        if latest_kind in long_cooldown_kinds
         else ROUTE_CIRCUIT_COOLDOWN_SECONDS
     )
     if latest_reset_epoch is not None and latest_failure_epoch is not None:
@@ -940,7 +967,7 @@ def _route_circuit(
     # this sandbox cannot start (NF-2026-02086) is no different.  Those stay open
     # for the evidence window; a single observed SUCCESS still closes them.
     cooldown = ROUTE_CIRCUIT_LOOKBACK_SECONDS if latest_kind in (
-        _ROUTE_LONG_COOLDOWN_KINDS | {"harness_behaviour"}
+        long_cooldown_kinds | {"harness_behaviour"}
     ) else ROUTE_CIRCUIT_COOLDOWN_SECONDS
     failure_age = (
         max(0.0, now_epoch - latest_failure_epoch)

@@ -43,6 +43,7 @@ Scope vs. mandatory-change contract:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -54,15 +55,10 @@ from typing import Any, Mapping, Sequence
 
 # skill_registry is a pure, standalone, side-effect-free module (no filesystem,
 # store, or lifecycle import), so this keeps the self-contained contract above.
-# source_graph_languages is likewise a dependency-free constant table.
+# dart_project and source_graph_languages are imported inside the functions
+# that use them, keeping ``import aiworkhub.server`` within its NF-2026-01988
+# module budget.
 from . import skill_registry
-from .dart_project import (
-    DART_TEMPLATE_WORK_KINDS,
-    FLUTTER_VALIDATION,
-    is_dart_path,
-    partition_dart_paths,
-)
-from .source_graph_languages import LANGUAGE_BY_EXTENSION
 
 __all__ = [
     "AUDITED_CUSTOM_ESCAPE",
@@ -189,14 +185,21 @@ _PATH_LIKE_TOKEN_RE = re.compile(
 # ``_PATH_LIKE_TOKEN_RE`` above is kept verbatim for option tokens
 # (``--config=x.toml``): widening THAT would start refusing option spellings
 # persisted cards already carry, and every classification revalidates them.
-_INDEXED_PATH_SUFFIXES: tuple[str, ...] = tuple(sorted(LANGUAGE_BY_EXTENSION))
+# Built on first use so ``source_graph_languages`` is not executed by a bare
+# ``import aiworkhub.server`` (NF-2026-01988); the table is constant, so one
+# bounded cached entry is exact.
+@functools.lru_cache(maxsize=1)
+def _indexed_path_suffixes() -> tuple[str, ...]:
+    from .source_graph_languages import LANGUAGE_BY_EXTENSION
+
+    return tuple(sorted(LANGUAGE_BY_EXTENSION))
 
 
 def _is_path_like_token(token: str) -> bool:
     """Whether a validation argv token names a path that must be validated."""
     if _PATH_LIKE_TOKEN_RE.search(token):
         return True
-    return not token.startswith("-") and token.endswith(_INDEXED_PATH_SUFFIXES)
+    return not token.startswith("-") and token.endswith(_indexed_path_suffixes())
 
 
 _PYTEST_NODEID_SELECTOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -1275,6 +1278,13 @@ def _dart_flutter_validation(
     least one of each, something must be required to change, and the work kind
     must carry the bugfix or generic role gate (NF-2026-02258).
     """
+    # Lazy: keeps ``import aiworkhub.server`` within its module budget (NF-2026-01988).
+    from .dart_project import (
+        DART_TEMPLATE_WORK_KINDS,
+        FLUTTER_VALIDATION,
+        partition_dart_paths,
+    )
+
     production, tests, other = partition_dart_paths(write_set)
     if other:
         raise TaskTemplateError("dart_flutter_path_outside_lib_or_test")
@@ -2226,6 +2236,8 @@ def classify_task_card(
     # Tried strictly after the seven built-ins, so every card one of them
     # classifies keeps exactly the identity it had before. A Dart card tries
     # the Dart/Flutter template (NF-2026-02258) before the generic fallback.
+    from .dart_project import is_dart_path  # Lazy: NF-2026-01988 import budget.
+
     if any(is_dart_path(path) for path in writes):
         candidates.append((DART_FLUTTER_TEMPLATE_NAME, "compatible_dart_flutter_with_tests"))
     candidates.append(
