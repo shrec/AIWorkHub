@@ -1575,6 +1575,51 @@ def _failure_kind(cause: BaseException | None, failed_names: Sequence[str]) -> s
     return FAILURE_KIND_UNRUNNABLE
 
 
+def _unrunnable_cause(rows: Sequence[Mapping[str, Any]], error: str) -> tuple[str, int | None]:
+    """NF-2026-01025: the TAIL of a no-verdict run's output and its exit code.
+
+    The first red row's stdout_tail then stderr_tail (ANSI stripped), else the
+    refusal text; the last ``_FIRST_FAILURE_CHARS`` are kept, since the cause of
+    an unrunnable run (a traceback, an import error) prints last. The exit code
+    is that row's ``returncode``, ``None`` when no row recorded one.
+    """
+    for row in rows:
+        if row.get("returncode") == 0 and not row.get("timed_out"):
+            continue
+        parts = [
+            _strip_ansi(text)
+            for text in (row.get("stdout_tail"), row.get("stderr_tail"))
+            if isinstance(text, str) and text
+        ]
+        code = row.get("returncode")
+        exit_code = code if isinstance(code, int) and not isinstance(code, bool) else None
+        return ("\n".join(parts) or error)[-_FIRST_FAILURE_CHARS:], exit_code
+    return error[-_FIRST_FAILURE_CHARS:], None
+
+
+VALIDATION_RELAY_MISSING = "validation_relay_missing_in_candidate"
+
+
+def relay_missing_in_candidate(candidate_root: Path | str | None) -> str:
+    """NF-2026-01025: the relay module path a candidate tree lacks, else ``""``.
+
+    The module is the one ``windows_private_session._VALIDATION_RELAY_ENTRY``
+    imports. Only a tree that ships that module's package (``src/<package>``)
+    can lack it; an unknown root or a tree without the package imports the
+    installed one, so it is not refused here.
+    """
+    if candidate_root is None:
+        return ""
+    from .windows_private_session import validation_relay_module
+
+    parts = validation_relay_module().split(".")
+    relative = Path("src", *parts[:-1], parts[-1] + ".py")
+    package = Path(candidate_root) / relative.parent
+    if not (package / "__init__.py").is_file() or (Path(candidate_root) / relative).is_file():
+        return ""
+    return relative.as_posix()
+
+
 def run_finalization_neighbours(
     repo_root: Path | str,
     candidate_changed_paths: Iterable[Any],
@@ -1600,6 +1645,20 @@ def run_finalization_neighbours(
     )
     if not selection.tests:
         return None
+    missing = relay_missing_in_candidate(candidate_root)
+    if missing:
+        # NF-2026-01025: the AppContainer validation relay cannot import from this
+        # tree, so no neighbour could run; refuse with that reason, never a bare
+        # unrunnable record.
+        refused = selection.evidence()
+        reason = f"{VALIDATION_RELAY_MISSING}:{missing}"
+        refused.update(
+            command=neighbour_command(selection.tests), duration_seconds=0.0,
+            passed=False, error=reason, failed=[], first_failure=reason,
+            failure_kind=FAILURE_KIND_UNRUNNABLE, cause=VALIDATION_RELAY_MISSING,
+            exit_code=None, output_tail="",
+        )
+        return refused
     last: dict[str, Any] = {}
 
     def candidate_run(ws: Any, authority: Mapping[str, Any], meta: Mapping[str, Any]) -> Any:
@@ -1642,6 +1701,10 @@ def run_finalization_neighbours(
         failed["failure_kind"] = _failure_kind(cause, failed["failed"])
         if failed["failure_kind"] == FAILURE_KIND_ENVIRONMENT:
             failed["restriction"] = str(getattr(cause, "restriction", "") or "")
+        if failed["failure_kind"] == FAILURE_KIND_UNRUNNABLE:
+            tail, exit_code = _unrunnable_cause(rows, str(exc) or type(exc).__name__)
+            failed["output_tail"] = tail
+            failed["exit_code"] = exit_code
         if rows:
             failed["validation"] = rows
         return failed
@@ -1711,7 +1774,17 @@ def finalization_neighbour_refusal(
             "validation_environment_blocked:" + FINALIZATION_FAILURE_PREFIX + text, rows,
             restriction=str(recorded.get("restriction") or "") or "finalization_neighbour_tests",
         )
-    return WorkspaceError(FINALIZATION_UNRUNNABLE_PREFIX + text)
+    # NF-2026-01025: no verdict still names its cause -- the named refusal reason,
+    # the exit code, the exact neighbour command and the tail of what it printed.
+    cause = {
+        key: recorded.get(key)
+        for key in ("cause", "exit_code", "command", "output_tail")
+        if recorded.get(key) not in (None, "")
+    }
+    return WorkspaceError(
+        FINALIZATION_UNRUNNABLE_PREFIX
+        + _view_detail(view, failure_kind=view["failure_kind"], **cause)
+    )
 
 
 def _matched_finalization_record(

@@ -16,6 +16,7 @@ is kept as a direct delegate for the same reason; production
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from typing import Any, Callable, Mapping
 __all__ = [
     "run_appcontainer_validation_hopped",
     "validation_relay_main",
+    "validation_relay_module",
 ]
 
 
@@ -35,6 +37,18 @@ _VALIDATION_RELAY_ENTRY = (
     "from aiworkhub.windows_private_session import validation_relay_main as main;"
     " raise SystemExit(main())"
 )
+
+
+def validation_relay_module() -> str:
+    """The dotted module ``_VALIDATION_RELAY_ENTRY`` imports (NF-2026-01025).
+
+    Parsed from the entry itself, so a check for that module in a candidate
+    tree cannot drift from what the relay actually imports.
+    """
+    for node in ast.parse(_VALIDATION_RELAY_ENTRY).body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            return node.module
+    raise ValueError("validation_relay_entry_names_no_module")
 
 
 class ValidationRelayError(RuntimeError):
