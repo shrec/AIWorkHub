@@ -4170,9 +4170,12 @@ def test_the_shim_answers_a_denied_stat_only_for_a_brokered_directory(tmp_path):
     brokered = site._brokered(_denied, facts)
     assert brokered(tmp_path) is rebuilt
     assert brokered(str(tmp_path).upper(), follow_symlinks=False) is rebuilt
-    for denied in (target, tmp_path / "other", os.fsencode(str(tmp_path)), 3):
+    for denied in (os.fsencode(str(tmp_path)), 3):
         with pytest.raises(PermissionError):
             brokered(denied)
+    for inside in (target, tmp_path / "other"):  # entries of a brokered dir
+        with pytest.raises(FileNotFoundError):
+            brokered(inside)
     with pytest.raises(PermissionError):
         brokered(tmp_path, dir_fd=3)
 
