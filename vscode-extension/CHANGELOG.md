@@ -1,10 +1,11 @@
 # AIWorkHub for VS Code — Changelog
 
-## Unreleased
+## 0.13.17 — 2026-11-28
 
 ### Fixed
 
 - Bundles runtime 0.13.17: the release cut widens an unmapped changed path by the tests that name it instead of running the full suite, and a rerun resumes from the failed test nodes; after a manager-console session rotation the successor runs one automatic continue turn from its handoff and callbacks keep waking the active session; a truncated failing-check summary keeps the lines that name the failure; every seat's instructions carry the "Incremental by default" principle.
+- Bundles runtime 0.13.17 Linux and hosted-project fixes: no virtual `Z:` drive is ever defined; validation accepts `cmake -D` host paths beneath a card's `read_roots` and `ctest` build dirs made by an earlier `cmake -B` row; Node validation rows get the extension's repository assets; non-Python cards classify as `custom_validation`; blocked-card recovery accepts candidates that delete files; the Linux worker sandbox enforces a read allow-list; host-local AIWorkHub files stay out of a hosted repo's git; OpenCode workers get their tools again.
 
 ## 0.13.16 — 2026-11-27
 

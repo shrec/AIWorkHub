@@ -4,7 +4,7 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
-## [Unreleased]
+## [0.13.17] - 2026-11-28
 
 ### Added
 
@@ -23,6 +23,13 @@ noted by package/extension version and release tag.
 - Release cut test selection: an unmapped changed path no longer forces the full suite; it widens the selection by the tests that name it, and fails closed to the full suite only when no test references it. A rerun of the same version resumes from the failed test nodes plus what changed since, through `.scratch/release/VERSION/resume.json` (`aiworkhub.release_cut.resume.v1`, keyed by HEAD); a recorded node pytest no longer collects (exit 4 serially, 5 under xdist) drops the resume entry and runs the normal selection, on the host and in WSL (NF-2026-00976).
 - Manager console rotation: the successor session runs one automatic continue turn worded from its handoff (a mechanical handoff says so), so the chat no longer stalls after a rotation; a continue turn that rotates again does not chain another continue, a failed continue is recorded on the successor, and callbacks keep waking the active session (NF-2026-00979).
 - Quality gate: a truncated failing-check summary keeps the lines that name the failure (`failed with exit code`, `not ok`, `✖`, `AssertionError`, `Error:`) with two lines of context ahead of the head/tail window, so a sandbox-only failure names its test instead of being cut away (NF-2026-00982).
+- Linux and hosted-project fixes (reported from a Linux host): AIWorkHub never defines a virtual `Z:` drive; validation accepts host toolchain argv paths (`cmake -D<VAR>=<path>` beneath a card's `read_roots`, and a `ctest --test-dir` build dir created by an earlier `cmake -B` row); Node validation rows seed the AIWorkHub extension's tracked repository assets; template classification selects `custom_validation` for non-Python cards; blocked-card recovery accepts a retained candidate that deletes files; finalization "neighbour tests unrunnable" records its real cause; `task_amend_pending` edits `objective` and `required_outputs` on a never-launched card; Source Graph indexes systemd/udev/INI config files as plain text; the tool-guard hook no longer dead-ends a session whose AIWorkHub MCP is not loaded; the Linux worker sandbox enforces a read allow-list; AIWorkHub host-local files stay out of a hosted repo's git; `manager_correction` returns after writing canonical files; `manager_callback_watch --follow` streams one JSON line per callback; the auto reviewer is never launched with an unlaunchable runner (NF-2026-01017, NF-2026-01011, NF-2026-01015, NF-2026-01024, NF-2026-01025, NF-2026-01022, NF-2026-01027, NF-2026-01019, NF-2026-01014, NF-2026-01004, NF-2026-01013, NF-2026-01008, NF-2026-01020, NF-2026-01009).
+- Host validation stage uses a short repo-local TEMP/basetemp, so nested helper paths stay under the Windows path limit in deep repositories (NF-2026-01006).
+- Windows AppContainer stat broker: a denied stat of an entry inside a brokered ancestor directory reads as not found, so pytest's rootdir search no longer fails with `PermissionError` on a parent `pyproject.toml` (NF-2026-01028).
+- Promotion no longer refuses a clean file as `promotion_canonical_dirty_at_seed` in `core.autocrlf` repositories: a seeded path counts as dirty only when its bytes differ from the base blob beyond line endings, whatever the ambient Git config (NF-2026-01029).
+- OpenCode workers get their tools again (lost in 0.13.16) and worker tool names keep the `awh_` prefix (NF-2026-00993).
+- Review pipeline: a locked review transition is retried instead of discarding a completed attempt; the review-recovery scan is time-bounded; reviewer source evidence uses bounded enclosing-symbol context with a water-filled per-path budget; storage quarantine re-checks live combined-validation unions (NF-2026-00856, NF-2026-00853, NF-2026-00761).
+- Fix batches 02, 04, 10, 11, 12, 14, 19 and 21: retained candidate identity on retry, process-launcher reachability, Windows MCP bridge hard links, stale-candidate reviewer launch, quality-evidence gaps, Windows worker_workspace test triage, review calibration corpus and Development Rules detector coverage (NF-2026-00589, NF-2026-00328, NF-2026-00036, NF-2026-00794, NF-2026-00468, NF-2026-00019, NF-2026-00936, NF-2026-00870).
 
 ## [0.13.16] - 2026-11-27
 

@@ -94,13 +94,13 @@ Source Graph coverage and bounded viewers for logs, sessions, AI Memory and KB.
   <em>Tasks, callback health, source coverage, context stores, preflight and evidence in one retained editor tab.</em>
 </div>
 
-## What's new in 0.13.16
+## What's new in 0.13.17
 
-- NeedFix and Roadmap MCP tools now carry the `aiworkhub_` prefix (`aiworkhub_needfix_list`, ...); the old names stay callable as deprecated aliases until 0.14.0.
-- MCP stdio negotiates `protocolVersion` (up to `2025-11-25`); `tools/list` is sorted by name and carries cache hints and tool annotations on both stdio paths.
-- MCP `2026-07-28` (stateless) on both stdio servers: `server/discover`, a per-request protocol version instead of `initialize`, and the Tasks extension, so a worker launch is an MCP task that clients poll with `tasks/get` and stop with `tasks/cancel`; older clients keep the `initialize` path unchanged.
-- Process-event ledger lookups read a per-archive key index instead of scanning the whole rotated history (2.4 GB streamed continuously by the dashboard server before).
-- The quality gate fills `vscode-extension/` into sparse validation trees, so extension cards run `extension-regression`.
+- AIWorkHub never defines a virtual `Z:` drive; Windows validation uses a short repo-local temp path instead.
+- Linux and hosted projects: validation accepts `cmake -D` host paths beneath a card's `read_roots` and `ctest` build dirs made by an earlier `cmake -B` row; non-Python cards classify as `custom_validation`; the Linux worker sandbox enforces a read allow-list; host-local AIWorkHub files stay out of the hosted repo's git.
+- Node validation rows get the extension's repository assets, so `extension-regression` runs in gate worktrees.
+- Blocked-card recovery accepts a candidate that deletes files; "neighbour tests unrunnable" names its real cause; `task_amend_pending` edits `objective` and `required_outputs`.
+- OpenCode workers get their tools again; `manager_callback_watch --follow` streams one JSON line per callback.
 
 ## Get started
 
