@@ -1772,6 +1772,10 @@ def validate_custom_validation_roles(
         raise TaskTemplateError("invalid_validation")
     if validation_roles is not None and len(validation_roles) > MAX_PATHS_PER_FIELD:
         raise TaskTemplateError("invalid_validation_roles")
+    # NF-2026-01017: ``-DNAME=<abs>`` beneath a bound card read_root is a host
+    # toolchain path, not a repo path; no bound root keeps it refused.
+    from .validation_argv_paths import host_define_beneath_read_root
+
     for item in () if validation is None else validation:
         if not isinstance(item, str):
             raise TaskTemplateError("invalid_validation_not_string")
@@ -1798,6 +1802,8 @@ def validate_custom_validation_roles(
                 # so it matches the separated ``-I dir`` form exactly.
                 payload = token[len(_INCLUDE_ROOT_OPTION) :]
             elif not token or not _is_path_like_token(token):
+                continue
+            elif host_define_beneath_read_root(token):
                 continue
             elif (
                 msbuild_switches
@@ -1926,6 +1932,25 @@ def resolve_validation_exemption(
 
 
 def validate_template_provenance(
+    payload: Any,
+    *,
+    expanded_card: Mapping[str, Any] | None = None,
+    read_roots: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Bind the card's validated ``read_roots`` (NF-2026-01017), then validate.
+
+    The roots authorize ``-DNAME=<abs>`` host toolchain paths beneath them
+    for exactly this validation; with none, every absolute path stays refused.
+    """
+    from .validation_argv_paths import declared_read_roots
+
+    with declared_read_roots(read_roots):
+        return _validate_template_provenance_unbound(
+            payload, expanded_card=expanded_card
+        )
+
+
+def _validate_template_provenance_unbound(
     payload: Any,
     *,
     expanded_card: Mapping[str, Any] | None = None,
@@ -2178,6 +2203,19 @@ def _custom_escape_provenance(card: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def classify_task_card(
+    *, read_roots: Sequence[str] | None = None, **fields: Any
+) -> dict[str, Any]:
+    """Classify a card with its validated ``read_roots`` bound (NF-2026-01017).
+
+    ``fields`` are exactly :func:`_classify_task_card_unbound`'s keywords.
+    """
+    from .validation_argv_paths import declared_read_roots
+
+    with declared_read_roots(read_roots):
+        return _classify_task_card_unbound(**fields)
+
+
+def _classify_task_card_unbound(
     *,
     allowed_writes: Sequence[str],
     required_outputs: Sequence[str],

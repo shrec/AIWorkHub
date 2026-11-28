@@ -5214,7 +5214,7 @@ def create_task(
                 read_only=read_only,
                 read_first=read_first2,
                 allow_unchanged_required_outputs=allow_unchanged_outputs2,
-                custom_escape=custom_template_escape,
+                custom_escape=custom_template_escape, read_roots=read_roots2,
             )
         else:
             # A bound provenance object carries the exact source card it was
@@ -5249,7 +5249,7 @@ def create_task(
             )
             bound_provenance = task_templates.validate_template_provenance(
                 template_provenance,
-                expanded_card=requested_card,
+                expanded_card=requested_card, read_roots=read_roots2,
             )
             expected_digest = task_templates.expanded_contract_digest(
                 {

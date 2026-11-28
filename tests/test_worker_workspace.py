@@ -726,6 +726,8 @@ def _commit_validation_worker_package(repo: Path) -> None:
         "worker_workspace_native_seed.py",
         # ...and its AIWorkHub extension repository-asset seed (NF-2026-01011).
         "worker_workspace_extension_seed.py",
+        # ...and its validation argv build-dir/read_root rules (NF-2026-01017).
+        "validation_argv_paths.py",
         # ...and its validation stall watchdog (NF-2026-02269).
         "validation_stall.py",
         # ...and its bubblewrap interpreter identity binds (NF-2026-02327).

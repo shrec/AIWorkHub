@@ -1487,17 +1487,12 @@ def _validation_file_operands(
                 not in _VALIDATION_FILE_SUFFIXES
             ):
                 continue
-            try:
-                relative = _relative_repo_path(raw_path)
-                if cd_relative:
-                    relative = _relative_repo_path(
-                        (PurePosixPath(cd_relative) / PurePosixPath(relative)).as_posix()
-                    )
-            except WorkspaceError:
-                # Path-shaped operands must retain the existing fail-closed
-                # normalization behaviour; non-path command words were
-                # filtered above before reaching this branch.
-                raise
+            # Path-shaped operands keep the fail-closed normalization errors.
+            relative = _relative_repo_path(raw_path)
+            if cd_relative:
+                relative = _relative_repo_path(
+                    (PurePosixPath(cd_relative) / PurePosixPath(relative)).as_posix()
+                )
             if relative in exempt:
                 continue
             candidate = repo / relative
@@ -1505,7 +1500,10 @@ def _validation_file_operands(
             if candidate.is_dir() and not candidate.is_symlink():
                 continue
             if candidate.is_symlink() or not candidate.is_file():
-                raise _input_missing_error("validation", command_index, relative)
+                from .validation_argv_paths import validation_operand_is_build_dir  # NF-2026-01017
+                if not validation_operand_is_build_dir(repo, card.get("validation") or [], command_index, tokens, token_index, relative):
+                    raise _input_missing_error("validation", command_index, relative)
+                continue  # a build dir an earlier row (or this row's -B) creates is no input
             rows.add(relative)
     return tuple(sorted(rows))
 
